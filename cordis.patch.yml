@@ -1,0 +1,21 @@
+- insert:
+    - id: qwen-mode
+      name: 'dsh-qwen-mode'
+      config: {}
+- id: permission
+  config:
+    presets:
+      reply-only:
+        sandbox: read-only
+        approval: never
+        name: 仅回复
+        description: 禁止工具调用，仅进行纯文本对话。
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never

@@ -1,0 +1,53 @@
+{
+  "name": "dsh-qwen-mode",
+  "version": "1.3.32",
+  "description": "Qwen mode for DSH: managed Qwen/GenieX providers, reasoning parsing, model limits, warmup and per-turn stats through a loopback OpenAI-compatible proxy.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./icon": "./icon.svg",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "author": "Fuxfantx",
+  "license": "MIT-0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Fuxfantx/dsh-qwen-mode.git"
+  },
+  "homepage": "https://github.com/Fuxfantx/dsh-qwen-mode#readme",
+  "bugs": {
+    "url": "https://github.com/Fuxfantx/dsh-qwen-mode/issues"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "qwen",
+    "geniex",
+    "local-llm",
+    "openai-compatible",
+    "cordis-plugin"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true
+    }
+  }
+}
