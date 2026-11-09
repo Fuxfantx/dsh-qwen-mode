@@ -246,7 +246,14 @@ function applyRequestDefaults(body, settings) {
 }
 
 function thinkState(assumeReasoning = false, format = 'none') {
-  return { buffer: '', inThink: false, assumeReasoning, format, separated: false }
+  return { buffer: '', inThink: false, assumeReasoning, format, separated: false, pending: false }
+}
+
+/** Locate the first Markdown heading that likely starts the final answer. */
+function headingStart(value) {
+  const match = /(?:^|\n\n)(?=#{1,6}\s)/mu.exec(value)
+  if (match === null) return -1
+  return match.index + (match[0] === '\n\n' ? 2 : 0)
 }
 
 function safePrefix(value) {
@@ -265,6 +272,30 @@ function feedThink(value, state) {
   const out = []
   while (state.buffer !== '') {
     if (!state.inThink) {
+      if (state.pending) {
+        const heading = headingStart(state.buffer)
+        if (heading !== -1) {
+          pushPiece(out, 'reasoning', state.buffer.slice(0, heading))
+          state.buffer = state.buffer.slice(heading)
+          state.pending = false
+          state.separated = true
+          continue
+        }
+        if (state.buffer.length <= 1200) break
+        pushPiece(out, 'content', state.buffer)
+        state.buffer = ''
+        state.pending = false
+        state.separated = true
+        continue
+      }
+      if (state.separated) {
+        const safe = safePrefix(state.buffer)
+        if (safe > 0) {
+          pushPiece(out, 'content', state.buffer.slice(0, safe))
+          state.buffer = state.buffer.slice(safe)
+        }
+        break
+      }
       const open = state.buffer.indexOf('<think>')
       const close = state.buffer.indexOf('</think>')
       if (open !== -1 && (close === -1 || open < close)) {
@@ -278,6 +309,7 @@ function feedThink(value, state) {
         state.buffer = state.buffer.slice(close + 8)
         state.inThink = false
         state.separated = true
+        state.pending = true
         continue
       }
       if (state.assumeReasoning && !state.separated) {
@@ -286,6 +318,9 @@ function feedThink(value, state) {
           const held = parts.pop()
           pushPiece(out, 'reasoning', parts.join('\n\n'))
           state.buffer = held
+          state.separated = true
+          state.pending = true
+          continue
         }
         break
       }
@@ -309,6 +344,7 @@ function feedThink(value, state) {
     state.buffer = state.buffer.slice(close + 8)
     state.inThink = false
     state.separated = true
+    state.pending = true
   }
   return out
 }
@@ -316,6 +352,18 @@ function feedThink(value, state) {
 function flushThink(state) {
   const out = []
   if (state.buffer !== '') {
+    if (state.pending) {
+      const heading = headingStart(state.buffer)
+      if (heading !== -1) {
+        pushPiece(out, 'reasoning', state.buffer.slice(0, heading))
+        pushPiece(out, 'content', state.buffer.slice(heading))
+      } else {
+        pushPiece(out, 'content', state.buffer)
+      }
+      state.pending = false
+      state.buffer = ''
+      return out
+    }
     const type = state.inThink || (state.assumeReasoning && !state.separated && state.format !== 'none')
       ? 'reasoning'
       : 'content'
