@@ -6,24 +6,21 @@
 
 ## 中文
 
-为 Qwen / GenieX 的 OpenAI 兼容端点提供 DSH 集成：自动维护 Provider、补齐思考参数、解析推理内容，并显示每轮模型性能。
+为 Qwen / GenieX 的 OpenAI 兼容端点提供 DSH 集成：自动维护模型 Provider，处理思考与推理内容，并展示每轮模型性能。
 
 ### 功能
 
 - **关闭 / 自动** 两档模式；自动档只处理 `From GenieX` / `From QwenCloud` 下的模型。
-- GenieX 自动创建 **From GenieX**，QwenCloud 自动创建 **From QwenCloud**。
-- 从上游模型目录发现模型，并生成上下文窗口与最大输出限制。
-- GenieX 通过 `/v1/models/{id}` 的 `model_type`（并回退到缓存中的 `mmproj`/`geniex.json`）识别 VLM，为模型 Provider 同时声明文本与图片输入；缓存目录由 `geniex list` 的 `Models cached in ...` 输出定位。
-- GenieX 请求支持覆盖 `compute` 与 `vit_compute` 推理参数。
-- GenieX 注入顶层 `enable_think`；QwenCloud 注入 `enable_thinking` 并保留 `reasoning_effort`。
-- 将 `<think>...</think>` 拆为 `reasoning_content`；无标签时识别 GenieX 的“推理段落 + 空行 + 正文”结构。
-- 为流式请求补 `stream_options.include_usage`，回复完成后显示模型名、TTFT、Decode TPS 和时间；历史对话同样可查看。
-- 安装 **仅回复 / Reply Only** 权限：只读、无审批，并隐藏/拒绝工具调用。
-- 可选模型预热：选择 `From GenieX` 模型时提前加载；预热请求串行执行。
-- 模型选择器显示量化精度（如 `Q4_0`），并隐藏官方 trigger 图标。
-- 可配置上下文窗口、最大输出、采样默认值与 `repetition_penalty`。
+- 自动创建并维护 **From GenieX** 或 **From QwenCloud** Provider。
+- 从上游模型目录发现模型，并配置上下文窗口与最大输出。
+- 自动识别 VLM，并为模型声明文本与图片输入。
+- 处理思考参数与推理内容，兼容上游已分离和未分离两种输出。
+- 为流式请求补充用量统计，显示模型名、TTFT、Decode TPS 与耗时；历史轮次也可查看。
+- 可选模型预热；模型列表用颜色显示预热与驻留状态。
+- 可配置 GenieX Compute、Vision Encoder 与采样默认值。
+- 安装 **仅回复** 权限：只读、无审批，并隐藏和拒绝工具调用。
 
-### 要求与安装
+### 安装
 
 - DSH 需支持 Cordis bundle 与 Plugin Manager。
 - 从离线 zip 或插件目录安装，刷新 DSH 页面；详见 [INSTALL.md](INSTALL.md)。
@@ -34,21 +31,26 @@
 1. 打开 **Settings → Qwen Mode**。
 2. 选择 **关闭** 或 **自动**。
 3. 选择来源并填写上游地址：
-   - **GenieX**：填 `http://127.0.0.1:18181` 即可，插件自动使用 `/v1`。
+   - **GenieX**：填 `http://127.0.0.1:18181`，插件自动使用 `/v1`。
    - **QwenCloud**：填写完整兼容端点，插件不会自动追加 `/v1`。
-4. 按需设置模型限制、推理后端与采样默认值。
-5. 点击「保存并应用」，插件自动创建/更新 Provider。
+4. 按需设置上下文窗口、最大输出、推理后端与采样默认值。
+5. 点击「保存并应用」，插件自动创建或更新 Provider。
 6. 在模型选择器中选择该 Provider 下的模型。
 
 ### 设置
 
-- **API Key**：留空时使用 DSH credential `local`，不读取同名环境变量；QwenCloud 可填写环境变量名，例如 `DASHSCOPE_API_KEY`。
-- **上下文窗口**：留空时，GenieX 视为由 `geniex serve --nctx <value>` 指定，不再下发上下文窗口字段；QwenCloud 使用默认 `262144`。
-- **推理后端**（仅 GenieX）：`Compute` 可留空或填写 `cpu/gpu/npu/hybrid`、设备列表；`Vision Encoder` 在 CPU/GPU/NPU 间切换，NPU 映射为 `HTP2`，且只对检测到的 VLM 下发。
-- **模型能力**：已知模型系列使用快速映射；未知 GenieX 模型回退读取缓存 GGUF 的 `tokenizer.chat_template`，检测 `reasoning_effort` 档位，未知档位不显示。
-- **模型预热**：位于「接入来源 → 高级选项」，仅对 `From GenieX` 生效；发送最小 system prompt + 单 token 请求，预热期间发送按钮替换为转圈。耗时主要来自模型加载，prompt 本身占比很小。
-- **统计**：仅在该轮回复完成后显示；DSH 在流式阶段不提供可用的 TTFT/Decode TPS 结算值。
-- **GenieX reasoning_format**：请求使用 `auto`；上游已分离出纯 `reasoning_content` 时直接透传，未分离时由代理回退解析内联思考。
+- **API Key**：留空时使用 DSH credential `local`；QwenCloud 可填写环境变量名，例如 `DASHSCOPE_API_KEY`。
+- **上下文窗口**：留空时 GenieX 使用服务端 `--nctx`；QwenCloud 使用 `262144`。
+- **推理后端**（仅 GenieX）：
+  - `Compute` 可留空，或填写 `cpu` / `gpu` / `npu` / `hybrid` / 设备列表。
+  - `Vision Encoder` 可选 CPU / GPU / NPU；NPU 对应 GenieX 的 `HTP2`。
+- **模型预热**：位于「接入来源 → 高级选项」，仅对 `From GenieX` 生效。预热与正式请求使用相同的加载参数，避免刚预热就因参数变化重新加载。
+- **驻留圆点**：仅当来源为 GenieX 且自动预热启用时显示：
+  - 黄点：正在预热
+  - 绿点：已预热并驻留
+  - 红点：未预热
+  - 蓝点：其它 Provider，无需预热
+- **统计**：仅在该轮回复完成后显示。
 - **仅回复**：隐藏并拒绝工具调用，适合纯聊天。
 - **repetition_penalty**：可设为 `1.05`，降低 thinking 段落循环输出的概率。
 
@@ -56,31 +58,28 @@
 
 - 代理固定监听 `127.0.0.1:18182`；端口被占用时插件无法启动。
 - 模型目录来自上游 `/v1/models`；上游不提供该端点时不会创建模型。
-- 只处理 JSON 请求体和 SSE/JSON 响应，其他端点原样透传。
-- 采样默认值只填充请求未自带的字段。
+- 模型选择仍由 DSH 按会话管理；插件的预热/驻留状态是全局的，但不会改写各会话已选择的模型。
+- GenieX 同一时刻只驻留一个模型。不同会话选择不同模型时，旧模型会被卸载，这是上游行为。
 
 ---
 
 ## English
 
-DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers, thinking parameter normalization, reasoning parsing, and per-turn model performance.
+DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed model providers, thinking and reasoning handling, and per-turn model performance.
 
 ### Features
 
-- **Off / Auto** only; Auto applies only to models under `From GenieX` / `From QwenCloud`.
-- GenieX creates **From GenieX**; QwenCloud creates **From QwenCloud**.
-- Discovers models and builds context-window / max-output limits.
-- Detects GenieX VLMs through `/v1/models/{id}` `model_type` (falling back to cache `mmproj`/`geniex.json`) and declares both text and image inputs; the cache root is read from `geniex list`'s `Models cached in ...` line.
-- GenieX requests can override `compute` and `vit_compute` inference parameters.
-- Injects `enable_think` for GenieX; injects `enable_thinking` and preserves `reasoning_effort` for QwenCloud.
-- Splits `<think>...</think>` into `reasoning_content`; recognizes GenieX's reasoning-paragraph + blank-line + answer shape when tags are absent.
-- Adds `stream_options.include_usage` to streaming requests and shows model, TTFT, Decode TPS, and time after a reply completes; historical turns are included.
-- Adds **仅回复 / Reply Only**: read-only, no approvals, tools hidden/denied.
-- Optional warmup for `From GenieX` models; warmups are serialized so models cannot evict each other.
-- Shows a quantization badge (for example `Q4_0`) and hides the shipped model-trigger icon.
-- Configurable context window, max output, sampling defaults, and `repetition_penalty`.
+- **Off / Auto** modes; Auto applies only to models under `From GenieX` / `From QwenCloud`.
+- Creates and maintains the **From GenieX** or **From QwenCloud** provider.
+- Discovers models from the upstream catalog and configures context and output limits.
+- Detects VLM models and declares text plus image input.
+- Handles thinking parameters and reasoning content, whether the upstream separates it or not.
+- Adds streaming usage data and shows model name, TTFT, Decode TPS, and elapsed time; historical turns are included.
+- Optional model warmup, with colored residency dots in the model list.
+- GenieX Compute, Vision Encoder, and sampling defaults.
+- **Reply Only** permission: read-only, no approvals, tools hidden and denied.
 
-### Requirements and Install
+### Install
 
 - DSH with Cordis bundle and Plugin Manager support.
 - Install from the offline zip or plugin directory, then refresh DSH. See [INSTALL.md](INSTALL.md).
@@ -91,37 +90,42 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers
 1. Open **Settings → Qwen Mode**.
 2. Choose **Off** or **Auto**.
 3. Choose a source and enter the upstream URL:
-   - **GenieX**: `http://127.0.0.1:18181`; the plugin appends `/v1` automatically.
+   - **GenieX**: `http://127.0.0.1:18181`; the plugin appends `/v1`.
    - **QwenCloud**: enter the full compatible endpoint; the plugin does not append `/v1`.
-4. Adjust model limits, inference backend, and sampling defaults.
-5. Click **Save and Apply**; the managed provider is created or updated.
+4. Adjust context, max output, inference backend, and sampling defaults as needed.
+5. Click **Save and Apply**; the provider is created or updated.
 6. Select a model under that provider in the model picker.
 
 ### Settings
 
-- **API Key**: empty uses DSH credential `local` and does not read an environment variable of that name. For QwenCloud, enter an environment variable such as `DASHSCOPE_API_KEY`.
-- **Context window**: when empty, GenieX assumes `geniex serve --nctx <value>` and the field is omitted; QwenCloud uses the default `262144`.
-- **Inference Backend** (GenieX only): `Compute` may be empty or contain `cpu/gpu/npu/hybrid` or a device list; `Vision Encoder` switches CPU/GPU/NPU, mapping NPU to `HTP2`, and is sent only for detected VLMs.
-- **Capabilities**: known model families use a fast mapping; unknown GenieX models fall back to the cached GGUF `tokenizer.chat_template` to detect `reasoning_effort` levels. Unknown levels are not shown.
-- **Model Warmup**: under **Source → Advanced**, applies only to `From GenieX`; sends a minimal system prompt and a one-token request, replacing the send button with a spinner. Load time is dominated by model loading, not prompt length.
-- **Stats**: shown only after the reply completes; DSH does not expose settled TTFT/Decode TPS during streaming.
-- **GenieX reasoning_format**: requests use `auto`; when upstream separates pure `reasoning_content`, it is passed through, otherwise the proxy falls back to inline-thinking parsing.
-- **Reply Only**: hides and denies tools for a pure chat experience.
+- **API Key**: empty uses the DSH credential `local`; for QwenCloud, enter an environment variable such as `DASHSCOPE_API_KEY`.
+- **Context window**: empty lets GenieX use its `--nctx`; QwenCloud falls back to `262144`.
+- **Inference Backend** (GenieX only):
+  - `Compute` may be empty or contain `cpu` / `gpu` / `npu` / `hybrid` / a device list.
+  - `Vision Encoder` selects CPU / GPU / NPU; NPU maps to GenieX `HTP2`.
+- **Model Warmup**: under **Source → Advanced**, GenieX only. Warmup uses the same load parameters as real requests, so it is not immediately reloaded.
+- **Residency dots**: shown only when the source is GenieX and warmup is enabled:
+  - Yellow: warming up
+  - Green: warmed and resident
+  - Red: not warmed
+  - Blue: another provider, no warmup needed
+- **Stats**: shown after a reply completes.
+- **Reply Only**: hides and denies tools for pure chat.
 - **repetition_penalty**: try `1.05` to reduce looping in thinking output.
 
 ### Limitations
 
-- The proxy listens on `127.0.0.1:18182`; the plugin cannot start if the port is busy.
+- The proxy listens on `127.0.0.1:18182`; it cannot start if the port is busy.
 - Model catalogs come from the upstream `/v1/models` endpoint.
-- Only JSON request bodies and SSE/JSON responses are transformed; other endpoints pass through.
-- Sampling defaults fill only fields the request does not already carry.
+- Model selection stays per Session in DSH; the plugin's warm/residency state is global but does not rewrite session selections.
+- GenieX keeps only one model resident at a time. Different models selected in different Sessions will unload the previous one; this is upstream behavior.
 
 ---
 
 ## Files / 文件
 
-- `index.js` — proxy, provider maintenance, model discovery, reasoning parser, turn metrics.
-- `client.js` — settings page, model label, warmup spinner, permission icon, turn stats.
+- `index.js` — proxy, provider maintenance, model discovery, reasoning, metrics, warm status.
+- `client.js` — settings page, model list status, warmup spinner, permission icon, turn stats.
 - `cordis.patch.yml` — installs the `qwen-mode` loader row.
 - `locale/` — plugin inventory copy (`zh`, `en`).
 - `icon.svg` — plugin icon.

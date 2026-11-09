@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Browser half of the Qwen mode bundle: one compact Settings section.
  *
  * The Host owns the provider entry (`From GenieX` / `From QwenCloud`), so this
@@ -153,6 +153,46 @@ window.__ModuleLoader__.load({
       return body.value
     }
 
+    const warmState = {
+      states: new Map(),
+      enabled: false,
+      listeners: new Set(),
+      timer: null,
+      subscribers: 0,
+      refreshing: false,
+      async refresh() {
+        if (warmState.refreshing) return
+        warmState.refreshing = true
+        try {
+          const status = await call('modelStatus')
+          warmState.states = new Map(Object.entries(status?.states ?? {}))
+          warmState.enabled = status?.active === true
+        } catch {
+          warmState.states = new Map()
+          warmState.enabled = false
+        }
+        warmState.refreshing = false
+        for (const listener of warmState.listeners) listener()
+      },
+      subscribe(listener) {
+        warmState.listeners.add(listener)
+        warmState.subscribers += 1
+        if (warmState.subscribers === 1) {
+          void warmState.refresh()
+          warmState.timer = window.setInterval(() => void warmState.refresh(), 2500)
+        }
+        listener()
+        return () => {
+          warmState.listeners.delete(listener)
+          warmState.subscribers -= 1
+          if (warmState.subscribers === 0 && warmState.timer !== null) {
+            window.clearInterval(warmState.timer)
+            warmState.timer = null
+          }
+        }
+      },
+    }
+
     function QwenGlyph({ size = 18 }) {
       return h('svg', {
         viewBox: '0 0 24 24',
@@ -166,12 +206,69 @@ window.__ModuleLoader__.load({
       ])
     }
 
+    /** Model name that marquees only while hovered and only when it overflows. */
+    function ModelName({ name, marquee }) {
+      const outerRef = React.useRef(null)
+      const innerRef = React.useRef(null)
+      const [hovered, setHovered] = React.useState(false)
+      const [distance, setDistance] = React.useState(0)
+      const measure = () => {
+        const outer = outerRef.current
+        const inner = innerRef.current
+        if (outer === null || inner === null) return
+        const previous = inner.style.maxWidth
+        inner.style.maxWidth = 'none'
+        setDistance(Math.max(0, inner.scrollWidth - outer.clientWidth))
+        inner.style.maxWidth = previous
+      }
+      React.useEffect(() => {
+        measure()
+      }, [name])
+      if (!marquee) return h('span', { style: S.modelName, title: name }, name)
+      const reduceMotion = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
+      const duration = Math.max(4, Math.min(12, distance / 25))
+      return h('span', {
+        ref: outerRef,
+        style: { ...S.modelName, display: 'inline-block', maxWidth: '100%' },
+        onMouseEnter: () => {
+          setHovered(true)
+          measure()
+        },
+        onMouseLeave: () => setHovered(false),
+      }, h('span', {
+        ref: innerRef,
+        style: {
+          display: 'inline-block',
+          maxWidth: hovered ? 'none' : '100%',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          whiteSpace: 'nowrap',
+          animation: hovered && distance > 0 && !reduceMotion
+            ? `qwen-model-name-marquee ${duration}s linear infinite alternate`
+            : 'none',
+          '--qwen-model-name-distance': `${distance}px`,
+        },
+      }, name))
+    }
+
     /**
      * Inline model label for the composer model selector. The slot replaces the
      * built-in name + badge, so render both; GenieX models gain a quantization
      * tag derived from their `:Q4_0` suffix.
      */
     function ModelLabel({ provider, model, placement, selected, sessionId, getLocale }) {
+      const [warmEnabled, setWarmEnabled] = React.useState(false)
+      const [residentState, setResidentState] = React.useState('')
+      React.useEffect(() => {
+        const update = () => {
+          setWarmEnabled((current) => current === warmState.enabled ? current : warmState.enabled)
+          if (placement === 'option' && provider?.id === 'from-geniex' && typeof model?.id === 'string') {
+            const next = warmState.states.get(model.id) ?? ''
+            setResidentState((current) => current === next ? current : next)
+          }
+        }
+        return warmState.subscribe(update)
+      }, [placement, provider?.id, model?.id])
       React.useEffect(() => {
         if (placement !== 'trigger' || !selected) return
         const key = sessionId ?? 'global'
@@ -196,9 +293,11 @@ window.__ModuleLoader__.load({
           await preheat.bootDelay
           if (preheat.ready !== null) await preheat.ready
           if (preheat.selected.get(key) !== modelId) return
+          if (!preheat.enabled) return
+          const loaded = warmState.states.has(modelId)
+          if (loaded && lastWarm.get(key) === modelId) return
           const modelKey = `${key}\u0000${modelId}`
-          if (!preheat.enabled || lastWarm.get(key) === modelId) return
-          if (Date.now() - (lastWarmAt.get(modelKey) ?? 0) < 15000) return
+          if (loaded && Date.now() - (lastWarmAt.get(modelKey) ?? 0) < 15000) return
           lastWarm.set(key, modelId)
           lastWarmAt.set(modelKey, Date.now())
           preheat.begin(modelKey)
@@ -215,6 +314,49 @@ window.__ModuleLoader__.load({
       }, [placement, selected, provider?.id, model?.id, sessionId])
 
       const name = model?.name ?? model?.id ?? ''
+      const dotKind = !warmEnabled || placement !== 'option'
+        ? null
+        : provider?.id === 'from-geniex'
+          ? (residentState === 'loading' ? 'yellow' : residentState === '' ? 'red' : 'green')
+          : 'blue'
+      const warmZh = String(getLocale?.() ?? '').startsWith('zh')
+      const dotTitle = dotKind === null
+        ? ''
+        : warmZh
+          ? (dotKind === 'yellow' ? '正在预热' : dotKind === 'green' ? '已预热' : dotKind === 'red' ? '未预热' : '无需预热')
+          : (dotKind === 'yellow' ? 'Warming up' : dotKind === 'green' ? 'Warmed' : dotKind === 'red' ? 'Not warmed' : 'No warmup needed')
+      const dotFill = dotKind === 'green'
+        ? 'var(--dsw-alias-state-success-primary)'
+        : dotKind === 'yellow'
+          ? 'var(--dsw-alias-state-warn-primary)'
+          : dotKind === 'red'
+            ? 'var(--dsw-alias-state-error-primary)'
+            : '#ADD8E6'
+      const warmDot = dotKind === null
+        ? null
+        : h('span', {
+          key: 'warm',
+          title: dotTitle,
+          style: {
+            width: '7px',
+            height: '7px',
+            flex: '0 0 7px',
+            alignSelf: 'center',
+            marginLeft: 'auto',
+            marginRight: '2px',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            lineHeight: 0,
+          },
+        }, h('svg', {
+          key: 'circle',
+          viewBox: '0 0 7 7',
+          width: 7,
+          height: 7,
+          'aria-hidden': true,
+          style: { display: 'block', flex: '0 0 7px' },
+        }, h('circle', { cx: 3.5, cy: 3.5, r: 3.5, fill: dotFill })))
       const badges = []
       if (provider?.id === 'from-geniex' && typeof model?.id === 'string') {
         const match = /:([^:/\s]+)$/u.exec(model.id)
@@ -245,9 +387,13 @@ window.__ModuleLoader__.load({
           }, text))
         }
       }
-      return h('span', { style: S.modelLabel }, placement === 'trigger'
-        ? [...badges, h('span', { key: 'name', style: S.modelName, title: name }, name)]
-        : [h('span', { key: 'name', style: S.modelName, title: name }, name), ...badges])
+      const nameNode = h(ModelName, { key: 'name', name, marquee: placement === 'option' })
+      const parts = placement === 'trigger'
+        ? [...badges, nameNode]
+        : [nameNode, ...badges]
+      if (warmDot !== null) parts.push(warmDot)
+      const labelStyle = placement === 'option' ? { ...S.modelLabel, width: '100%' } : S.modelLabel
+      return h('span', { style: labelStyle }, parts)
     }
 
     /** Insert per-turn model/TTFT/TPS into the finalized assistant action row. */
@@ -457,8 +603,8 @@ window.__ModuleLoader__.load({
       segment: { border: 'none', background: 'transparent', color: 'var(--dsw-alias-label-secondary)', borderRadius: '6px', padding: '5px 9px', fontSize: '11px', cursor: 'pointer', whiteSpace: 'nowrap' },
       segmentActive: { border: 'none', background: 'var(--dsw-alias-brand-primary)', color: 'var(--dsw-alias-label-primary-inverted)', borderRadius: '6px', padding: '5px 9px', fontSize: '11px', cursor: 'pointer', whiteSpace: 'nowrap' },
       modelLabel: { display: 'inline-flex', alignItems: 'center', gap: '4px', minWidth: 0, maxWidth: '100%', height: '20px', verticalAlign: 'middle' },
-      modelName: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, lineHeight: '20px' },
-      modelBadge: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: '0 0 auto', height: '20px', boxSizing: 'border-box', padding: '0 6px', borderRadius: '999px', border: '1px solid var(--dsw-alias-border-l1)', background: 'transparent', fontSize: '9px', lineHeight: '20px', fontWeight: 500, whiteSpace: 'nowrap', alignSelf: 'center' },
+      modelName: { display: 'inline-flex', alignItems: 'center', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', minWidth: 0, height: '18px', lineHeight: '18px' },
+      modelBadge: { display: 'inline-flex', alignItems: 'center', justifyContent: 'center', flex: '0 0 auto', height: '18px', boxSizing: 'border-box', padding: '0 5px', borderRadius: '999px', border: '1px solid var(--dsw-alias-border-l1)', background: 'transparent', fontSize: '9px', lineHeight: '18px', fontWeight: 500, whiteSpace: 'nowrap', alignSelf: 'center' },
       checkRow: { display: 'flex', alignItems: 'center', gap: '8px', color: 'var(--dsw-alias-label-primary)', fontSize: '12px', cursor: 'pointer' },
       banner: { padding: '9px 11px', borderRadius: '8px', border: '1px solid var(--dsw-alias-state-error-primary)', color: 'var(--dsw-alias-state-error-primary)', background: 'var(--dsw-alias-bg-layer-1)', fontSize: '12px', overflowWrap: 'anywhere' },
       card: { display: 'flex', flexDirection: 'column', gap: '10px', padding: '14px', borderRadius: '10px', border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-1)' },
@@ -895,6 +1041,33 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale'],
       apply(ctx) {
+        if (typeof document !== 'undefined') {
+          const style = document.createElement('style')
+          style.id = 'qwen-model-option-warm'
+          style.textContent = 'button[role="option"] [data-provider-id]{display:flex!important;align-items:center!important;width:100%!important;min-width:0!important}@keyframes qwen-model-name-marquee{from{transform:translateX(0)}to{transform:translateX(calc(-1 * var(--qwen-model-name-distance,0px)))}}'
+          document.head.appendChild(style)
+          ctx.effect(() => () => style.remove(), 'qwen-mode: model option warm style')
+          ctx.effect(() => {
+            let scheduled = false
+            const clear = () => {
+              for (const button of document.querySelectorAll('button[role="menuitemradio"][title]')) {
+                button.removeAttribute('title')
+              }
+            }
+            const schedule = () => {
+              if (scheduled) return
+              scheduled = true
+              requestAnimationFrame(() => {
+                scheduled = false
+                clear()
+              })
+            }
+            const observer = new MutationObserver(schedule)
+            observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['title'] })
+            clear()
+            return () => observer.disconnect()
+          }, 'qwen-mode: model option title')
+        }
         let bound
         try {
           ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'qwen-mode: locale')

@@ -255,6 +255,13 @@ function thinkingEnabled(body) {
   return true
 }
 
+function inferenceFields(settings, vision) {
+  const fields = {}
+  if (settings.compute !== '') fields.compute = settings.compute
+  if (vision) fields.vit_compute = VIT_COMPUTE_VALUE[settings.vitCompute]
+  return fields
+}
+
 function applyRequestDefaults(body, settings, vision = false) {
   const output = { ...body }
   const thinking = thinkingEnabled(body)
@@ -269,8 +276,7 @@ function applyRequestDefaults(body, settings, vision = false) {
     if (thinking && ['low', 'medium', 'high', 'xhigh'].includes(effort)) output.reasoning_effort = effort
     else delete output.reasoning_effort
     output.reasoning_format = 'auto'
-    if (settings.compute !== '') output.compute = settings.compute
-    if (vision) output.vit_compute = VIT_COMPUTE_VALUE[settings.vitCompute]
+    Object.assign(output, inferenceFields(settings, vision))
   }
   const fill = (key, value) => {
     if (value !== null && output[key] === undefined) output[key] = value
@@ -781,7 +787,7 @@ async function discoverModels(ctx, settings) {
   }))
 }
 
-async function warmUpModel(ctx, settings, model) {
+async function warmUpModel(ctx, settings, model, vision = false) {
   const url = upstreamURL(settings, 'chat/completions')
   const body = {
     model,
@@ -794,7 +800,7 @@ async function warmUpModel(ctx, settings, model) {
     stream: false,
   }
   if (settings.protocol === 'qwen') body.enable_thinking = false
-  else Object.assign(body, { enable_think: false, reasoning_format: 'none' })
+  else Object.assign(body, { enable_think: false, reasoning_format: 'none' }, inferenceFields(settings, vision))
   const startedAt = Date.now()
   const response = await fetch(url, {
     method: 'POST',
@@ -1026,8 +1032,46 @@ export async function apply(ctx) {
     for (const id of provider.visionModels) visionModels.add(id)
   }
 
+  const statusCache = { key: '', at: 0, value: null }
+  const readGeniexStatus = async () => {
+    const active = settings.protocol === 'geniex' && settings.warm === true
+    if (!active) return { active: false, models: [] }
+    const key = settings.upstream
+    if (statusCache.key === key && Date.now() - statusCache.at < 1500) return statusCache.value
+    let value = { active: true, models: [] }
+    try {
+      const url = new URL(settings.upstream)
+      url.pathname = '/status'
+      url.search = ''
+      const response = await fetch(url, {
+        headers: { accept: 'application/json', ...await credentialHeader(ctx, settings) },
+        signal: AbortSignal.timeout(2000),
+      })
+      if (response.ok) {
+        const body = await response.json()
+        const models = Array.isArray(body?.models)
+          ? body.models.filter((model) => typeof model?.id === 'string')
+          : []
+        value = {
+          active: true,
+          models: models.map((model) => model.id),
+          states: Object.fromEntries(models.map((model) => [model.id, model.state])),
+          keepaliveSeconds: typeof body?.keepalive_seconds === 'number' ? body.keepalive_seconds : null,
+        }
+      }
+    } catch {
+      // A missing status endpoint means the client cannot classify warm models.
+    }
+    statusCache.key = key
+    statusCache.at = Date.now()
+    statusCache.value = value
+    return value
+  }
+
+  let warmQueue = Promise.resolve()
   const api = {
     state: () => state(),
+    modelStatus: readGeniexStatus,
     setMode: async (payload) => {
       const mode = ['off', 'auto'].includes(payload?.mode) ? payload.mode : null
       if (mode === null) throw httpError(400, 'invalid mode')
@@ -1088,12 +1132,21 @@ export async function apply(ctx) {
       })
       return { updated: true, name }
     },
-    warm: async (payload) => {
-      if (!settings.warm) throw httpError(409, 'model warmup is disabled')
-      const model = text(payload?.model)
-      if (model === '' || !managedModels.has(model)) throw httpError(400, 'unknown managed model')
-      const result = await warmUpModel(ctx, settings, model)
-      return { warmed: true, model, ...result }
+    warm: (payload) => {
+      const operation = async () => {
+        if (!settings.warm) throw httpError(409, 'model warmup is disabled')
+        const model = text(payload?.model)
+        if (model === '' || !managedModels.has(model)) throw httpError(400, 'unknown managed model')
+        if (settings.protocol === 'geniex') {
+          const status = await readGeniexStatus()
+          if (status.models.includes(model)) return { warmed: true, model, skipped: true }
+        }
+        const result = await warmUpModel(ctx, settings, model, visionModels.has(model))
+        return { warmed: true, model, ...result }
+      }
+      const result = warmQueue.then(operation, operation)
+      warmQueue = result.catch(() => {})
+      return result
     },
     save: async (payload) => {
       const mode = ['off', 'auto', 'always'].includes(payload?.mode) ? payload.mode : settings.mode
