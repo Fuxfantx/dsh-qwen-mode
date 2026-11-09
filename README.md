@@ -47,7 +47,7 @@
 - **推理后端**（仅 GenieX）：
   - `Compute` 可留空，或填写 `cpu` / `gpu` / `npu` / `hybrid` / 设备列表。
   - `Vision Encoder` 可选 CPU / GPU / NPU；NPU 对应 GenieX 的 `HTP2`。
-- **采样推荐**：设置页可从 GGUF 的 `general.sampling.*` 一键填入 temperature / top_p / top_k / min_p；填入后仍需保存。
+- **采样推荐**：设置页可从 GGUF 的 `general.sampling.*` 读取推荐值并填入 temperature / top_p / top_k / min_p；填入后仍需保存。
 - **模型名颜色**：GGUF tags 含 `abliterated`、`abliteration`、`uncensored` 或 `refusal-direction` 时，模型名使用主题的 warning 色显示。
 - **模型预热**：位于「接入来源 → 高级选项」，仅对 `From GenieX` 生效。预热与正式请求使用相同的加载参数，避免刚预热就因参数变化重新加载。
 - **驻留圆点**：仅在来源为 GenieX、模式为自动且自动预热启用时显示：
@@ -111,7 +111,7 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed model pro
 - **Inference Backend** (GenieX only):
   - `Compute` may be empty or contain `cpu` / `gpu` / `npu` / `hybrid` / a device list.
   - `Vision Encoder` selects CPU / GPU / NPU; NPU maps to GenieX `HTP2`.
-- **Sampling recommendation**: fill temperature / top_p / top_k / min_p from GGUF `general.sampling.*` in one click; save afterward.
+- **Sampling recommendation**: read temperature / top_p / top_k / min_p from GGUF `general.sampling.*`; save afterward.
 - **Model name color**: when GGUF tags include `abliterated`, `abliteration`, `uncensored`, or `refusal-direction`, the model name uses the theme warning color.
 - **Model Warmup**: under **Source → Advanced**, GenieX only. Warmup uses the same load parameters as real requests, so it is not immediately reloaded.
 - **Residency dots**: shown only when the source is GenieX, the mode is Auto, and warmup is enabled:

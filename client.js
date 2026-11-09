@@ -55,7 +55,7 @@ window.__ModuleLoader__.load({
       'autoNctx.label': '优先使用模型上下文阈限（GGUF context_length）',
       'maxOutputTokens.label': '最大输出长度',
       'mtp.label': 'MTP 投机解码',
-      'mtp.hint': '仅对内含MTP/nextn 头、目录存在 mtp-*.gguf 的GGUF模型生效，MTP启用时暂不支持添加图片。',
+      'mtp.hint': '仅对内含 MTP / nextn 头、目录存在 mtp-*.gguf 文件的 GGUF 模型生效，MTP 启用时暂不支持添加图片。',
       'mtp.tokens': 'spec_n_max',
       'mtp.min': 'spec_n_min',
       'mtp.pmin': 'spec_p_min',
@@ -69,9 +69,8 @@ window.__ModuleLoader__.load({
       'sampling.title': '采样默认值',
       'sampling.hint': '仅在请求未携带该字段时填充；留空则不注入。',
       'sampling.recommend': '元数据推荐',
-      'sampling.fill': '填入推荐值',
+      'sampling.fill': '读取推荐值',
       'sampling.none': '当前没有带推荐采样值的模型',
-      'sampling.recommendHint': '从 GGUF 的 general.sampling.* 读取；填入后仍需保存。',
       'temperature.label': 'temperature',
       'topP.label': 'top_p',
       'topK.label': 'top_k',
@@ -130,7 +129,7 @@ window.__ModuleLoader__.load({
       'autoNctx.label': 'Prefer model context limit (GGUF context_length)',
       'maxOutputTokens.label': 'Max output tokens',
       'mtp.label': 'MTP speculative decoding',
-      'mtp.hint': 'Applies only to GGUF models with an MTP/nextn head and an mtp-*.gguf companion; images are not supported while MTP is enabled.',
+      'mtp.hint': 'Applies only to GGUF models with an MTP / nextn head and an mtp-*.gguf companion file; images are not supported while MTP is enabled.',
       'mtp.tokens': 'spec_n_max',
       'mtp.min': 'spec_n_min',
       'mtp.pmin': 'spec_p_min',
@@ -144,9 +143,8 @@ window.__ModuleLoader__.load({
       'sampling.title': 'Sampling Defaults',
       'sampling.hint': 'Filled only when the request does not already carry the field; empty omits it.',
       'sampling.recommend': 'Metadata recommendation',
-      'sampling.fill': 'Fill recommended',
+      'sampling.fill': 'Read recommended',
       'sampling.none': 'No model currently exposes recommended sampling',
-      'sampling.recommendHint': 'Read from GGUF general.sampling.*; save after filling.',
       'temperature.label': 'temperature',
       'topP.label': 'top_p',
       'topK.label': 'top_k',
@@ -341,11 +339,30 @@ window.__ModuleLoader__.load({
      * built-in name + badge, so render both; GenieX models gain a quantization
      * tag derived from their `:Q4_0` suffix.
      */
-    function ModelLabel({ provider, model, placement, selected, sessionId, getLocale }) {
+    function ModelLabel({ provider, model, placement, selected, sessionId, getLocale, getTheme, subscribeTheme }) {
+      const [darkTheme, setDarkTheme] = React.useState(() => {
+        try {
+          return getTheme?.()?.active?.colorScheme !== 'light'
+        } catch {
+          return true
+        }
+      })
       const [warmEnabled, setWarmEnabled] = React.useState(false)
       const [residentState, setResidentState] = React.useState('')
       const [warmRevision, setWarmRevision] = React.useState(warmState.revision)
       const [modelMeta, setModelMeta] = React.useState(null)
+      React.useEffect(() => {
+        if (typeof getTheme !== 'function' || typeof subscribeTheme !== 'function') return undefined
+        const read = () => {
+          try {
+            setDarkTheme(getTheme()?.active?.colorScheme !== 'light')
+          } catch {
+            // Keep the last known scheme.
+          }
+        }
+        read()
+        return subscribeTheme(read)
+      }, [getTheme, subscribeTheme])
       React.useEffect(() => {
         const update = () => {
           setWarmEnabled((current) => current === warmState.enabled ? current : warmState.enabled)
@@ -501,7 +518,9 @@ window.__ModuleLoader__.load({
         key: 'name',
         name,
         marquee: placement === 'option',
-        color: abliterated ? 'var(--dsw-alias-state-warn-primary)' : undefined,
+        color: abliterated
+          ? darkTheme ? '#FFFF00' : 'var(--dsw-alias-state-warn-primary)'
+          : undefined,
       })
       const parts = placement === 'trigger'
         ? [...badges, nameNode]
@@ -1294,7 +1313,19 @@ window.__ModuleLoader__.load({
             h('div', { key: 'heading', style: S.configHeading }, t('sampling.title')),
             h('div', { key: 'hint', style: S.hint }, t('sampling.hint')),
             h('div', { key: 'grid', style: { ...S.grid, gridTemplateColumns: 'repeat(4, minmax(0, 1fr))' } }, [
-              ...['temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty'].map((key) => h(Field, {
+              ...['temperature', 'topP', 'topK', 'minP'].map((key) => h(Field, {
+                key,
+                label: t(`${key}.label`),
+              }, h('input', {
+                key: 'input',
+                style: S.input,
+                inputMode: 'decimal',
+                value: numberValue(key),
+                onChange: (event) => setNumber(key, event.target.value),
+              }))),
+            ]),
+            h('div', { key: 'grid-penalties', style: { ...S.grid, gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', marginTop: '10px' } }, [
+              ...['repetitionPenalty', 'presencePenalty', 'frequencyPenalty'].map((key) => h(Field, {
                 key,
                 label: t(`${key}.label`),
               }, h('input', {
@@ -1320,7 +1351,6 @@ window.__ModuleLoader__.load({
                 onClick: fillRecommendedSampling,
               }, t('sampling.fill')),
             ]),
-            h('div', { key: 'recommend-hint', style: S.hint }, t('sampling.recommendHint')),
           ]),
           settings.protocol === 'geniex' ? h('div', { key: 'inference-wrap' }, [
             h('div', { key: 'divider-inference', style: S.divider }),
@@ -1385,7 +1415,7 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'locale'],
+      inject: ['slots', 'locale', 'theme'],
       apply(ctx) {
         if (typeof document !== 'undefined') {
           const style = document.createElement('style')
@@ -1440,7 +1470,11 @@ window.__ModuleLoader__.load({
 
         ctx.slots.inject('conversation.input.model.label', () => ctx.slots.register({
           name: 'conversation.input.model.label',
-          inject: () => ({ getLocale: () => ctx.locale.getLocale().active }),
+          inject: () => ({
+            getLocale: () => ctx.locale.getLocale().active,
+            getTheme: () => ctx.theme.getTheme(),
+            subscribeTheme: (listener) => ctx.on('theme/change', listener),
+          }),
         }, ModelLabel))
 
         ctx.slots.inject('conversation.input.overlay', () => ctx.slots.register({
