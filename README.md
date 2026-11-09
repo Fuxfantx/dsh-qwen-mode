@@ -45,7 +45,7 @@
   - `Compute` 可留空，或填写 `cpu` / `gpu` / `npu` / `hybrid` / 设备列表。
   - `Vision Encoder` 可选 CPU / GPU / NPU；NPU 对应 GenieX 的 `HTP2`。
 - **模型预热**：位于「接入来源 → 高级选项」，仅对 `From GenieX` 生效。预热与正式请求使用相同的加载参数，避免刚预热就因参数变化重新加载。
-- **驻留圆点**：仅当来源为 GenieX 且自动预热启用时显示：
+- **驻留圆点**：仅在来源为 GenieX、模式为自动且自动预热启用时显示：
   - 黄点：正在预热
   - 绿点：已预热并驻留
   - 红点：未预热
@@ -104,7 +104,7 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed model pro
   - `Compute` may be empty or contain `cpu` / `gpu` / `npu` / `hybrid` / a device list.
   - `Vision Encoder` selects CPU / GPU / NPU; NPU maps to GenieX `HTP2`.
 - **Model Warmup**: under **Source → Advanced**, GenieX only. Warmup uses the same load parameters as real requests, so it is not immediately reloaded.
-- **Residency dots**: shown only when the source is GenieX and warmup is enabled:
+- **Residency dots**: shown only when the source is GenieX, the mode is Auto, and warmup is enabled:
   - Yellow: warming up
   - Green: warmed and resident
   - Red: not warmed

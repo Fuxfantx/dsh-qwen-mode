@@ -10,7 +10,7 @@
  */
 
 import { execFile } from 'node:child_process'
-import { mkdir, open, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
 import { homedir } from 'node:os'
@@ -21,6 +21,7 @@ const SCOPE = 'qwen-mode'
 const API_PREFIX = '/qwen-mode/api'
 const STORE_FILE = 'qwen-mode.json'
 const MAX_BODY = 8 * 1024 * 1024
+const MAX_PROXY_BODY = 32 * 1024 * 1024
 const DEFAULT_PORT = 18182
 const VIT_COMPUTE_VALUE = { cpu: 'CPU', gpu: 'GPU', npu: 'HTP2' }
 const VISION_MODEL_PATTERN = /(?:^|[/_-])(?:vl|vision)(?:[/_-]|$)/iu
@@ -59,6 +60,25 @@ export const inject = ['webServer', 'connection', 'configEditor', 'credentials',
 
 function text(value) {
   return typeof value === 'string' ? value.trim() : ''
+}
+
+function normalizeUpstream(value) {
+  const candidate = text(value).replace(/\/+$/u, '')
+  try {
+    const url = new URL(candidate)
+    return url.protocol === 'http:' || url.protocol === 'https:' ? candidate : DEFAULTS.upstream
+  } catch {
+    return DEFAULTS.upstream
+  }
+}
+
+function assertUpstream(value) {
+  const candidate = text(value)
+  try {
+    const url = new URL(candidate)
+    if (url.protocol === 'http:' || url.protocol === 'https:') return
+  } catch {}
+  throw httpError(400, 'Upstream URL must be an absolute http(s) URL')
 }
 
 function numberOrNull(value) {
@@ -130,17 +150,21 @@ function sendJson(res, status, body) {
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let size = 0
+    let rejected = false
     const chunks = []
     req.on('data', (chunk) => {
+      if (rejected) return
       size += chunk.length
       if (size > MAX_BODY) {
+        rejected = true
+        chunks.length = 0
         reject(httpError(413, 'request body is too large'))
-        req.destroy()
         return
       }
       chunks.push(chunk)
     })
     req.on('end', () => {
+      if (rejected) return
       if (chunks.length === 0) {
         resolve({})
         return
@@ -153,6 +177,7 @@ function readJson(req) {
       }
     })
     req.on('error', reject)
+    req.on('aborted', () => reject(httpError(400, 'request aborted')))
   })
 }
 
@@ -172,7 +197,7 @@ function normalizeSettings(raw) {
       : source.enabled === true || source.mode === 'always' ? 'auto' : 'off',
     warm: source.warm === true,
     protocol,
-    upstream: text(source.upstream).replace(/\/+$/u, '') || DEFAULTS.upstream,
+    upstream: normalizeUpstream(source.upstream),
     apiKeyEnv: text(source.apiKeyEnv),
     proxyPort: port,
     managedProviderId: text(source.managedProviderId) || null,
@@ -540,6 +565,9 @@ function writeProxyResponse(upstream, res, active, assumeReasoning) {
   const headers = { ...upstream.headers }
   delete headers['content-length']
   delete headers['transfer-encoding']
+  for (const name of ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'upgrade']) {
+    delete headers[name]
+  }
   headers['cache-control'] = 'no-store'
   res.writeHead(upstream.statusCode ?? 502, headers)
   res.flushHeaders()
@@ -556,10 +584,9 @@ function writeProxyResponse(upstream, res, active, assumeReasoning) {
       try {
         const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'))
         if (Array.isArray(payload.choices)) {
-          const state = createThinkState(assumeReasoning)
           payload.choices = payload.choices.map((choice) => ({
             ...choice,
-            message: rewriteMessage(choice.message, state),
+            message: rewriteMessage(choice.message, createThinkState(assumeReasoning)),
           }))
         }
         res.end(JSON.stringify(payload))
@@ -575,10 +602,22 @@ function writeProxyResponse(upstream, res, active, assumeReasoning) {
   let buffer = ''
   upstream.on('data', (chunk) => {
     buffer += decoder.write(chunk)
-    let index
-    while ((index = buffer.indexOf('\n\n')) !== -1) {
+    let index = -1
+    let width = 2
+    while (true) {
+      const lf = buffer.indexOf('\n\n')
+      const crlf = buffer.indexOf('\r\n\r\n')
+      if (crlf !== -1 && (lf === -1 || crlf < lf)) {
+        index = crlf
+        width = 4
+      } else if (lf !== -1) {
+        index = lf
+        width = 2
+      } else {
+        break
+      }
       const raw = buffer.slice(0, index)
-      buffer = buffer.slice(index + 2)
+      buffer = buffer.slice(index + width)
       res.write(transformSseEvent(raw, state, meta))
     }
   })
@@ -601,9 +640,25 @@ function forward(req, res, settings, logger, ownsModel, isVision) {
   const transport = upstreamUrl.protocol === 'https:' ? https : http
   const headers = { ...req.headers, host: upstreamUrl.host, 'accept-encoding': 'identity' }
   delete headers['content-length']
+  delete headers['transfer-encoding']
   const bodyChunks = []
-  req.on('data', (chunk) => bodyChunks.push(chunk))
+  let bodySize = 0
+  let rejected = false
+  let upstreamReq = null
+  req.on('data', (chunk) => {
+    if (rejected) return
+    bodySize += chunk.length
+    if (bodySize > MAX_PROXY_BODY) {
+      rejected = true
+      bodyChunks.length = 0
+      sendJson(res, 413, { ok: false, error: { message: 'request body is too large' } })
+      req.resume()
+      return
+    }
+    bodyChunks.push(chunk)
+  })
   req.on('end', () => {
+    if (rejected) return
     let body = Buffer.concat(bodyChunks)
     let active = false
     let thinking = false
@@ -620,9 +675,15 @@ function forward(req, res, settings, logger, ownsModel, isVision) {
       }
     }
     headers['content-length'] = String(body.length)
-    const upstreamReq = transport.request(upstreamUrl, { method: req.method, headers }, (upstreamRes) => {
-      writeProxyResponse(upstreamRes, res, active, thinking)
-    })
+    try {
+      upstreamReq = transport.request(upstreamUrl, { method: req.method, headers }, (upstreamRes) => {
+        writeProxyResponse(upstreamRes, res, active, thinking)
+      })
+    } catch (error) {
+      logger.warn(`[${SCOPE}] cannot create upstream request: ${String(error)}`)
+      sendJson(res, 502, { ok: false, error: { message: String(error) } })
+      return
+    }
     upstreamReq.setNoDelay(true)
     upstreamReq.on('error', (error) => {
       logger.warn(`[${SCOPE}] upstream request failed: ${String(error)}`)
@@ -632,8 +693,16 @@ function forward(req, res, settings, logger, ownsModel, isVision) {
     upstreamReq.end(body)
   })
   req.on('error', (error) => {
+    upstreamReq?.destroy()
     logger.warn(`[${SCOPE}] proxy request failed: ${String(error)}`)
     if (!res.headersSent) sendJson(res, 400, { ok: false, error: { message: String(error) } })
+  })
+  req.on('aborted', () => {
+    rejected = true
+    upstreamReq?.destroy()
+  })
+  res.on('close', () => {
+    if (!res.writableEnded) upstreamReq?.destroy()
   })
 }
 
@@ -650,6 +719,20 @@ function readProviderConfig(ctx) {
 
 function shortName(id) {
   return id.split('/').pop().replace(/:[^:]+$/u, '') || id
+}
+
+async function mapLimit(items, limit, operation) {
+  const results = new Array(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next
+      next += 1
+      results[index] = await operation(items[index], index)
+    }
+  })
+  await Promise.all(workers)
+  return results
 }
 
 function splitModelId(id) {
@@ -699,7 +782,7 @@ async function detectReasoningEfforts(settings, id) {
     if (typeof file === 'string' && file !== '') {
       const handle = await open(join(cacheRoot, owner, leaf, file), 'r')
       try {
-        const buffer = Buffer.alloc(16 * 1024 * 1024)
+        const buffer = Buffer.alloc(4 * 1024 * 1024)
         const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
         const text = buffer.subarray(0, bytesRead).toString('utf8')
         const start = text.indexOf('tokenizer.chat_template')
@@ -768,14 +851,18 @@ async function discoverModels(ctx, settings) {
   if (!response.ok) throw httpError(502, `model discovery failed: HTTP ${response.status}`)
   const body = await response.json()
   const rows = Array.isArray(body?.data) ? body.data : []
-  const entries = rows
-    .map((row) => ({
-      id: typeof row?.id === 'string' ? row.id : '',
-      modelType: typeof row?.model_type === 'string' ? row.model_type : null,
-    }))
-    .filter((entry) => entry.id !== '')
-  if (entries.length === 0) throw httpError(502, 'model discovery returned no models')
-  return Promise.all(entries.map(async ({ id, modelType }) => {
+  const unique = new Map()
+  for (const row of rows) {
+    const id = typeof row?.id === 'string' ? row.id : ''
+    if (id === '') continue
+    const modelType = typeof row?.model_type === 'string' ? row.model_type : null
+    const previous = unique.get(id)
+    if (previous === undefined || (previous.modelType === null && modelType !== null)) {
+      unique.set(id, { id, modelType })
+    }
+  }
+  if (unique.size === 0) throw httpError(502, 'model discovery returned no models')
+  return mapLimit([...unique.values()], 6, async ({ id, modelType }) => {
     const known = KNOWN_REASONING_EFFORTS.find((entry) => id.toLowerCase().includes(entry.match))
     const [vision, reasoningEfforts] = await Promise.all([
       modelType !== null
@@ -784,7 +871,7 @@ async function discoverModels(ctx, settings) {
       known === undefined ? detectReasoningEfforts(settings, id) : Promise.resolve(known.efforts),
     ])
     return buildModelSpec(id, settings, vision, reasoningEfforts)
-  }))
+  })
 }
 
 async function warmUpModel(ctx, settings, model, vision = false) {
@@ -806,7 +893,7 @@ async function warmUpModel(ctx, settings, model, vision = false) {
     method: 'POST',
     headers: { 'content-type': 'application/json', accept: 'application/json', ...await credentialHeader(ctx, settings) },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(300000),
   })
   const raw = await response.text()
   if (!response.ok) throw httpError(502, `model warmup failed: HTTP ${response.status}`)
@@ -824,7 +911,11 @@ async function upsertProvider(ctx, settings) {
   const id = providerIdFor(settings.protocol)
   const keyRef = apiKeyRef(settings)
   if (keyRef === 'local') {
-    await ctx.credentials.set('local', 'local')
+    try {
+      await ctx.credentials.resolve('local')
+    } catch {
+      await ctx.credentials.set('local', 'local')
+    }
   }
   const models = await discoverModels(ctx, settings)
   const desired = {
@@ -922,7 +1013,19 @@ export async function apply(ctx) {
   }
   const persist = async () => {
     await mkdir(profileDir, { recursive: true })
-    await writeFile(storePath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8')
+    const body = `${JSON.stringify(settings, null, 2)}\n`
+    const temporary = `${storePath}.${process.pid}.${Date.now()}.tmp`
+    await writeFile(temporary, body, 'utf8')
+    try {
+      await rename(temporary, storePath)
+    } catch {
+      await writeFile(storePath, body, 'utf8')
+      try {
+        await unlink(temporary)
+      } catch {
+        // A leftover temporary file is harmless.
+      }
+    }
   }
   await persist().catch((error) => logger.warn(`[${SCOPE}] cannot save settings: ${String(error)}`))
 
@@ -1034,7 +1137,7 @@ export async function apply(ctx) {
 
   const statusCache = { key: '', at: 0, value: null }
   const readGeniexStatus = async () => {
-    const active = settings.protocol === 'geniex' && settings.warm === true
+    const active = settings.mode === 'auto' && settings.protocol === 'geniex' && settings.warm === true
     if (!active) return { active: false, models: [] }
     const key = settings.upstream
     if (statusCache.key === key && Date.now() - statusCache.at < 1500) return statusCache.value
@@ -1056,7 +1159,6 @@ export async function apply(ctx) {
           active: true,
           models: models.map((model) => model.id),
           states: Object.fromEntries(models.map((model) => [model.id, model.state])),
-          keepaliveSeconds: typeof body?.keepalive_seconds === 'number' ? body.keepalive_seconds : null,
         }
       }
     } catch {
@@ -1078,6 +1180,7 @@ export async function apply(ctx) {
       if (mode === settings.mode) return state()
       const previous = settings.mode
       settings.mode = mode
+      statusCache.at = 0
       try {
         await syncProvider()
         settings.lastError = null
@@ -1103,8 +1206,8 @@ export async function apply(ctx) {
       return turnMetrics.get(key) ?? null
     },
     permissionLabel: async (payload) => {
-      const locale = text(payload?.locale)
-      const name = locale === 'en' ? 'Reply Only' : '仅回复'
+      const locale = text(payload?.locale).toLowerCase()
+      const name = locale.startsWith('en') ? 'Reply Only' : '仅回复'
       const entry = ctx.configEditor.entries().find((candidate) => {
         return candidate.options.id === 'permission' || candidate.options.id?.endsWith(':permission')
       })
@@ -1124,7 +1227,7 @@ export async function apply(ctx) {
           description: '禁止工具调用，仅进行纯文本对话。',
         }
         if (presets['reply-only']?.name === name && Object.keys(presets)[0] === 'reply-only') return config
-        const next = { 'reply-only': { ...reply, name, description: '禁止工具调用，仅进行纯文本对话。 ' } }
+        const next = { 'reply-only': { ...reply, name, description: '禁止工具调用，仅进行纯文本对话。' } }
         for (const [key, value] of Object.entries(presets)) {
           if (key !== 'reply-only') next[key] = value
         }
@@ -1134,14 +1237,16 @@ export async function apply(ctx) {
     },
     warm: (payload) => {
       const operation = async () => {
-        if (!settings.warm) throw httpError(409, 'model warmup is disabled')
+        if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
         const model = text(payload?.model)
         if (model === '' || !managedModels.has(model)) throw httpError(400, 'unknown managed model')
         if (settings.protocol === 'geniex') {
           const status = await readGeniexStatus()
+          if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
           if (status.models.includes(model)) return { warmed: true, model, skipped: true }
         }
         const result = await warmUpModel(ctx, settings, model, visionModels.has(model))
+        statusCache.at = 0
         return { warmed: true, model, ...result }
       }
       const result = warmQueue.then(operation, operation)
@@ -1150,10 +1255,25 @@ export async function apply(ctx) {
     },
     save: async (payload) => {
       const mode = ['off', 'auto', 'always'].includes(payload?.mode) ? payload.mode : settings.mode
-      const next = normalizeSettings({ ...settings, ...payload, mode })
+      if (typeof payload?.upstream === 'string') assertUpstream(payload.upstream)
+      const previous = settings
+      const next = normalizeSettings({
+        ...settings,
+        ...payload,
+        mode,
+        proxyPort: settings.proxyPort,
+      })
+      const providerChanged = ['protocol', 'upstream', 'apiKeyEnv', 'contextWindow', 'maxOutputTokens']
+        .some((key) => next[key] !== previous[key])
+      const managedProvider = readManagedProvider(ctx, next).provider
+      const providerMissing = next.mode === 'auto'
+        && (managedProvider?.exists !== true || !Array.isArray(managedProvider.models) || managedProvider.models.length === 0)
+      const providerRemoval = next.mode === 'off' && next.managedProviderId !== null
+      const requiresSync = next.mode !== previous.mode || providerChanged || providerMissing || providerRemoval
       settings = next
+      statusCache.at = 0
       try {
-        await syncProvider()
+        if (requiresSync) await syncProvider()
         settings.lastError = null
       } catch (error) {
         settings.lastError = String(error)
@@ -1163,11 +1283,7 @@ export async function apply(ctx) {
     },
     apply: async () => {
       try {
-        const provider = await upsertProvider(ctx, settings)
-        managedModels.clear()
-        visionModels.clear()
-        for (const id of provider.models) managedModels.add(id)
-        for (const id of provider.visionModels) visionModels.add(id)
+        await syncProvider()
         settings.lastError = null
       } catch (error) {
         settings.lastError = String(error)
@@ -1187,6 +1303,17 @@ export async function apply(ctx) {
       await persist()
       return state()
     },
+  }
+
+  let mutationQueue = Promise.resolve()
+  const mutate = (operation) => {
+    const result = mutationQueue.then(operation, operation)
+    mutationQueue = result.catch(() => {})
+    return result
+  }
+  for (const method of ['setMode', 'save', 'apply', 'remove', 'permissionLabel']) {
+    const operation = api[method]
+    api[method] = (payload) => mutate(() => operation(payload))
   }
 
   ctx.effect(() => ctx.webServer.register({

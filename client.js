@@ -142,11 +142,12 @@ window.__ModuleLoader__.load({
       return ''
     }
 
-    async function call(method, payload) {
+    async function call(method, payload, options) {
       const response = await fetch(`${apiBase()}${API}/${method}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload ?? {}),
+        signal: options?.signal,
       })
       const body = await response.json().catch(() => undefined)
       if (!response.ok || body?.ok !== true) throw new Error(body?.error?.message ?? `HTTP ${response.status}`)
@@ -164,7 +165,7 @@ window.__ModuleLoader__.load({
         if (warmState.refreshing) return
         warmState.refreshing = true
         try {
-          const status = await call('modelStatus')
+          const status = await call('modelStatus', undefined, { signal: AbortSignal.timeout(3000) })
           warmState.states = new Map(Object.entries(status?.states ?? {}))
           warmState.enabled = status?.active === true
         } catch {
@@ -172,7 +173,13 @@ window.__ModuleLoader__.load({
           warmState.enabled = false
         }
         warmState.refreshing = false
-        for (const listener of warmState.listeners) listener()
+        for (const listener of warmState.listeners) {
+          try {
+            listener()
+          } catch {
+            // A label can unmount between refresh and notification.
+          }
+        }
       },
       subscribe(listener) {
         warmState.listeners.add(listener)
@@ -221,9 +228,6 @@ window.__ModuleLoader__.load({
         setDistance(Math.max(0, inner.scrollWidth - outer.clientWidth))
         inner.style.maxWidth = previous
       }
-      React.useEffect(() => {
-        measure()
-      }, [name])
       if (!marquee) return h('span', { style: S.modelName, title: name }, name)
       const reduceMotion = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
       const duration = Math.max(4, Math.min(12, distance / 25))
@@ -239,7 +243,7 @@ window.__ModuleLoader__.load({
         ref: innerRef,
         style: {
           display: 'inline-block',
-          maxWidth: hovered ? 'none' : '100%',
+          maxWidth: hovered && !reduceMotion ? 'none' : '100%',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
           whiteSpace: 'nowrap',
@@ -317,7 +321,7 @@ window.__ModuleLoader__.load({
       const dotKind = !warmEnabled || placement !== 'option'
         ? null
         : provider?.id === 'from-geniex'
-          ? (residentState === 'loading' ? 'yellow' : residentState === '' ? 'red' : 'green')
+          ? (residentState === 'loading' ? 'yellow' : residentState === 'active' || residentState === 'idle' ? 'green' : 'red')
           : 'blue'
       const warmZh = String(getLocale?.() ?? '').startsWith('zh')
       const dotTitle = dotKind === null
@@ -364,7 +368,7 @@ window.__ModuleLoader__.load({
           badges.push(h('span', {
             key: 'quant',
             style: { ...S.modelBadge, color: 'var(--dsw-alias-brand-primary)', borderColor: 'var(--dsw-alias-brand-primary)' },
-            title: `${model.id} · ${match[1]}`,
+            title: model.id,
           }, match[1]))
         }
       }
@@ -761,8 +765,8 @@ window.__ModuleLoader__.load({
         for (const listener of preheat.listeners) listener()
       },
     }
-    preheat.ready = call('state')
-      .then((next) => { preheat.enabled = next?.warm === true })
+    preheat.ready = call('state', undefined, { signal: AbortSignal.timeout(10000) })
+      .then((next) => { preheat.enabled = next?.mode === 'auto' && next?.warm === true })
       .catch(() => {})
 
     function Field({ label, hint, children }) {
@@ -781,7 +785,7 @@ window.__ModuleLoader__.load({
 
       const load = React.useCallback(async () => {
         try {
-          setSettings(await call('state'))
+          setSettings(await call('state', undefined, { signal: AbortSignal.timeout(15000) }))
           setError('')
         } catch (reason) {
           setError(format(t('loadFailed'), { message: String(reason?.message ?? reason) }))
@@ -791,6 +795,10 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         void load()
       }, [load])
+
+      React.useEffect(() => {
+        preheat.enabled = settings?.mode === 'auto' && settings?.warm === true
+      }, [settings?.mode, settings?.warm])
 
       const update = (key, value) => setSettings((current) => current === null ? current : { ...current, [key]: value })
       const numberValue = (key) => settings?.[key] === null || settings?.[key] === undefined ? '' : String(settings[key])
@@ -851,7 +859,6 @@ window.__ModuleLoader__.load({
             return
           }
         }
-        preheat.enabled = settings.warm === true
         void action('save', () => call('save', {
           mode: settings.mode,
           warm: settings.warm === true,
@@ -1048,24 +1055,18 @@ window.__ModuleLoader__.load({
           document.head.appendChild(style)
           ctx.effect(() => () => style.remove(), 'qwen-mode: model option warm style')
           ctx.effect(() => {
-            let scheduled = false
-            const clear = () => {
-              for (const button of document.querySelectorAll('button[role="menuitemradio"][title]')) {
-                button.removeAttribute('title')
-              }
+            const suppress = (event) => {
+              const target = event.target
+              if (!(target instanceof Element)) return
+              const button = target.closest('button[role="menuitemradio"][title]')
+              if (button !== null) button.removeAttribute('title')
             }
-            const schedule = () => {
-              if (scheduled) return
-              scheduled = true
-              requestAnimationFrame(() => {
-                scheduled = false
-                clear()
-              })
+            document.addEventListener('pointerover', suppress, true)
+            document.addEventListener('focusin', suppress, true)
+            return () => {
+              document.removeEventListener('pointerover', suppress, true)
+              document.removeEventListener('focusin', suppress, true)
             }
-            const observer = new MutationObserver(schedule)
-            observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['title'] })
-            clear()
-            return () => observer.disconnect()
           }, 'qwen-mode: model option title')
         }
         let bound
