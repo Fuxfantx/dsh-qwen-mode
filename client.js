@@ -52,11 +52,20 @@ window.__ModuleLoader__.load({
       'limits.invalid': '最大输出长度不能大于上下文窗口。',
       'contextWindow.label': '上下文窗口',
       'contextWindow.geniexPlaceholder': 'GENIEX_NCTX（default 4096）',
-      'autoNctx.label': '自动使用模型上下文（GGUF）',
-      'autoNctx.hint': '启用后优先使用 GGUF 的 context_length；读取不到时回退到上方上下文窗口。',
+      'autoNctx.label': '优先使用模型上下文阈限（GGUF context_length）',
       'maxOutputTokens.label': '最大输出长度',
       'mtp.label': 'MTP 投机解码',
-      'mtp.hint': '仅对 GGUF 内含 MTP/nextn 头的文本模型生效；VLM 自动跳过，避免禁用图片输入。',
+      'mtp.hint': '仅对 GGUF 内含 MTP/nextn 头、且模型目录存在 mtp-*.gguf 的 llama_cpp 文本模型生效；VLM 有图片时由发送前确认。',
+      'mtp.tokens': 'spec_n_max',
+      'mtp.min': 'spec_n_min',
+      'mtp.pmin': 'spec_p_min',
+      'mtp.imageTitle': '图片与 MTP 冲突',
+      'mtp.imageBody': '当前模型支持图片，但启用 MTP 时 GenieX 会走纯文本路径。',
+      'mtp.direct': '直接发送',
+      'mtp.directHint': '图片会被忽略',
+      'mtp.disable': '关闭 MTP 发送',
+      'mtp.disableHint': '需要重新加载模型',
+      'mtp.cancel': '取消',
       'sampling.title': '采样默认值',
       'sampling.hint': '仅在请求未携带该字段时填充；留空则不注入。',
       'sampling.recommend': '元数据推荐',
@@ -118,11 +127,20 @@ window.__ModuleLoader__.load({
       'limits.invalid': 'Max output tokens cannot exceed the context window.',
       'contextWindow.label': 'Context window',
       'contextWindow.geniexPlaceholder': 'GENIEX_NCTX (default 4096)',
-      'autoNctx.label': 'Use per-model context from GGUF',
-      'autoNctx.hint': 'When enabled, prefer the GGUF context_length; fall back to the context window above.',
+      'autoNctx.label': 'Prefer model context limit (GGUF context_length)',
       'maxOutputTokens.label': 'Max output tokens',
       'mtp.label': 'MTP speculative decoding',
-      'mtp.hint': 'Applies only to text models whose GGUF contains an MTP/nextn head; VLM models are skipped to preserve image input.',
+      'mtp.hint': 'Applies only to llama_cpp text models whose GGUF contains an MTP/nextn head and whose directory has mtp-*.gguf; VLM image sends ask first.',
+      'mtp.tokens': 'spec_n_max',
+      'mtp.min': 'spec_n_min',
+      'mtp.pmin': 'spec_p_min',
+      'mtp.imageTitle': 'Images conflict with MTP',
+      'mtp.imageBody': 'This model supports images, but GenieX takes the text-only path when MTP is enabled.',
+      'mtp.direct': 'Send directly',
+      'mtp.directHint': 'Images will be ignored',
+      'mtp.disable': 'Send without MTP',
+      'mtp.disableHint': 'The model must reload',
+      'mtp.cancel': 'Cancel',
       'sampling.title': 'Sampling Defaults',
       'sampling.hint': 'Filled only when the request does not already carry the field; empty omits it.',
       'sampling.recommend': 'Metadata recommendation',
@@ -249,7 +267,7 @@ window.__ModuleLoader__.load({
         modelMetaState.subscribers += 1
         if (modelMetaState.subscribers === 1) {
           void modelMetaState.refresh()
-          modelMetaState.timer = window.setInterval(() => void modelMetaState.refresh(), 30000)
+          modelMetaState.timer = window.setInterval(() => void modelMetaState.refresh(), 5000)
         }
         listener()
         return () => {
@@ -350,6 +368,7 @@ window.__ModuleLoader__.load({
         const key = sessionId ?? 'global'
         const selectedModel = provider?.id === 'from-geniex' && typeof model?.id === 'string' ? model.id : null
         preheat.setSelected(key, selectedModel)
+        selectedMtp.model = selectedModel ?? ''
         const previousProvider = lastProvider.get(key)
         lastProvider.set(key, provider?.id)
         if (previousProvider !== undefined && previousProvider !== provider?.id) {
@@ -462,6 +481,19 @@ window.__ModuleLoader__.load({
             key: 'catalog',
             style: { ...S.modelBadge, color, borderColor: color },
           }, text))
+        }
+      }
+      if (provider?.id === 'from-geniex' && modelMeta?.mtpStats !== null && modelMeta?.mtpStats !== undefined) {
+        const stats = modelMeta.mtpStats
+        if (typeof stats.rate === 'number' && Number.isFinite(stats.rate)) {
+          const color = stats.rate >= 0.5
+            ? 'var(--dsw-alias-state-success-primary)'
+            : 'var(--dsw-alias-state-warn-primary)'
+          badges.push(h('span', {
+            key: 'mtp',
+            style: { ...S.modelBadge, color, borderColor: color },
+            title: `${stats.accepted ?? 0} accepted / ${stats.rejected ?? 0} rejected`,
+          }, `MTP ${Math.round(stats.rate * 100)}%`))
         }
       }
       const abliterated = modelMeta?.abliterated === true
@@ -721,6 +753,7 @@ window.__ModuleLoader__.load({
     const lastWarmAt = new Map()
     const lastWarmRevision = new Map()
     const warmChain = new Map()
+    const selectedMtp = { model: '' }
 
     /** Replace the composer send button with a spinner while warmup is active. */
     const sendWarm = {
@@ -754,6 +787,130 @@ window.__ModuleLoader__.load({
         return button
       }
       return null
+    }
+
+    /** Force a choice before a VLM image send that would otherwise ignore the images under MTP. */
+    function installMtpSendGuard(t) {
+      if (typeof document === 'undefined') return () => {}
+      const panel = { node: null, busy: false }
+      const imageSelectors = ['[data-attachment-kind="image"]', '[class*="rail"] img', '[class*="attachment"] img', '[class*="imagePreview"]', '[class*="image-preview"]']
+      const composerHasImages = (button) => {
+        let node = button.parentElement
+        let root = null
+        for (let depth = 0; depth < 10 && node !== null; depth += 1) {
+          if (node.querySelector('[contenteditable="true"]') !== null) {
+            root = node
+            break
+          }
+          node = node.parentElement
+        }
+        root ??= button.parentElement?.parentElement ?? null
+        if (root === null) return false
+        if (root.querySelector('img') !== null) return true
+        const outer = root.parentElement
+        if (outer !== null && outer.querySelector('[class*="rail"] img, [class*="attachment"] img') !== null) return true
+        return imageSelectors.some((selector) => root.querySelector(selector) !== null)
+      }
+      const close = () => {
+        if (panel.node !== null) panel.node.remove()
+        panel.node = null
+        panel.busy = false
+      }
+      const open = (button, model) => {
+        if (panel.node !== null) return
+        const rect = button.getBoundingClientRect()
+        const node = document.createElement('div')
+        node.setAttribute('data-qwen-mtp-choice', '')
+        node.style.cssText = [
+          'position:fixed',
+          `right:${Math.max(12, window.innerWidth - rect.right)}px`,
+          `bottom:${Math.max(12, window.innerHeight - rect.top + 8)}px`,
+          'width:min(300px,calc(100vw - 24px))',
+          'z-index:2147483000',
+          'display:flex',
+          'flex-direction:column',
+          'gap:8px',
+          'padding:12px',
+          'border-radius:10px',
+          'border:1px solid var(--dsw-alias-border-l2)',
+          'background:var(--dsw-alias-bg-overlay)',
+          'color:var(--dsw-alias-label-primary)',
+          'box-shadow:var(--dsw-elevation-prominent)',
+          'font-size:12px',
+        ].join(';')
+        const title = document.createElement('div')
+        title.textContent = t('mtp.imageTitle')
+        title.style.cssText = 'font-weight:600;font-size:13px;'
+        const body = document.createElement('div')
+        body.textContent = t('mtp.imageBody')
+        body.style.cssText = 'color:var(--dsw-alias-label-secondary);line-height:1.5;'
+        const option = (label, hint, disabledHint, allow) => {
+          const buttonNode = document.createElement('button')
+          buttonNode.type = 'button'
+          buttonNode.style.cssText = 'appearance:none;text-align:left;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:7px;padding:7px 9px;cursor:pointer;font:inherit;'
+          const strong = document.createElement('div')
+          strong.textContent = label
+          strong.style.cssText = 'font-weight:500;'
+          const note = document.createElement('div')
+          note.textContent = allow === true ? hint : disabledHint
+          note.style.cssText = 'color:var(--dsw-alias-label-secondary);font-size:11px;margin-top:2px;'
+          buttonNode.append(strong, note)
+          buttonNode.onclick = async () => {
+            if (panel.busy) return
+            panel.busy = true
+            buttonNode.disabled = true
+            try {
+              await call('mtpChoice', { model, allow }, { signal: AbortSignal.timeout(5000) })
+            } catch (error) {
+              body.textContent = String(error?.message ?? error)
+              buttonNode.disabled = false
+              panel.busy = false
+              return
+            }
+            close()
+            mtpGuardBypass = true
+            button.click()
+            setTimeout(() => { mtpGuardBypass = false }, 0)
+          }
+          return buttonNode
+        }
+        const cancel = document.createElement('button')
+        cancel.type = 'button'
+        cancel.textContent = t('mtp.cancel')
+        cancel.style.cssText = 'appearance:none;border:none;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;cursor:pointer;padding:2px 0;align-self:flex-end;'
+        cancel.onclick = close
+        node.append(title, body, option(t('mtp.direct'), t('mtp.directHint'), '', true), option(t('mtp.disable'), '', t('mtp.disableHint'), false), cancel)
+        document.body.appendChild(node)
+        panel.node = node
+      }
+
+      let mtpGuardBypass = false
+      const onClick = (event) => {
+        const button = findSendButton()
+        if (button === null || !(event.target instanceof Node) || !button.contains(event.target)) return
+        if (mtpGuardBypass) {
+          mtpGuardBypass = false
+          return
+        }
+        const model = selectedMtp.model
+        if (model === '') return
+        const meta = modelMetaState.models.get(model)
+        if (meta?.vision !== true || meta.mtpReady !== true || meta.mtpEnabled !== true) return
+        if (!composerHasImages(button)) return
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        open(button, model)
+      }
+      const onKeyDown = (event) => {
+        if (event.key === 'Escape') close()
+      }
+      document.addEventListener('click', onClick, true)
+      document.addEventListener('keydown', onKeyDown)
+      return () => {
+        close()
+        document.removeEventListener('click', onClick, true)
+        document.removeEventListener('keydown', onKeyDown)
+      }
     }
     function showSendWarm() {
       if (sendWarm.spinner !== null) return
@@ -888,6 +1045,13 @@ window.__ModuleLoader__.load({
       }, [load])
 
       React.useEffect(() => {
+        const hasModels = modelInfo !== null && Object.keys(modelInfo.models ?? {}).length > 0
+        if (hasModels) return undefined
+        const timer = window.setInterval(() => void refreshModelInfo(), 3000)
+        return () => window.clearInterval(timer)
+      }, [modelInfo, refreshModelInfo])
+
+      React.useEffect(() => {
         preheat.enabled = settings?.mode === 'auto' && settings?.warm === true
       }, [settings?.mode, settings?.warm])
 
@@ -930,7 +1094,7 @@ window.__ModuleLoader__.load({
       const save = () => {
         if (settings === null) return
         const numeric = {}
-        for (const key of ['contextWindow', 'maxOutputTokens', 'temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty']) {
+        for (const key of ['contextWindow', 'maxOutputTokens', 'temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty', 'mtpDraftTokens', 'mtpDraftMin', 'mtpDraftPMin']) {
           const raw = settings[key]
           if (raw === null || raw === undefined || String(raw).trim() === '') {
             numeric[key] = null
@@ -942,6 +1106,10 @@ window.__ModuleLoader__.load({
             return
           }
           if ((key === 'contextWindow' || key === 'maxOutputTokens') && (!Number.isInteger(value) || value <= 0)) {
+            setError(format(t('numberInvalid'), { field: key }))
+            return
+          }
+          if (key.startsWith('mtp') && value < 0) {
             setError(format(t('numberInvalid'), { field: key }))
             return
           }
@@ -1120,13 +1288,12 @@ window.__ModuleLoader__.load({
               }),
               h('span', { key: 'label' }, t('autoNctx.label')),
             ]),
-            h('div', { key: 'auto-nctx-hint', style: S.hint }, t('autoNctx.hint')),
           ]),
           h('div', { key: 'divider-sampling', style: S.divider }),
           h('div', { key: 'sampling', style: S.configSection }, [
             h('div', { key: 'heading', style: S.configHeading }, t('sampling.title')),
             h('div', { key: 'hint', style: S.hint }, t('sampling.hint')),
-            h('div', { key: 'grid', style: S.grid }, [
+            h('div', { key: 'grid', style: { ...S.grid, gridTemplateColumns: 'repeat(4, minmax(0, 1fr))' } }, [
               ...['temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty'].map((key) => h(Field, {
                 key,
                 label: t(`${key}.label`),
@@ -1186,6 +1353,19 @@ window.__ModuleLoader__.load({
                 h('span', { key: 'label' }, t('mtp.label')),
               ]),
               h('div', { key: 'mtp-hint', style: S.hint }, t('mtp.hint')),
+              h('div', { key: 'mtp-params', style: S.grid }, [
+                ...['mtpDraftTokens', 'mtpDraftMin', 'mtpDraftPMin'].map((key, index) => h(Field, {
+                  key,
+                  label: t(index === 0 ? 'mtp.tokens' : index === 1 ? 'mtp.min' : 'mtp.pmin'),
+                }, h('input', {
+                  key: 'input',
+                  style: S.input,
+                  inputMode: index === 2 ? 'decimal' : 'numeric',
+                  value: numberValue(key),
+                  placeholder: index === 0 ? '3' : '0',
+                  onChange: (event) => setNumber(key, event.target.value),
+                }))),
+              ]),
               h('datalist', { key: 'compute-options', id: 'qwen-compute-options' },
                 ['cpu', 'gpu', 'npu', 'hybrid'].map((value) => h('option', { key: value, value }))),
             ]),
@@ -1237,6 +1417,8 @@ window.__ModuleLoader__.load({
           }
           return format(zh[key] ?? en[key] ?? key, params)
         }
+
+        ctx.effect(() => installMtpSendGuard(t), 'qwen-mode: VLM MTP send guard')
 
         ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section',

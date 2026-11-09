@@ -40,8 +40,9 @@
 ### 设置
 
 - **API Key**：留空时使用 DSH credential `local`；QwenCloud 可填写环境变量名，例如 `DASHSCOPE_API_KEY`。
-- **上下文窗口**：留空时 GenieX 使用服务端 `--nctx`；QwenCloud 使用 `262144`。启用「自动使用模型上下文」后，优先读取 GGUF 的 `context_length`，并按模型限制最大输出。
-- **MTP 投机解码**：仅当 GGUF 含 MTP/nextn 头、运行时为 `llama_cpp` 且模型不是 VLM 时生效；否则不会下发任何 `spec_*` 参数。
+- **上下文窗口**：留空时 GenieX 使用服务端 `--nctx`；QwenCloud 使用 `262144`。启用「优先使用模型上下文阈限（GGUF context_length）」后，优先读取 GGUF 的 `context_length`，并按模型限制最大输出。
+- **MTP 投机解码**：仅当开关启用、GGUF 含 MTP/nextn 头、运行时为 `llama_cpp`，且模型目录存在 `mtp-*.gguf` 时生效；`spec_n_max / spec_n_min / spec_p_min` 可在设置页填写，默认 3 / 0 / 0。VLM 带图片发送时会先询问“直接发送（忽略图片）”或“关闭 MTP 发送（重载模型）”。
+- **MTP 接受率**：成功收到 MTP usage 后，模型名旁显示最近一次接受率。
 - **历史推理内容**：GenieX 的 HTTP 接口不提供 `preserve_thinking` 开关，实际保留策略由模型模板决定，因此插件不伪造该选项。
 - **推理后端**（仅 GenieX）：
   - `Compute` 可留空，或填写 `cpu` / `gpu` / `npu` / `hybrid` / 设备列表。
@@ -103,8 +104,9 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed model pro
 ### Settings
 
 - **API Key**: empty uses the DSH credential `local`; for QwenCloud, enter an environment variable such as `DASHSCOPE_API_KEY`.
-- **Context window**: empty lets GenieX use its `--nctx`; QwenCloud falls back to `262144`. With **Use per-model context from GGUF** enabled, the GGUF `context_length` wins and max output is capped per model.
-- **MTP speculative decoding**: applies only when the GGUF contains an MTP/nextn head, the runtime is `llama_cpp`, and the model is not a VLM; otherwise no `spec_*` fields are sent.
+- **Context window**: empty lets GenieX use its `--nctx`; QwenCloud falls back to `262144`. With **Prefer model context limit (GGUF context_length)** enabled, the GGUF `context_length` wins and max output is capped per model.
+- **MTP speculative decoding**: applies only when the toggle is on, the GGUF contains an MTP/nextn head, the runtime is `llama_cpp`, and `mtp-*.gguf` exists; `spec_n_max / spec_n_min / spec_p_min` are configurable (default 3 / 0 / 0). A VLM image send asks whether to send directly (images ignored) or send without MTP (model reloads).
+- **MTP acceptance**: after MTP usage arrives, the model name shows the latest acceptance rate.
 - **Historical reasoning**: GenieX's HTTP API has no `preserve_thinking` switch; the model template decides. The plugin does not expose a fake toggle.
 - **Inference Backend** (GenieX only):
   - `Compute` may be empty or contain `cpu` / `gpu` / `npu` / `hybrid` / a device list.

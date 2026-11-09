@@ -10,7 +10,7 @@
  */
 
 import { execFile } from 'node:child_process'
-import { mkdir, open, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { mkdir, open, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
 import { homedir } from 'node:os'
@@ -51,6 +51,9 @@ const DEFAULTS = {
   maxOutputTokens: 131072,
   autoNctx: false,
   mtp: false,
+  mtpDraftTokens: MTP_DRAFT_TOKENS,
+  mtpDraftMin: 0,
+  mtpDraftPMin: 0,
   compute: '',
   vitCompute: 'npu',
   temperature: null,
@@ -90,6 +93,10 @@ function assertUpstream(value) {
 
 function numberOrNull(value) {
   return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function nonNegativeNumber(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback
 }
 
 function positiveInt(value, fallback) {
@@ -213,6 +220,9 @@ function normalizeSettings(raw) {
     maxOutputTokens: autoNctx ? maxOutput : effectiveContext === null ? maxOutput : Math.min(maxOutput, effectiveContext),
     autoNctx,
     mtp: source.mtp === true,
+    mtpDraftTokens: Math.floor(nonNegativeNumber(source.mtpDraftTokens, DEFAULTS.mtpDraftTokens)),
+    mtpDraftMin: Math.floor(nonNegativeNumber(source.mtpDraftMin, 0)),
+    mtpDraftPMin: nonNegativeNumber(source.mtpDraftPMin, 0),
     compute: text(source.compute).slice(0, 100),
     vitCompute: ['cpu', 'gpu', 'npu'].includes(source.vitCompute) ? source.vitCompute : DEFAULTS.vitCompute,
     temperature: numberOrNull(source.temperature),
@@ -421,11 +431,11 @@ function parseGgufPrefix(buffer) {
   }
 }
 
-async function readModelMetadata(settings, id) {
+async function readModelMetadata(settings, id, fresh = false) {
   if (settings.protocol !== 'geniex') return null
   const cacheKey = `${settings.upstream}|${id}`
   const cached = modelMetadataCache.get(cacheKey)
-  if (cached !== undefined && Date.now() - cached.at < CAPABILITY_CACHE_TTL_MS) return cached.value
+  if (!fresh && cached !== undefined && Date.now() - cached.at < CAPABILITY_CACHE_TTL_MS) return cached.value
   let value = null
   try {
     const cacheRoot = await geniexModelsRoot()
@@ -435,6 +445,15 @@ async function readModelMetadata(settings, id) {
       ?? Object.values(manifest?.ModelFile ?? {}).find((entry) => entry?.Downloaded === true)?.Name
     if (typeof file === 'string' && file !== '') {
       const path = join(cacheRoot, owner, leaf, file)
+      const directory = join(cacheRoot, owner, leaf)
+      let mtpFile = ''
+      try {
+        const names = await readdir(directory)
+        const mtpName = names.find((name) => /^mtp.*\.gguf$/iu.test(name))
+        if (mtpName !== undefined) mtpFile = join(directory, mtpName)
+      } catch {
+        // The optional MTP companion is absent.
+      }
       const handle = await open(path, 'r')
       try {
         const buffer = Buffer.allocUnsafe(GGUF_PREFIX_BYTES)
@@ -442,6 +461,7 @@ async function readModelMetadata(settings, id) {
         value = {
           ...parseGgufPrefix(buffer.subarray(0, bytesRead)),
           pluginId: typeof manifest?.PluginId === 'string' ? manifest.PluginId : '',
+          mtpFile,
         }
       } finally {
         await handle.close()
@@ -472,21 +492,22 @@ function inferenceFields(settings, vision) {
   return fields
 }
 
-function loadFields(settings, context, mtp) {
+function loadFields(settings, context, mtp, mtpFile = '') {
   const fields = {}
   if (settings.protocol === 'geniex') {
     if (typeof context === 'number' && context > 0) fields.nctx = context
-    if (mtp) {
+    if (mtp && mtpFile !== '') {
       fields.spec_type = MTP_SPEC_TYPE
-      fields.spec_n_max = MTP_DRAFT_TOKENS
-      fields.spec_n_min = 0
-      fields.spec_p_min = 0
+      fields.spec_draft_model = mtpFile
+      fields.spec_n_max = settings.mtpDraftTokens
+      fields.spec_n_min = settings.mtpDraftMin
+      fields.spec_p_min = settings.mtpDraftPMin
     }
   }
   return fields
 }
 
-function applyRequestDefaults(body, settings, vision = false, context = null, mtp = false) {
+function applyRequestDefaults(body, settings, vision = false, context = null, mtp = false, mtpFile = '') {
   const output = { ...body }
   const thinking = thinkingEnabled(body)
   if (settings.protocol === 'qwen') {
@@ -506,7 +527,7 @@ function applyRequestDefaults(body, settings, vision = false, context = null, mt
     if (key.startsWith('spec_')) delete output[key]
   }
   if (settings.protocol === 'geniex') delete output.nctx
-  Object.assign(output, loadFields(settings, context, mtp))
+  Object.assign(output, loadFields(settings, context, mtp, mtpFile))
   const fill = (key, value) => {
     if (value !== null && output[key] === undefined) output[key] = value
   }
@@ -763,10 +784,11 @@ function transformSseEvent(raw, state, meta) {
   if (parsed?.id !== undefined) meta.id = parsed.id
   if (parsed?.created !== undefined) meta.created = parsed.created
   if (parsed?.model !== undefined) meta.model = parsed.model
+  if (parsed?.usage !== undefined && typeof meta.onUsage === 'function') meta.onUsage(parsed.usage)
   return rewriteChunk(parsed, state).map(sseEvent).join('')
 }
 
-function writeProxyResponse(upstream, res, active, assumeReasoning) {
+function writeProxyResponse(upstream, res, active, assumeReasoning, onUsage) {
   const headers = { ...upstream.headers }
   delete headers['content-length']
   delete headers['transfer-encoding']
@@ -788,6 +810,7 @@ function writeProxyResponse(upstream, res, active, assumeReasoning) {
     upstream.on('end', () => {
       try {
         const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+        if (payload?.usage !== undefined && typeof onUsage === 'function') onUsage(payload.usage)
         if (Array.isArray(payload.choices)) {
           payload.choices = payload.choices.map((choice) => ({
             ...choice,
@@ -803,7 +826,7 @@ function writeProxyResponse(upstream, res, active, assumeReasoning) {
   }
   const decoder = new StringDecoder('utf8')
   const state = createThinkState(assumeReasoning)
-  const meta = {}
+  const meta = { onUsage }
   let buffer = ''
   upstream.on('data', (chunk) => {
     buffer += decoder.write(chunk)
@@ -833,7 +856,18 @@ function writeProxyResponse(upstream, res, active, assumeReasoning) {
   })
 }
 
-function forward(req, res, settings, logger, ownsModel, isVision, modelContext, useMtp) {
+function bodyHasImages(body) {
+  if (!Array.isArray(body?.messages)) return false
+  return body.messages.some((message) => {
+    if (!Array.isArray(message?.content)) return false
+    return message.content.some((part) => {
+      const type = typeof part?.type === 'string' ? part.type.toLowerCase() : ''
+      return type === 'image_url' || type === 'input_image' || type === 'image'
+    })
+  })
+}
+
+function forward(req, res, settings, logger, ownsModel, isVision, modelContext, useMtp, canMtp, mtpApprovedFor, mtpFileFor, consumeMtpChoice, onUsageFor) {
   let upstreamUrl
   try {
     const requestUrl = new URL(req.url ?? '/', 'http://qwen.invalid')
@@ -867,19 +901,31 @@ function forward(req, res, settings, logger, ownsModel, isVision, modelContext, 
     let body = Buffer.concat(bodyChunks)
     let active = false
     let thinking = false
+    let activeModel = ''
+    let mtpActive = false
     if (settings.mode !== 'off' && body.length > 0) {
       try {
         const parsed = JSON.parse(body.toString('utf8'))
         active = ownsModel(parsed?.model)
         if (active) {
           thinking = thinkingEnabled(parsed, settings)
+          const model = parsed?.model
+          activeModel = model
+          const vision = isVision(model)
+          const hasImages = bodyHasImages(parsed)
+          const mtp = hasImages && vision
+            ? canMtp(model) && mtpApprovedFor(model)
+            : useMtp(model)
+          mtpActive = mtp
           body = Buffer.from(JSON.stringify(applyRequestDefaults(
             parsed,
             settings,
-            isVision(parsed?.model),
-            modelContext(parsed?.model),
-            useMtp(parsed?.model),
+            vision,
+            modelContext(model),
+            mtp,
+            mtpFileFor(model),
           )), 'utf8')
+          consumeMtpChoice(model)
         }
       } catch {
         // Preserve non-JSON bodies unchanged.
@@ -888,7 +934,7 @@ function forward(req, res, settings, logger, ownsModel, isVision, modelContext, 
     headers['content-length'] = String(body.length)
     try {
       upstreamReq = transport.request(upstreamUrl, { method: req.method, headers }, (upstreamRes) => {
-        writeProxyResponse(upstreamRes, res, active, thinking)
+        writeProxyResponse(upstreamRes, res, active, thinking, (usage) => onUsageFor(activeModel, usage, mtpActive))
       })
     } catch (error) {
       logger.warn(`[${SCOPE}] cannot create upstream request: ${String(error)}`)
@@ -1096,7 +1142,7 @@ async function discoverModels(ctx, settings) {
   }
 }
 
-async function warmUpModel(ctx, settings, model, vision = false, context = null, mtp = false) {
+async function warmUpModel(ctx, settings, model, vision = false, context = null, mtp = false, mtpFile = '') {
   const url = upstreamURL(settings, 'chat/completions')
   const body = {
     model,
@@ -1109,7 +1155,7 @@ async function warmUpModel(ctx, settings, model, vision = false, context = null,
     stream: false,
   }
   if (settings.protocol === 'qwen') body.enable_thinking = false
-  else Object.assign(body, { enable_think: false, reasoning_format: 'none' }, inferenceFields(settings, vision), loadFields(settings, context, mtp))
+  else Object.assign(body, { enable_think: false, reasoning_format: 'none' }, inferenceFields(settings, vision), loadFields(settings, context, mtp, mtpFile))
   const startedAt = Date.now()
   const response = await fetch(url, {
     method: 'POST',
@@ -1255,23 +1301,34 @@ export async function apply(ctx) {
   const managedModels = new Set()
   const visionModels = new Set()
   const mtpModels = new Set()
+  const mtpFiles = new Map()
+  const mtpSuppressed = new Set()
+  const mtpApproved = new Set()
+  const mtpStats = new Map()
   const modelContexts = new Map()
   const modelCapabilities = new Map()
   let modelRevision = 0
+  let capabilityRetryAt = 0
   const applyCapabilities = (capabilities = new Map()) => {
     mtpModels.clear()
+    mtpFiles.clear()
     modelContexts.clear()
     modelCapabilities.clear()
     for (const [id, metadata] of capabilities) {
       modelCapabilities.set(id, metadata)
-      if (metadata?.hasMtp === true && metadata.pluginId === 'llama_cpp') mtpModels.add(id)
+      if (metadata?.hasMtp === true && metadata.pluginId === 'llama_cpp' && typeof metadata.mtpFile === 'string' && metadata.mtpFile !== '') {
+        mtpModels.add(id)
+        mtpFiles.set(id, metadata.mtpFile)
+      }
       if (typeof metadata?.contextLength === 'number') modelContexts.set(id, metadata.contextLength)
     }
   }
   const refreshManagedModels = async () => {
+    capabilityRetryAt = 0
     managedModels.clear()
     visionModels.clear()
     mtpModels.clear()
+    mtpFiles.clear()
     modelContexts.clear()
     modelCapabilities.clear()
     const provider = readManagedProvider(ctx, settings).provider
@@ -1288,11 +1345,32 @@ export async function apply(ctx) {
     const context = modelContexts.get(model) ?? settings.contextWindow
     return typeof context === 'number' && context > 0 ? context : null
   }
-  const useMtp = (model) => {
+  const canMtp = (model) => {
     return settings.mtp
       && settings.protocol === 'geniex'
       && mtpModels.has(model)
-      && !visionModels.has(model)
+      && mtpFiles.has(model)
+  }
+  const useMtp = (model) => canMtp(model) && !mtpSuppressed.has(model)
+  const mtpApprovedFor = (model) => mtpApproved.has(model)
+  const mtpFileFor = (model) => mtpFiles.get(model) ?? ''
+  const consumeMtpChoice = (model) => {
+    mtpApproved.delete(model)
+    mtpSuppressed.delete(model)
+  }
+  const recordMtpUsage = (model, usage, active = false) => {
+    if (!active) return
+    const details = usage?.completion_tokens_details ?? usage?.completionTokensDetails
+    const accepted = numberOrNull(details?.accepted_prediction_tokens ?? details?.acceptedPredictionTokens)
+    const rejected = numberOrNull(details?.rejected_prediction_tokens ?? details?.rejectedPredictionTokens)
+    if (accepted === null || rejected === null || accepted + rejected <= 0) return
+    mtpStats.set(model, {
+      accepted,
+      rejected,
+      rate: accepted / (accepted + rejected),
+      updatedAt: Date.now(),
+    })
+    while (mtpStats.size > 64) mtpStats.delete(mtpStats.keys().next().value)
   }
   const ownsModel = (model) => {
     if (settings.mode !== 'auto') return false
@@ -1436,19 +1514,57 @@ export async function apply(ctx) {
   const api = {
     state: () => state(),
     modelStatus: readGeniexStatus,
-    modelInfo: () => ({
-      revision: modelRevision,
-      models: Object.fromEntries([...managedModels].map((id) => {
-        const metadata = modelCapabilities.get(id)
-        return [id, {
-          abliterated: metadata?.abliterated === true,
-          hasMtp: metadata?.hasMtp === true && metadata.pluginId === 'llama_cpp',
-          contextLength: typeof metadata?.contextLength === 'number' ? metadata.contextLength : null,
-          sampling: metadata?.sampling ?? {},
-          tags: metadata?.tags ?? [],
-        }]
-      })),
-    }),
+    modelInfo: async () => {
+      let capabilitiesChanged = false
+      if (managedModels.size === 0) {
+        await refreshManagedModels()
+        capabilitiesChanged = managedModels.size > 0
+      }
+      const missing = [...managedModels].filter((id) => {
+        return !modelCapabilities.has(id) || modelCapabilities.get(id) === null
+      })
+      if (missing.length > 0 && Date.now() >= capabilityRetryAt) {
+        capabilityRetryAt = Date.now() + 60000
+        const entries = await mapLimit(missing, 4, async (id) => {
+          modelMetadataCache.delete(`${settings.upstream}|${id}`)
+          return [id, await readModelMetadata(settings, id, true)]
+        })
+        const merged = new Map(modelCapabilities)
+        for (const [id, metadata] of entries) merged.set(id, metadata)
+        applyCapabilities(merged)
+        capabilitiesChanged = entries.some(([, metadata]) => metadata !== null)
+      }
+      if (capabilitiesChanged) modelRevision += 1
+      return {
+        revision: modelRevision,
+        models: Object.fromEntries([...managedModels].map((id) => {
+          const metadata = modelCapabilities.get(id)
+          return [id, {
+            abliterated: metadata?.abliterated === true,
+            hasMtp: metadata?.hasMtp === true && metadata.pluginId === 'llama_cpp',
+            mtpReady: mtpModels.has(id) && mtpFiles.has(id),
+            mtpEnabled: settings.mtp === true,
+            vision: visionModels.has(id),
+            contextLength: typeof metadata?.contextLength === 'number' ? metadata.contextLength : null,
+            sampling: metadata?.sampling ?? {},
+            tags: metadata?.tags ?? [],
+            mtpStats: mtpStats.get(id) ?? null,
+          }]
+        })),
+      }
+    },
+    mtpChoice: (payload) => {
+      const model = text(payload?.model)
+      if (!mtpModels.has(model) || !mtpFiles.has(model)) throw httpError(400, 'model has no MTP companion')
+      if (payload?.allow === true) {
+        mtpApproved.add(model)
+        mtpSuppressed.delete(model)
+      } else {
+        mtpApproved.delete(model)
+        mtpSuppressed.add(model)
+      }
+      return { ok: true }
+    },
     setMode: async (payload) => {
       const mode = ['off', 'auto'].includes(payload?.mode) ? payload.mode : null
       if (mode === null) throw httpError(400, 'invalid mode')
@@ -1523,6 +1639,7 @@ export async function apply(ctx) {
           visionModels.has(model),
           modelContext(model),
           useMtp(model),
+          mtpFileFor(model),
         )
         statusCache.at = 0
         return { warmed: true, model, ...result }
@@ -1550,11 +1667,22 @@ export async function apply(ctx) {
       const requiresSync = next.mode !== previous.mode || providerChanged || providerMissing || providerRemoval
       const loadChanged = requiresSync
         || next.mtp !== previous.mtp
+        || next.mtpDraftTokens !== previous.mtpDraftTokens
+        || next.mtpDraftMin !== previous.mtpDraftMin
+        || next.mtpDraftPMin !== previous.mtpDraftPMin
         || next.compute !== previous.compute
         || next.vitCompute !== previous.vitCompute
       const revisionBefore = modelRevision
       settings = next
       statusCache.at = 0
+      if (next.mtp && !previous.mtp && managedModels.size > 0) {
+        capabilityRetryAt = 0
+        for (const id of managedModels) modelMetadataCache.delete(`${settings.upstream}|${id}`)
+        const entries = await mapLimit([...managedModels], 4, async (id) => {
+          return [id, await readModelMetadata(settings, id, true)]
+        })
+        applyCapabilities(new Map(entries))
+      }
       try {
         if (requiresSync) await syncProvider()
         settings.lastError = null
@@ -1567,6 +1695,7 @@ export async function apply(ctx) {
     },
     apply: async () => {
       try {
+        for (const id of managedModels) modelMetadataCache.delete(`${settings.upstream}|${id}`)
         await syncProvider()
         settings.lastError = null
       } catch (error) {
@@ -1697,6 +1826,11 @@ export async function apply(ctx) {
     (model) => visionModels.has(model),
     modelContext,
     useMtp,
+    canMtp,
+    mtpApprovedFor,
+    mtpFileFor,
+    consumeMtpChoice,
+    recordMtpUsage,
   ))
   await new Promise((resolve, reject) => {
     server.once('error', reject)
