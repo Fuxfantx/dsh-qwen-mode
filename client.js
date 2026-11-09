@@ -55,7 +55,7 @@ window.__ModuleLoader__.load({
       'autoNctx.label': '优先使用模型上下文阈限（GGUF context_length）',
       'maxOutputTokens.label': '最大输出长度',
       'mtp.label': 'MTP 投机解码',
-      'mtp.hint': '仅对内含 MTP / nextn 头、目录存在 mtp-*.gguf 文件的 GGUF 模型生效，MTP 启用时暂不支持添加图片。',
+      'mtp.hint': '仅对内含 mtp / nextn 张量、目录下存在 mtp-*.gguf 文件的 GGUF 模型生效；MTP 启用时暂不支持添加图片。',
       'mtp.tokens': 'spec_n_max',
       'mtp.min': 'spec_n_min',
       'mtp.pmin': 'spec_p_min',
@@ -129,7 +129,7 @@ window.__ModuleLoader__.load({
       'autoNctx.label': 'Prefer model context limit (GGUF context_length)',
       'maxOutputTokens.label': 'Max output tokens',
       'mtp.label': 'MTP speculative decoding',
-      'mtp.hint': 'Applies only to GGUF models with an MTP / nextn head and an mtp-*.gguf companion file; images are not supported while MTP is enabled.',
+      'mtp.hint': 'Applies only to GGUF models containing mtp / nextn tensors and an mtp-*.gguf file in the model directory; images are not supported while MTP is enabled.',
       'mtp.tokens': 'spec_n_max',
       'mtp.min': 'spec_n_min',
       'mtp.pmin': 'spec_p_min',
@@ -1324,7 +1324,7 @@ window.__ModuleLoader__.load({
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
             ]),
-            h('div', { key: 'grid-penalties', style: { ...S.grid, gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', marginTop: '10px' } }, [
+            h('div', { key: 'grid-penalties', style: { ...S.grid, gridTemplateColumns: 'repeat(3, minmax(0, 1fr))' } }, [
               ...['repetitionPenalty', 'presencePenalty', 'frequencyPenalty'].map((key) => h(Field, {
                 key,
                 label: t(`${key}.label`),
