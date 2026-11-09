@@ -14,6 +14,7 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const NS = 'qwenMode'
     const API = '/qwen-mode/api'
+    const DEFAULT_CONTEXT_WINDOW = 262144
 
     const zh = {
       'section.title': 'Qwen 模式',
@@ -50,9 +51,10 @@ window.__ModuleLoader__.load({
       'reasoningFormat.deepseek': 'deepseek（可能提前结束思考）',
       'reasoningFormat.auto': 'auto（由上游决定）',
       'limits.title': '模型限制',
-      'limits.hint': '上下文窗口与最大输出长度；最大输出不能超过上下文窗口。',
+      'limits.hint': '上下文窗口留空时：GenieX 视为由 `geniex serve --nctx` 指定，不再下发该字段；QwenCloud 使用默认 262144。最大输出不能超过已设置的上下文窗口。',
       'limits.invalid': '最大输出长度不能大于上下文窗口。',
       'contextWindow.label': '上下文窗口',
+      'contextWindow.placeholder': '留空：GenieX 用 --nctx，QwenCloud 用 262144',
       'maxOutputTokens.label': '最大输出长度',
       'sampling.title': '采样默认值',
       'sampling.hint': '仅在请求未自带该参数时填充；留空表示不注入。',
@@ -111,9 +113,10 @@ window.__ModuleLoader__.load({
       'reasoningFormat.deepseek': 'deepseek (may end thinking early)',
       'reasoningFormat.auto': 'auto (upstream decides)',
       'limits.title': 'Model limits',
-      'limits.hint': 'Context window and maximum output length; output cannot exceed the context window.',
+      'limits.hint': 'If the context window is empty: GenieX assumes `geniex serve --nctx` and the field is omitted; QwenCloud uses the default 262144. Max output cannot exceed an explicit context window.',
       'limits.invalid': 'Max output tokens cannot exceed the context window.',
       'contextWindow.label': 'Context window',
+      'contextWindow.placeholder': 'Empty: GenieX uses --nctx; QwenCloud uses 262144',
       'maxOutputTokens.label': 'Max output tokens',
       'sampling.title': 'Sampling defaults',
       'sampling.hint': 'Injected only when the request does not already carry the field; empty omits it.',
@@ -682,9 +685,13 @@ window.__ModuleLoader__.load({
           }
           numeric[key] = value
         }
-        if (numeric.maxOutputTokens !== null && numeric.contextWindow !== null && numeric.maxOutputTokens > numeric.contextWindow) {
-          setError(t('limits.invalid'))
-          return
+        if (numeric.maxOutputTokens !== null) {
+          const effectiveContext = numeric.contextWindow
+            ?? (settings.protocol === 'qwen' ? DEFAULT_CONTEXT_WINDOW : null)
+          if (effectiveContext !== null && numeric.maxOutputTokens > effectiveContext) {
+            setError(t('limits.invalid'))
+            return
+          }
         }
         preheat.enabled = settings.warm === true
         void action('save', () => call('save', {
@@ -834,6 +841,7 @@ window.__ModuleLoader__.load({
               style: S.input,
               inputMode: 'numeric',
               value: numberValue(key),
+              placeholder: key === 'contextWindow' ? t('contextWindow.placeholder') : undefined,
               onChange: (event) => setNumber(key, event.target.value),
             }))),
           ]),

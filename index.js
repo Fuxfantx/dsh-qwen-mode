@@ -57,6 +57,10 @@ function positiveInt(value, fallback) {
   return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : fallback
 }
 
+function positiveIntOrNull(value) {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : null
+}
+
 function streamFirstTokenTime(stream) {
   if (!Array.isArray(stream)) return undefined
   for (const record of stream) {
@@ -130,22 +134,23 @@ function normalizeSettings(raw) {
   const port = typeof source.proxyPort === 'number' && Number.isInteger(source.proxyPort) && source.proxyPort > 0 && source.proxyPort < 65536
     ? source.proxyPort
     : DEFAULT_PORT
+  const protocol = source.protocol === 'qwen' ? 'qwen' : 'geniex'
+  const contextWindow = positiveIntOrNull(source.contextWindow)
+  const effectiveContext = contextWindow ?? (protocol === 'qwen' ? DEFAULTS.contextWindow : null)
+  const maxOutput = positiveInt(source.maxOutputTokens, DEFAULTS.maxOutputTokens)
   return {
     version: 1,
     mode: ['off', 'auto'].includes(source.mode)
       ? source.mode
       : source.enabled === true || source.mode === 'always' ? 'auto' : 'off',
     warm: source.warm === true,
-    protocol: source.protocol === 'qwen' ? 'qwen' : 'geniex',
+    protocol,
     upstream: text(source.upstream).replace(/\/+$/u, '') || DEFAULTS.upstream,
     apiKeyEnv: text(source.apiKeyEnv),
     proxyPort: port,
     managedProviderId: text(source.managedProviderId) || null,
-    contextWindow: positiveInt(source.contextWindow, DEFAULTS.contextWindow),
-    maxOutputTokens: Math.min(
-      positiveInt(source.maxOutputTokens, DEFAULTS.maxOutputTokens),
-      positiveInt(source.contextWindow, DEFAULTS.contextWindow),
-    ),
+    contextWindow,
+    maxOutputTokens: effectiveContext === null ? maxOutput : Math.min(maxOutput, effectiveContext),
     thinking: ['auto', 'on', 'off'].includes(source.thinking) ? source.thinking : 'auto',
     reasoningFormat: ['none', 'deepseek', 'auto'].includes(source.reasoningFormat) ? source.reasoningFormat : 'none',
     temperature: numberOrNull(source.temperature),
@@ -520,14 +525,16 @@ function modelSpec(id, settings) {
     : lower.includes('3.8')
       ? { off: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh' }
       : undefined
-  return {
+  const contextWindow = settings.contextWindow ?? (settings.protocol === 'qwen' ? DEFAULTS.contextWindow : null)
+  const spec = {
     id,
     name: shortName(id),
-    contextWindow: settings.contextWindow,
     maxTokens: settings.maxOutputTokens,
     reasoningEfforts,
     input: ['text'],
   }
+  if (contextWindow !== null) spec.contextWindow = contextWindow
+  return spec
 }
 
 async function credentialHeader(ctx, settings) {

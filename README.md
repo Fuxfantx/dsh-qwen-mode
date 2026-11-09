@@ -41,6 +41,7 @@
 ### 设置
 
 - **API Key**：留空时使用 DSH credential `local`，不读取同名环境变量；QwenCloud 可填写环境变量名，例如 `DASHSCOPE_API_KEY`。
+- **上下文窗口**：留空时，GenieX 视为由 `geniex serve --nctx <value>` 指定，不再下发上下文窗口字段；QwenCloud 使用默认 `262144`。
 - **模型预热**：位于「接入来源 → 高级选项」，仅对 `From GenieX` 生效；预热期间发送按钮替换为转圈。
 - **统计**：仅在该轮回复完成后显示；DSH 在流式阶段不提供可用的 TTFT/Decode TPS 结算值。
 - **仅回复**：隐藏并拒绝工具调用，适合纯聊天。
@@ -92,6 +93,7 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers
 ### Settings
 
 - **API Key**: empty uses DSH credential `local` and does not read an environment variable of that name. For QwenCloud, enter an environment variable such as `DASHSCOPE_API_KEY`.
+- **Context window**: when empty, GenieX assumes `geniex serve --nctx <value>` and the field is omitted; QwenCloud uses the default `262144`.
 - **Model Warmup**: under **Source → Advanced**, applies only to `From GenieX`; the send button is replaced by a spinner while warming.
 - **Stats**: shown only after the reply completes; DSH does not expose settled TTFT/Decode TPS during streaming.
 - **Reply Only**: hides and denies tools for a pure chat experience.
