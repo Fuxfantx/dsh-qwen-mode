@@ -1,4 +1,4 @@
-# DSH Qwen mode / DSH Qwen 模式
+# DSH Qwen Mode / DSH Qwen 模式
 
 [中文](#中文) · [English](#english)
 
@@ -12,24 +12,24 @@
 
 - **关闭 / 自动** 两档模式；自动档只处理 `From GenieX` / `From QwenCloud` 下的模型。
 - GenieX 自动创建 **From GenieX**，QwenCloud 自动创建 **From QwenCloud**。
-- 从上游模型目录发现模型，生成上下文窗口与最大输出限制。
+- 从上游模型目录发现模型，并生成上下文窗口与最大输出限制。
 - GenieX 注入顶层 `enable_think`；QwenCloud 注入 `enable_thinking` 并保留 `reasoning_effort`。
 - 将 `<think>...</think>` 拆为 `reasoning_content`；无标签时识别 GenieX 的“推理段落 + 空行 + 正文”结构。
-- 为流式请求补 `stream_options.include_usage`，并在回复结束后显示模型名、TTFT、Decode TPS 和时间。
+- 为流式请求补 `stream_options.include_usage`，回复完成后显示模型名、TTFT、Decode TPS 和时间。
 - 安装 **仅回复 / Reply Only** 权限：只读、无审批，并隐藏/拒绝工具调用。
-- 可选模型预热：选择 `From GenieX` 模型时提前加载；预热请求串行执行，避免模型互相换出内存。
+- 可选模型预热：选择 `From GenieX` 模型时提前加载；预热请求串行执行。
 - 模型选择器显示量化精度（如 `Q4_0`），并隐藏官方 trigger 图标。
-- 可配置上下文窗口、最大输出长度、思考模式、采样默认值。
+- 可配置上下文窗口、最大输出、思考模式、采样默认值与 `repetition_penalty`。
 
-### 安装
+### 要求与安装
 
-从离线 zip 或插件目录安装，刷新 DSH 页面。详细步骤见 [INSTALL.md](INSTALL.md)。
-
-本包没有 npm 依赖。
+- DSH 需支持 Cordis bundle 与 Plugin Manager。
+- 从离线 zip 或插件目录安装，刷新 DSH 页面；详见 [INSTALL.md](INSTALL.md)。
+- 本包没有 npm 依赖。
 
 ### 使用
 
-1. 打开 **Settings → Qwen mode**。
+1. 打开 **Settings → Qwen Mode**。
 2. 选择 **关闭** 或 **自动**。
 3. 选择来源并填写上游地址：
    - **GenieX**：填 `http://127.0.0.1:18181` 即可，插件自动使用 `/v1`。
@@ -38,14 +38,13 @@
 5. 点击「保存并应用」，插件自动创建/更新 Provider。
 6. 在模型选择器中选择该 Provider 下的模型。
 
-关闭会移除插件管理的 Provider；用户自己创建的 Provider 不受影响。
+### 设置
 
-### 设置说明
-
-- **API Key**：留空时使用 DSH credential `local`，不会读取同名环境变量；QwenCloud 可填写环境变量名，例如 `DASHSCOPE_API_KEY`。
+- **API Key**：留空时使用 DSH credential `local`，不读取同名环境变量；QwenCloud 可填写环境变量名，例如 `DASHSCOPE_API_KEY`。
 - **模型预热**：位于「接入来源 → 高级选项」，仅对 `From GenieX` 生效；预热期间发送按钮替换为转圈。
-- **统计显示**：只能在回复完成后显示；DSH 在流式阶段不提供可用的 TTFT/Decode TPS 结算值。
-- **权限**：`仅回复` 会隐藏并拒绝工具调用，适合纯聊天。
+- **统计**：仅在该轮回复完成后显示；DSH 在流式阶段不提供可用的 TTFT/Decode TPS 结算值。
+- **仅回复**：隐藏并拒绝工具调用，适合纯聊天。
+- **repetition_penalty**：可设为 `1.05`，降低 thinking 段落循环输出的概率。
 
 ### 限制
 
@@ -71,33 +70,32 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers
 - Adds **仅回复 / Reply Only**: read-only, no approvals, tools hidden/denied.
 - Optional warmup for `From GenieX` models; warmups are serialized so models cannot evict each other.
 - Shows a quantization badge (for example `Q4_0`) and hides the shipped model-trigger icon.
-- Configurable context window, max output, thinking mode, and sampling defaults.
+- Configurable context window, max output, thinking mode, sampling defaults, and `repetition_penalty`.
 
-### Install
+### Requirements and Install
 
-Install from the offline zip or the plugin directory, then refresh DSH. See [INSTALL.md](INSTALL.md) for details.
-
-The package has no npm dependencies.
+- DSH with Cordis bundle and Plugin Manager support.
+- Install from the offline zip or plugin directory, then refresh DSH. See [INSTALL.md](INSTALL.md).
+- The package has no npm dependencies.
 
 ### Usage
 
-1. Open **Settings → Qwen mode**.
+1. Open **Settings → Qwen Mode**.
 2. Choose **Off** or **Auto**.
 3. Choose a source and enter the upstream URL:
    - **GenieX**: `http://127.0.0.1:18181`; the plugin appends `/v1` automatically.
    - **QwenCloud**: enter the full compatible endpoint; the plugin does not append `/v1`.
 4. Adjust model limits, thinking, and sampling defaults.
-5. Click **Save and apply**; the managed provider is created or updated.
+5. Click **Save and Apply**; the managed provider is created or updated.
 6. Select a model under that provider in the model picker.
-
-Off removes the managed provider; user-created providers are untouched.
 
 ### Settings
 
-- **API key**: empty uses DSH credential `local` and does not read an environment variable of that name. For QwenCloud, enter an environment variable such as `DASHSCOPE_API_KEY`.
-- **Model warmup**: under **Source → Advanced**, applies only to `From GenieX`; the send button is replaced by a spinner while warming.
-- **Stats**: shown only after completion; DSH does not expose settled TTFT/Decode TPS during streaming.
-- **Permission**: `Reply Only` hides and denies tools for a pure chat experience.
+- **API Key**: empty uses DSH credential `local` and does not read an environment variable of that name. For QwenCloud, enter an environment variable such as `DASHSCOPE_API_KEY`.
+- **Model Warmup**: under **Source → Advanced**, applies only to `From GenieX`; the send button is replaced by a spinner while warming.
+- **Stats**: shown only after the reply completes; DSH does not expose settled TTFT/Decode TPS during streaming.
+- **Reply Only**: hides and denies tools for a pure chat experience.
+- **repetition_penalty**: try `1.05` to reduce looping in thinking output.
 
 ### Limitations
 
@@ -111,14 +109,11 @@ Off removes the managed provider; user-created providers are untouched.
 ## Files / 文件
 
 - `index.js` — proxy, provider maintenance, model discovery, reasoning parser, turn metrics.
-- `client.js` — Settings page, model label, warmup spinner, permission icon.
+- `client.js` — settings page, model label, warmup spinner, permission icon, turn stats.
 - `cordis.patch.yml` — installs the `qwen-mode` loader row.
 - `locale/` — plugin inventory copy (`zh`, `en`).
 - `icon.svg` — plugin icon.
 
----
-
 ## License / 许可证
 
 MIT-0. See [LICENSE](LICENSE).
-

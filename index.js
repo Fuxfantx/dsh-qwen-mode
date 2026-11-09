@@ -699,6 +699,13 @@ export async function apply(ctx) {
   const turnMetrics = new Map()
   const stepStarts = new Map()
   const firstTokens = new Map()
+  const trimMap = (map, max) => {
+    while (map.size > max) {
+      const oldest = map.keys().next().value
+      if (oldest === undefined) return
+      map.delete(oldest)
+    }
+  }
   ctx.effect(() => ctx.on('session/event', (session, event) => {
     const turn = event.data?.turn
     const step = event.data?.step
@@ -706,18 +713,22 @@ export async function apply(ctx) {
     const key = `${session.id}:${turn}:${step}`
     if (event.type === 'step/start') {
       stepStarts.set(key, event.time)
+      trimMap(stepStarts, 2000)
       return
     }
     if (event.type === 'assistant/attempt') {
       const first = streamFirstTokenTime(event.data.stream)
       if (first !== undefined) firstTokens.set(key, first)
+      trimMap(firstTokens, 2000)
       return
     }
     if (event.type !== 'assistant/message') return
     const source = event.data.message?.source
-    if (typeof source?.provider !== 'string' || typeof source?.model !== 'string') return
     const first = firstTokens.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
     const start = stepStarts.get(key) ?? first
+    stepStarts.delete(key)
+    firstTokens.delete(key)
+    if (typeof source?.provider !== 'string' || typeof source?.model !== 'string') return
     const outputTokens = event.data.usage?.outputTokens ?? null
     const decodeMs = Math.max(1, event.time - first)
     const metric = {
@@ -729,12 +740,7 @@ export async function apply(ctx) {
     }
     const turnKey = `${session.id}:${turn}`
     turnMetrics.set(turnKey, metric)
-    stepStarts.delete(key)
-    firstTokens.delete(key)
-    if (turnMetrics.size > 500) {
-      const oldest = turnMetrics.keys().next().value
-      if (oldest !== undefined) turnMetrics.delete(oldest)
-    }
+    trimMap(turnMetrics, 500)
   }), `${SCOPE}: turn metrics`)
 
   const state = () => ({

@@ -402,13 +402,12 @@ window.__ModuleLoader__.load({
       }
       const scan = () => {
         if (document.body === null) return
-        const labels = new Set(['仅回复', 'Reply Only'])
         const seen = new Set()
         for (const button of document.querySelectorAll('button[role="option"], button')) {
           const walker = document.createTreeWalker(button, NodeFilter.SHOW_TEXT)
           for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
             const text = node.nodeValue?.trim()
-            if (text === undefined || !labels.has(text)) continue
+            if (text === undefined || !REPLY_LABELS.has(text)) continue
             const label = node.parentElement
             const host = label?.parentElement
             if (label === null || label === undefined || host === null || host === undefined) continue
@@ -486,6 +485,7 @@ window.__ModuleLoader__.load({
       style: null,
     }
     const SEND_LABELS = new Set(['发送消息', 'Send message', '发送', 'Send'])
+    const REPLY_LABELS = new Set(['仅回复', 'Reply Only'])
     function clearSendWarm() {
       if (sendWarm.timer !== null) {
         clearInterval(sendWarm.timer)
