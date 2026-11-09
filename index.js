@@ -286,7 +286,8 @@ function geniexModelsRoot() {
           return
         }
         const match = /Models cached in\s+(.+)/iu.exec(stdout)
-        resolveRoot(match === null ? join(homedir(), '.cache', 'geniex', 'models') : match[1].trim())
+        const root = match === null ? '' : match[1].replace(/\x1b\[[0-9;]*m/gu, '').trim()
+        resolveRoot(root === '' ? join(homedir(), '.cache', 'geniex', 'models') : root)
       },
     )
   })

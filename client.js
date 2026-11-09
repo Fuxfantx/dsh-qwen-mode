@@ -55,7 +55,7 @@ window.__ModuleLoader__.load({
       'autoNctx.label': '优先使用模型上下文阈限（GGUF context_length）',
       'maxOutputTokens.label': '最大输出长度',
       'mtp.label': 'MTP 投机解码',
-      'mtp.hint': '仅对 GGUF 内含 MTP/nextn 头、且模型目录存在 mtp-*.gguf 的 llama_cpp 文本模型生效；VLM 有图片时由发送前确认。',
+      'mtp.hint': '仅对内含MTP/nextn 头、目录存在 mtp-*.gguf 的GGUF模型生效，MTP启用时暂不支持添加图片。',
       'mtp.tokens': 'spec_n_max',
       'mtp.min': 'spec_n_min',
       'mtp.pmin': 'spec_p_min',
@@ -130,7 +130,7 @@ window.__ModuleLoader__.load({
       'autoNctx.label': 'Prefer model context limit (GGUF context_length)',
       'maxOutputTokens.label': 'Max output tokens',
       'mtp.label': 'MTP speculative decoding',
-      'mtp.hint': 'Applies only to llama_cpp text models whose GGUF contains an MTP/nextn head and whose directory has mtp-*.gguf; VLM image sends ask first.',
+      'mtp.hint': 'Applies only to GGUF models with an MTP/nextn head and an mtp-*.gguf companion; images are not supported while MTP is enabled.',
       'mtp.tokens': 'spec_n_max',
       'mtp.min': 'spec_n_min',
       'mtp.pmin': 'spec_p_min',
@@ -1352,20 +1352,25 @@ window.__ModuleLoader__.load({
                 }),
                 h('span', { key: 'label' }, t('mtp.label')),
               ]),
-              h('div', { key: 'mtp-hint', style: S.hint }, t('mtp.hint')),
-              h('div', { key: 'mtp-params', style: S.grid }, [
-                ...['mtpDraftTokens', 'mtpDraftMin', 'mtpDraftPMin'].map((key, index) => h(Field, {
-                  key,
-                  label: t(index === 0 ? 'mtp.tokens' : index === 1 ? 'mtp.min' : 'mtp.pmin'),
-                }, h('input', {
-                  key: 'input',
-                  style: S.input,
-                  inputMode: index === 2 ? 'decimal' : 'numeric',
-                  value: numberValue(key),
-                  placeholder: index === 0 ? '3' : '0',
-                  onChange: (event) => setNumber(key, event.target.value),
-                }))),
-              ]),
+              settings.mtp === true ? h('div', {
+                key: 'mtp-details',
+                style: { display: 'flex', flexDirection: 'column', gap: '8px' },
+              }, [
+                h('div', { key: 'mtp-params', style: S.grid }, [
+                  ...['mtpDraftTokens', 'mtpDraftMin', 'mtpDraftPMin'].map((key, index) => h(Field, {
+                    key,
+                    label: t(index === 0 ? 'mtp.tokens' : index === 1 ? 'mtp.min' : 'mtp.pmin'),
+                  }, h('input', {
+                    key: 'input',
+                    style: S.input,
+                    inputMode: index === 2 ? 'decimal' : 'numeric',
+                    value: numberValue(key),
+                    placeholder: index === 0 ? '3' : '0',
+                    onChange: (event) => setNumber(key, event.target.value),
+                  }))),
+                ]),
+                h('div', { key: 'mtp-hint', style: S.hint }, t('mtp.hint')),
+              ]) : null,
               h('datalist', { key: 'compute-options', id: 'qwen-compute-options' },
                 ['cpu', 'gpu', 'npu', 'hybrid'].map((value) => h('option', { key: value, value }))),
             ]),
