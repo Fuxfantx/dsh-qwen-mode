@@ -23,6 +23,8 @@ const STORE_FILE = 'qwen-mode.json'
 const MAX_BODY = 8 * 1024 * 1024
 const MAX_PROXY_BODY = 32 * 1024 * 1024
 const DEFAULT_PORT = 18182
+const MTP_SPEC_TYPE = 'draft-mtp'
+const MTP_DRAFT_TOKENS = 3
 const VIT_COMPUTE_VALUE = { cpu: 'CPU', gpu: 'GPU', npu: 'HTP2' }
 const VISION_MODEL_PATTERN = /(?:^|[/_-])(?:vl|vision)(?:[/_-]|$)/iu
 const KNOWN_REASONING_EFFORTS = [
@@ -31,8 +33,10 @@ const KNOWN_REASONING_EFFORTS = [
 ]
 const CAPABILITY_CACHE_TTL_MS = 5 * 60 * 1000
 const CAPABILITY_CACHE_LIMIT = 512
+const GGUF_PREFIX_BYTES = 32 * 1024 * 1024
 const reasoningEffortCache = new Map()
 const visionCache = new Map()
+const modelMetadataCache = new Map()
 
 const DEFAULTS = {
   version: 1,
@@ -45,11 +49,14 @@ const DEFAULTS = {
   managedProviderId: null,
   contextWindow: 262144,
   maxOutputTokens: 131072,
+  autoNctx: false,
+  mtp: false,
   compute: '',
   vitCompute: 'npu',
   temperature: null,
   topP: null,
   topK: null,
+  minP: null,
   repetitionPenalty: null,
   presencePenalty: null,
   frequencyPenalty: null,
@@ -188,6 +195,7 @@ function normalizeSettings(raw) {
     : DEFAULT_PORT
   const protocol = source.protocol === 'qwen' ? 'qwen' : 'geniex'
   const contextWindow = positiveIntOrNull(source.contextWindow)
+  const autoNctx = source.autoNctx === true
   const effectiveContext = contextWindow ?? (protocol === 'qwen' ? DEFAULTS.contextWindow : null)
   const maxOutput = positiveInt(source.maxOutputTokens, DEFAULTS.maxOutputTokens)
   return {
@@ -202,12 +210,15 @@ function normalizeSettings(raw) {
     proxyPort: port,
     managedProviderId: text(source.managedProviderId) || null,
     contextWindow,
-    maxOutputTokens: effectiveContext === null ? maxOutput : Math.min(maxOutput, effectiveContext),
+    maxOutputTokens: autoNctx ? maxOutput : effectiveContext === null ? maxOutput : Math.min(maxOutput, effectiveContext),
+    autoNctx,
+    mtp: source.mtp === true,
     compute: text(source.compute).slice(0, 100),
     vitCompute: ['cpu', 'gpu', 'npu'].includes(source.vitCompute) ? source.vitCompute : DEFAULTS.vitCompute,
     temperature: numberOrNull(source.temperature),
     topP: numberOrNull(source.topP),
     topK: numberOrNull(source.topK),
+    minP: numberOrNull(source.minP),
     repetitionPenalty: numberOrNull(source.repetitionPenalty),
     presencePenalty: numberOrNull(source.presencePenalty),
     frequencyPenalty: numberOrNull(source.frequencyPenalty),
@@ -272,6 +283,180 @@ function geniexModelsRoot() {
   return geniexModelsRootPromise
 }
 
+const GGUF_SCALAR_SIZE = new Map([
+  [0, 1], [1, 1], [2, 2], [3, 2], [4, 4], [5, 4], [6, 4], [7, 1], [10, 8], [11, 8], [12, 8],
+])
+const GGUF_SAMPLING_KEYS = {
+  'general.sampling.temp': 'temperature',
+  'general.sampling.temperature': 'temperature',
+  'general.sampling.top_k': 'topK',
+  'general.sampling.top_p': 'topP',
+  'general.sampling.min_p': 'minP',
+  'general.sampling.presence_penalty': 'presencePenalty',
+  'general.sampling.frequency_penalty': 'frequencyPenalty',
+  'general.sampling.repetition_penalty': 'repetitionPenalty',
+}
+
+function parseGgufPrefix(buffer) {
+  let offset = 0
+  const remaining = () => buffer.length - offset
+  const need = (size) => {
+    if (remaining() < size) throw new Error('truncated GGUF header')
+  }
+  const u32 = () => {
+    need(4)
+    const value = buffer.readUInt32LE(offset)
+    offset += 4
+    return value
+  }
+  const u64 = () => {
+    need(8)
+    const value = Number(buffer.readBigUInt64LE(offset))
+    offset += 8
+    return value
+  }
+  const string = () => {
+    const length = u64()
+    if (length > remaining()) throw new Error('truncated GGUF string')
+    const value = buffer.toString('utf8', offset, offset + length)
+    offset += length
+    return value
+  }
+  const skipString = () => {
+    const length = u64()
+    if (length > remaining()) throw new Error('truncated GGUF string')
+    offset += length
+  }
+  const skipValue = (type, depth = 0) => {
+    if (depth > 8) throw new Error('GGUF nesting too deep')
+    if (GGUF_SCALAR_SIZE.has(type)) {
+      const size = GGUF_SCALAR_SIZE.get(type)
+      need(size)
+      offset += size
+      return
+    }
+    if (type === 8) {
+      skipString()
+      return
+    }
+    if (type !== 9) throw new Error(`unsupported GGUF type ${type}`)
+    const inner = u32()
+    const count = u64()
+    for (let index = 0; index < count; index += 1) skipValue(inner, depth + 1)
+  }
+  const readScalar = (type) => {
+    if (type === 0) { need(1); return buffer.readUInt8(offset++) }
+    if (type === 1) { need(1); return buffer.readInt8(offset++) }
+    if (type === 2) { need(2); const v = buffer.readUInt16LE(offset); offset += 2; return v }
+    if (type === 3) { need(2); const v = buffer.readInt16LE(offset); offset += 2; return v }
+    if (type === 4) return u32()
+    if (type === 5) { need(4); const v = buffer.readInt32LE(offset); offset += 4; return v }
+    if (type === 6) { need(4); const v = buffer.readFloatLE(offset); offset += 4; return v }
+    if (type === 7) { need(1); return buffer.readUInt8(offset++) !== 0 }
+    if (type === 10) return u64()
+    if (type === 11) { need(8); const v = Number(buffer.readBigInt64LE(offset)); offset += 8; return v }
+    if (type === 12) { need(8); const v = buffer.readDoubleLE(offset); offset += 8; return v }
+    throw new Error(`unsupported GGUF scalar ${type}`)
+  }
+  const readStringArray = (count) => {
+    const values = []
+    for (let index = 0; index < count; index += 1) values.push(string())
+    return values
+  }
+
+  need(4)
+  if (buffer.toString('ascii', 0, 4) !== 'GGUF') throw new Error('not a GGUF file')
+  offset = 4
+  const version = u32()
+  const tensorCount = u64()
+  const kvCount = u64()
+  const meta = {}
+  for (let index = 0; index < kvCount; index += 1) {
+    const key = string()
+    const type = u32()
+    if (type === 8) {
+      if (key === 'general.name' || key === 'general.finetune' || key === 'general.basename' || key === 'general.architecture') {
+        meta[key] = string()
+      } else {
+        skipString()
+      }
+    } else if (type === 9) {
+      const inner = u32()
+      const count = u64()
+      if (key === 'general.tags' && inner === 8) meta[key] = readStringArray(count)
+      else for (let item = 0; item < count; item += 1) skipValue(inner)
+    } else {
+      meta[key] = readScalar(type)
+    }
+  }
+  let hasMtp = Object.entries(meta).some(([key, value]) => {
+    return /nextn_predict_layers|mtp/i.test(key) && typeof value === 'number' && value > 0
+  })
+  for (let index = 0; index < tensorCount; index += 1) {
+    const name = string()
+    if (/nextn|mtp|draft_head/i.test(name)) hasMtp = true
+    const dimensions = u32()
+    need(dimensions * 8 + 12)
+    offset += dimensions * 8 + 12
+  }
+  const contextKey = Object.keys(meta).find((key) => key.endsWith('.context_length'))
+  const contextLength = contextKey === undefined ? null : positiveIntOrNull(meta[contextKey])
+  const tags = Array.isArray(meta['general.tags']) ? meta['general.tags'].map((tag) => String(tag).toLowerCase()) : []
+  const abliterated = tags.some((tag) => tag.includes('abliterat') || tag.includes('uncensored') || tag.includes('refusal-direction'))
+  const sampling = {}
+  for (const [key, name] of Object.entries(GGUF_SAMPLING_KEYS)) {
+    if (typeof meta[key] === 'number' && Number.isFinite(meta[key])) sampling[name] = meta[key]
+  }
+  return {
+    version,
+    tensorCount,
+    architecture: typeof meta['general.architecture'] === 'string' ? meta['general.architecture'] : '',
+    name: typeof meta['general.name'] === 'string' ? meta['general.name'] : '',
+    finetune: typeof meta['general.finetune'] === 'string' ? meta['general.finetune'] : '',
+    contextLength,
+    hasMtp,
+    tags,
+    abliterated,
+    sampling,
+  }
+}
+
+async function readModelMetadata(settings, id) {
+  if (settings.protocol !== 'geniex') return null
+  const cacheKey = `${settings.upstream}|${id}`
+  const cached = modelMetadataCache.get(cacheKey)
+  if (cached !== undefined && Date.now() - cached.at < CAPABILITY_CACHE_TTL_MS) return cached.value
+  let value = null
+  try {
+    const cacheRoot = await geniexModelsRoot()
+    const { owner, leaf, precision } = splitModelId(id)
+    const manifest = JSON.parse(await readFile(join(cacheRoot, owner, leaf, 'geniex.json'), 'utf8'))
+    const file = manifest?.ModelFile?.[precision]?.Name
+      ?? Object.values(manifest?.ModelFile ?? {}).find((entry) => entry?.Downloaded === true)?.Name
+    if (typeof file === 'string' && file !== '') {
+      const path = join(cacheRoot, owner, leaf, file)
+      const handle = await open(path, 'r')
+      try {
+        const buffer = Buffer.allocUnsafe(GGUF_PREFIX_BYTES)
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
+        value = {
+          ...parseGgufPrefix(buffer.subarray(0, bytesRead)),
+          pluginId: typeof manifest?.PluginId === 'string' ? manifest.PluginId : '',
+        }
+      } finally {
+        await handle.close()
+      }
+    }
+  } catch {
+    // A missing or partial cache entry simply disables the optional model metadata.
+  }
+  modelMetadataCache.set(cacheKey, { value, at: Date.now() })
+  if (modelMetadataCache.size > CAPABILITY_CACHE_LIMIT) {
+    modelMetadataCache.delete(modelMetadataCache.keys().next().value)
+  }
+  return value
+}
+
 function thinkingEnabled(body) {
   const effort = typeof body.reasoning_effort === 'string' ? body.reasoning_effort.trim().toLowerCase() : null
   if (effort !== null && effort !== '') return !['off', 'none'].includes(effort)
@@ -287,7 +472,21 @@ function inferenceFields(settings, vision) {
   return fields
 }
 
-function applyRequestDefaults(body, settings, vision = false) {
+function loadFields(settings, context, mtp) {
+  const fields = {}
+  if (settings.protocol === 'geniex') {
+    if (typeof context === 'number' && context > 0) fields.nctx = context
+    if (mtp) {
+      fields.spec_type = MTP_SPEC_TYPE
+      fields.spec_n_max = MTP_DRAFT_TOKENS
+      fields.spec_n_min = 0
+      fields.spec_p_min = 0
+    }
+  }
+  return fields
+}
+
+function applyRequestDefaults(body, settings, vision = false, context = null, mtp = false) {
   const output = { ...body }
   const thinking = thinkingEnabled(body)
   if (settings.protocol === 'qwen') {
@@ -303,12 +502,18 @@ function applyRequestDefaults(body, settings, vision = false) {
     output.reasoning_format = 'auto'
     Object.assign(output, inferenceFields(settings, vision))
   }
+  for (const key of Object.keys(output)) {
+    if (key.startsWith('spec_')) delete output[key]
+  }
+  if (settings.protocol === 'geniex') delete output.nctx
+  Object.assign(output, loadFields(settings, context, mtp))
   const fill = (key, value) => {
     if (value !== null && output[key] === undefined) output[key] = value
   }
   fill('temperature', settings.temperature)
   fill('top_p', settings.topP)
   fill('top_k', settings.topK)
+  fill('min_p', settings.minP)
   fill('repetition_penalty', settings.repetitionPenalty)
   fill('presence_penalty', settings.presencePenalty)
   fill('frequency_penalty', settings.frequencyPenalty)
@@ -628,7 +833,7 @@ function writeProxyResponse(upstream, res, active, assumeReasoning) {
   })
 }
 
-function forward(req, res, settings, logger, ownsModel, isVision) {
+function forward(req, res, settings, logger, ownsModel, isVision, modelContext, useMtp) {
   let upstreamUrl
   try {
     const requestUrl = new URL(req.url ?? '/', 'http://qwen.invalid')
@@ -668,7 +873,13 @@ function forward(req, res, settings, logger, ownsModel, isVision) {
         active = ownsModel(parsed?.model)
         if (active) {
           thinking = thinkingEnabled(parsed, settings)
-          body = Buffer.from(JSON.stringify(applyRequestDefaults(parsed, settings, isVision(parsed?.model))), 'utf8')
+          body = Buffer.from(JSON.stringify(applyRequestDefaults(
+            parsed,
+            settings,
+            isVision(parsed?.model),
+            modelContext(parsed?.model),
+            useMtp(parsed?.model),
+          )), 'utf8')
         }
       } catch {
         // Preserve non-JSON bodies unchanged.
@@ -743,13 +954,16 @@ function splitModelId(id) {
   return { owner, leaf, precision: colon === -1 ? '' : id.slice(colon + 1) }
 }
 
-function buildModelSpec(id, settings, vision = false, reasoningEfforts) {
+function buildModelSpec(id, settings, vision = false, reasoningEfforts, metadata = null) {
   const known = KNOWN_REASONING_EFFORTS.find((entry) => id.toLowerCase().includes(entry.match))?.efforts
-  const contextWindow = settings.contextWindow ?? (settings.protocol === 'qwen' ? DEFAULTS.contextWindow : null)
+  const metadataContext = positiveIntOrNull(metadata?.contextLength)
+  const contextWindow = settings.autoNctx
+    ? metadataContext ?? settings.contextWindow
+    : settings.contextWindow ?? (settings.protocol === 'qwen' ? DEFAULTS.contextWindow : null)
   const model = {
     id,
     name: shortName(id),
-    maxTokens: settings.maxOutputTokens,
+    maxTokens: contextWindow === null ? settings.maxOutputTokens : Math.min(settings.maxOutputTokens, contextWindow),
     reasoningEfforts: reasoningEfforts ?? known,
     input: vision ? ['text', 'image'] : ['text'],
   }
@@ -862,19 +1076,27 @@ async function discoverModels(ctx, settings) {
     }
   }
   if (unique.size === 0) throw httpError(502, 'model discovery returned no models')
-  return mapLimit([...unique.values()], 6, async ({ id, modelType }) => {
+  const discovered = await mapLimit([...unique.values()], 6, async ({ id, modelType }) => {
     const known = KNOWN_REASONING_EFFORTS.find((entry) => id.toLowerCase().includes(entry.match))
-    const [vision, reasoningEfforts] = await Promise.all([
+    const [vision, reasoningEfforts, metadata] = await Promise.all([
       modelType !== null
         ? Promise.resolve(modelType.toLowerCase() === 'vlm')
         : detectVision(settings, id, headers),
       known === undefined ? detectReasoningEfforts(settings, id) : Promise.resolve(known.efforts),
+      readModelMetadata(settings, id),
     ])
-    return buildModelSpec(id, settings, vision, reasoningEfforts)
+    return {
+      spec: buildModelSpec(id, settings, vision, reasoningEfforts, metadata),
+      metadata,
+    }
   })
+  return {
+    models: discovered.map((entry) => entry.spec),
+    capabilities: new Map(discovered.map((entry) => [entry.spec.id, entry.metadata])),
+  }
 }
 
-async function warmUpModel(ctx, settings, model, vision = false) {
+async function warmUpModel(ctx, settings, model, vision = false, context = null, mtp = false) {
   const url = upstreamURL(settings, 'chat/completions')
   const body = {
     model,
@@ -887,7 +1109,7 @@ async function warmUpModel(ctx, settings, model, vision = false) {
     stream: false,
   }
   if (settings.protocol === 'qwen') body.enable_thinking = false
-  else Object.assign(body, { enable_think: false, reasoning_format: 'none' }, inferenceFields(settings, vision))
+  else Object.assign(body, { enable_think: false, reasoning_format: 'none' }, inferenceFields(settings, vision), loadFields(settings, context, mtp))
   const startedAt = Date.now()
   const response = await fetch(url, {
     method: 'POST',
@@ -917,7 +1139,7 @@ async function upsertProvider(ctx, settings) {
       await ctx.credentials.set('local', 'local')
     }
   }
-  const models = await discoverModels(ctx, settings)
+  const { models, capabilities } = await discoverModels(ctx, settings)
   const desired = {
     displayName: providerNameFor(settings.protocol),
     api: 'openai-completions',
@@ -955,6 +1177,7 @@ async function upsertProvider(ctx, settings) {
     baseURL: desired.baseURL,
     models: models.map((model) => model.id),
     visionModels: models.filter((model) => model.input.includes('image')).map((model) => model.id),
+    capabilities,
   }
 }
 
@@ -1031,14 +1254,46 @@ export async function apply(ctx) {
 
   const managedModels = new Set()
   const visionModels = new Set()
-  const refreshManagedModels = () => {
+  const mtpModels = new Set()
+  const modelContexts = new Map()
+  const modelCapabilities = new Map()
+  let modelRevision = 0
+  const applyCapabilities = (capabilities = new Map()) => {
+    mtpModels.clear()
+    modelContexts.clear()
+    modelCapabilities.clear()
+    for (const [id, metadata] of capabilities) {
+      modelCapabilities.set(id, metadata)
+      if (metadata?.hasMtp === true && metadata.pluginId === 'llama_cpp') mtpModels.add(id)
+      if (typeof metadata?.contextLength === 'number') modelContexts.set(id, metadata.contextLength)
+    }
+  }
+  const refreshManagedModels = async () => {
     managedModels.clear()
     visionModels.clear()
+    mtpModels.clear()
+    modelContexts.clear()
+    modelCapabilities.clear()
     const provider = readManagedProvider(ctx, settings).provider
     for (const id of provider?.models ?? []) managedModels.add(id)
     for (const id of provider?.visionModels ?? []) visionModels.add(id)
+    const entries = await mapLimit([...managedModels], 4, async (id) => {
+      return [id, await readModelMetadata(settings, id)]
+    })
+    applyCapabilities(new Map(entries))
   }
-  refreshManagedModels()
+  await refreshManagedModels()
+  const modelContext = (model) => {
+    if (!settings.autoNctx) return null
+    const context = modelContexts.get(model) ?? settings.contextWindow
+    return typeof context === 'number' && context > 0 ? context : null
+  }
+  const useMtp = (model) => {
+    return settings.mtp
+      && settings.protocol === 'geniex'
+      && mtpModels.has(model)
+      && !visionModels.has(model)
+  }
   const ownsModel = (model) => {
     if (settings.mode !== 'auto') return false
     return typeof model === 'string' && managedModels.has(model)
@@ -1126,6 +1381,8 @@ export async function apply(ctx) {
       await deleteProvider(ctx, settings)
       managedModels.clear()
       visionModels.clear()
+      applyCapabilities()
+      modelRevision += 1
       return
     }
     const provider = await upsertProvider(ctx, settings)
@@ -1133,14 +1390,18 @@ export async function apply(ctx) {
     visionModels.clear()
     for (const id of provider.models) managedModels.add(id)
     for (const id of provider.visionModels) visionModels.add(id)
+    applyCapabilities(provider.capabilities)
+    modelRevision += 1
   }
 
   const statusCache = { key: '', at: 0, value: null }
   const readGeniexStatus = async () => {
     const active = settings.mode === 'auto' && settings.protocol === 'geniex' && settings.warm === true
-    if (!active) return { active: false, models: [] }
+    if (!active) return { active: false, models: [], revision: modelRevision }
     const key = settings.upstream
-    if (statusCache.key === key && Date.now() - statusCache.at < 1500) return statusCache.value
+    if (statusCache.key === key && Date.now() - statusCache.at < 1500) {
+      return { ...statusCache.value, revision: modelRevision }
+    }
     let value = { active: true, models: [] }
     try {
       const url = new URL(settings.upstream)
@@ -1164,6 +1425,7 @@ export async function apply(ctx) {
     } catch {
       // A missing status endpoint means the client cannot classify warm models.
     }
+    value.revision = modelRevision
     statusCache.key = key
     statusCache.at = Date.now()
     statusCache.value = value
@@ -1174,6 +1436,19 @@ export async function apply(ctx) {
   const api = {
     state: () => state(),
     modelStatus: readGeniexStatus,
+    modelInfo: () => ({
+      revision: modelRevision,
+      models: Object.fromEntries([...managedModels].map((id) => {
+        const metadata = modelCapabilities.get(id)
+        return [id, {
+          abliterated: metadata?.abliterated === true,
+          hasMtp: metadata?.hasMtp === true && metadata.pluginId === 'llama_cpp',
+          contextLength: typeof metadata?.contextLength === 'number' ? metadata.contextLength : null,
+          sampling: metadata?.sampling ?? {},
+          tags: metadata?.tags ?? [],
+        }]
+      })),
+    }),
     setMode: async (payload) => {
       const mode = ['off', 'auto'].includes(payload?.mode) ? payload.mode : null
       if (mode === null) throw httpError(400, 'invalid mode')
@@ -1240,12 +1515,15 @@ export async function apply(ctx) {
         if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
         const model = text(payload?.model)
         if (model === '' || !managedModels.has(model)) throw httpError(400, 'unknown managed model')
-        if (settings.protocol === 'geniex') {
-          const status = await readGeniexStatus()
-          if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
-          if (status.models.includes(model)) return { warmed: true, model, skipped: true }
-        }
-        const result = await warmUpModel(ctx, settings, model, visionModels.has(model))
+        if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
+        const result = await warmUpModel(
+          ctx,
+          settings,
+          model,
+          visionModels.has(model),
+          modelContext(model),
+          useMtp(model),
+        )
         statusCache.at = 0
         return { warmed: true, model, ...result }
       }
@@ -1263,13 +1541,18 @@ export async function apply(ctx) {
         mode,
         proxyPort: settings.proxyPort,
       })
-      const providerChanged = ['protocol', 'upstream', 'apiKeyEnv', 'contextWindow', 'maxOutputTokens']
+      const providerChanged = ['protocol', 'upstream', 'apiKeyEnv', 'contextWindow', 'maxOutputTokens', 'autoNctx']
         .some((key) => next[key] !== previous[key])
       const managedProvider = readManagedProvider(ctx, next).provider
       const providerMissing = next.mode === 'auto'
         && (managedProvider?.exists !== true || !Array.isArray(managedProvider.models) || managedProvider.models.length === 0)
       const providerRemoval = next.mode === 'off' && next.managedProviderId !== null
       const requiresSync = next.mode !== previous.mode || providerChanged || providerMissing || providerRemoval
+      const loadChanged = requiresSync
+        || next.mtp !== previous.mtp
+        || next.compute !== previous.compute
+        || next.vitCompute !== previous.vitCompute
+      const revisionBefore = modelRevision
       settings = next
       statusCache.at = 0
       try {
@@ -1278,6 +1561,7 @@ export async function apply(ctx) {
       } catch (error) {
         settings.lastError = String(error)
       }
+      if (loadChanged && modelRevision === revisionBefore) modelRevision += 1
       await persist()
       return state()
     },
@@ -1296,6 +1580,8 @@ export async function apply(ctx) {
         await deleteProvider(ctx, settings)
         managedModels.clear()
         visionModels.clear()
+        applyCapabilities()
+        modelRevision += 1
         settings.lastError = null
       } catch (error) {
         settings.lastError = String(error)
@@ -1402,7 +1688,16 @@ export async function apply(ctx) {
     // The permission catalog refresh is best-effort.
   }
 
-  const server = http.createServer((req, res) => forward(req, res, settings, logger, ownsModel, (model) => visionModels.has(model)))
+  const server = http.createServer((req, res) => forward(
+    req,
+    res,
+    settings,
+    logger,
+    ownsModel,
+    (model) => visionModels.has(model),
+    modelContext,
+    useMtp,
+  ))
   await new Promise((resolve, reject) => {
     server.once('error', reject)
     server.listen(settings.proxyPort, '127.0.0.1', resolve)
@@ -1416,9 +1711,3 @@ export async function apply(ctx) {
   }, 1500)
   ctx.effect(() => () => clearTimeout(labelTimer), `${SCOPE}: permission preset bootstrap`)
 }
-
-
-
-
-
-

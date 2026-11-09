@@ -40,10 +40,14 @@
 ### 设置
 
 - **API Key**：留空时使用 DSH credential `local`；QwenCloud 可填写环境变量名，例如 `DASHSCOPE_API_KEY`。
-- **上下文窗口**：留空时 GenieX 使用服务端 `--nctx`；QwenCloud 使用 `262144`。
+- **上下文窗口**：留空时 GenieX 使用服务端 `--nctx`；QwenCloud 使用 `262144`。启用「自动使用模型上下文」后，优先读取 GGUF 的 `context_length`，并按模型限制最大输出。
+- **MTP 投机解码**：仅当 GGUF 含 MTP/nextn 头、运行时为 `llama_cpp` 且模型不是 VLM 时生效；否则不会下发任何 `spec_*` 参数。
+- **历史推理内容**：GenieX 的 HTTP 接口不提供 `preserve_thinking` 开关，实际保留策略由模型模板决定，因此插件不伪造该选项。
 - **推理后端**（仅 GenieX）：
   - `Compute` 可留空，或填写 `cpu` / `gpu` / `npu` / `hybrid` / 设备列表。
   - `Vision Encoder` 可选 CPU / GPU / NPU；NPU 对应 GenieX 的 `HTP2`。
+- **采样推荐**：设置页可从 GGUF 的 `general.sampling.*` 一键填入 temperature / top_p / top_k / min_p；填入后仍需保存。
+- **模型名颜色**：GGUF tags 含 `abliterated`、`abliteration`、`uncensored` 或 `refusal-direction` 时，模型名使用主题的 warning 色显示。
 - **模型预热**：位于「接入来源 → 高级选项」，仅对 `From GenieX` 生效。预热与正式请求使用相同的加载参数，避免刚预热就因参数变化重新加载。
 - **驻留圆点**：仅在来源为 GenieX、模式为自动且自动预热启用时显示：
   - 黄点：正在预热
@@ -99,10 +103,14 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed model pro
 ### Settings
 
 - **API Key**: empty uses the DSH credential `local`; for QwenCloud, enter an environment variable such as `DASHSCOPE_API_KEY`.
-- **Context window**: empty lets GenieX use its `--nctx`; QwenCloud falls back to `262144`.
+- **Context window**: empty lets GenieX use its `--nctx`; QwenCloud falls back to `262144`. With **Use per-model context from GGUF** enabled, the GGUF `context_length` wins and max output is capped per model.
+- **MTP speculative decoding**: applies only when the GGUF contains an MTP/nextn head, the runtime is `llama_cpp`, and the model is not a VLM; otherwise no `spec_*` fields are sent.
+- **Historical reasoning**: GenieX's HTTP API has no `preserve_thinking` switch; the model template decides. The plugin does not expose a fake toggle.
 - **Inference Backend** (GenieX only):
   - `Compute` may be empty or contain `cpu` / `gpu` / `npu` / `hybrid` / a device list.
   - `Vision Encoder` selects CPU / GPU / NPU; NPU maps to GenieX `HTP2`.
+- **Sampling recommendation**: fill temperature / top_p / top_k / min_p from GGUF `general.sampling.*` in one click; save afterward.
+- **Model name color**: when GGUF tags include `abliterated`, `abliteration`, `uncensored`, or `refusal-direction`, the model name uses the theme warning color.
 - **Model Warmup**: under **Source → Advanced**, GenieX only. Warmup uses the same load parameters as real requests, so it is not immediately reloaded.
 - **Residency dots**: shown only when the source is GenieX, the mode is Auto, and warmup is enabled:
   - Yellow: warming up

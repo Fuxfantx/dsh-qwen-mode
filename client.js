@@ -52,12 +52,21 @@ window.__ModuleLoader__.load({
       'limits.invalid': '最大输出长度不能大于上下文窗口。',
       'contextWindow.label': '上下文窗口',
       'contextWindow.geniexPlaceholder': 'GENIEX_NCTX（default 4096）',
+      'autoNctx.label': '自动使用模型上下文（GGUF）',
+      'autoNctx.hint': '启用后优先使用 GGUF 的 context_length；读取不到时回退到上方上下文窗口。',
       'maxOutputTokens.label': '最大输出长度',
+      'mtp.label': 'MTP 投机解码',
+      'mtp.hint': '仅对 GGUF 内含 MTP/nextn 头的文本模型生效；VLM 自动跳过，避免禁用图片输入。',
       'sampling.title': '采样默认值',
       'sampling.hint': '仅在请求未携带该字段时填充；留空则不注入。',
+      'sampling.recommend': '元数据推荐',
+      'sampling.fill': '填入推荐值',
+      'sampling.none': '当前没有带推荐采样值的模型',
+      'sampling.recommendHint': '从 GGUF 的 general.sampling.* 读取；填入后仍需保存。',
       'temperature.label': 'temperature',
       'topP.label': 'top_p',
       'topK.label': 'top_k',
+      'minP.label': 'min_p',
       'repetitionPenalty.label': 'repetition_penalty',
       'presencePenalty.label': 'presence_penalty',
       'frequencyPenalty.label': 'frequency_penalty',
@@ -109,12 +118,21 @@ window.__ModuleLoader__.load({
       'limits.invalid': 'Max output tokens cannot exceed the context window.',
       'contextWindow.label': 'Context window',
       'contextWindow.geniexPlaceholder': 'GENIEX_NCTX (default 4096)',
+      'autoNctx.label': 'Use per-model context from GGUF',
+      'autoNctx.hint': 'When enabled, prefer the GGUF context_length; fall back to the context window above.',
       'maxOutputTokens.label': 'Max output tokens',
+      'mtp.label': 'MTP speculative decoding',
+      'mtp.hint': 'Applies only to text models whose GGUF contains an MTP/nextn head; VLM models are skipped to preserve image input.',
       'sampling.title': 'Sampling Defaults',
       'sampling.hint': 'Filled only when the request does not already carry the field; empty omits it.',
+      'sampling.recommend': 'Metadata recommendation',
+      'sampling.fill': 'Fill recommended',
+      'sampling.none': 'No model currently exposes recommended sampling',
+      'sampling.recommendHint': 'Read from GGUF general.sampling.*; save after filling.',
       'temperature.label': 'temperature',
       'topP.label': 'top_p',
       'topK.label': 'top_k',
+      'minP.label': 'min_p',
       'repetitionPenalty.label': 'repetition_penalty',
       'presencePenalty.label': 'presence_penalty',
       'frequencyPenalty.label': 'frequency_penalty',
@@ -157,6 +175,7 @@ window.__ModuleLoader__.load({
     const warmState = {
       states: new Map(),
       enabled: false,
+      revision: 0,
       listeners: new Set(),
       timer: null,
       subscribers: 0,
@@ -168,6 +187,7 @@ window.__ModuleLoader__.load({
           const status = await call('modelStatus', undefined, { signal: AbortSignal.timeout(3000) })
           warmState.states = new Map(Object.entries(status?.states ?? {}))
           warmState.enabled = status?.active === true
+          warmState.revision = Number.isSafeInteger(status?.revision) ? status.revision : 0
         } catch {
           warmState.states = new Map()
           warmState.enabled = false
@@ -200,6 +220,49 @@ window.__ModuleLoader__.load({
       },
     }
 
+    const modelMetaState = {
+      models: new Map(),
+      listeners: new Set(),
+      timer: null,
+      subscribers: 0,
+      refreshing: false,
+      async refresh() {
+        if (modelMetaState.refreshing) return
+        modelMetaState.refreshing = true
+        try {
+          const info = await call('modelInfo', undefined, { signal: AbortSignal.timeout(5000) })
+          modelMetaState.models = new Map(Object.entries(info?.models ?? {}))
+        } catch {
+          // Model metadata is optional; keep the last successful snapshot.
+        }
+        modelMetaState.refreshing = false
+        for (const listener of modelMetaState.listeners) {
+          try {
+            listener()
+          } catch {
+            // A label can unmount between refresh and notification.
+          }
+        }
+      },
+      subscribe(listener) {
+        modelMetaState.listeners.add(listener)
+        modelMetaState.subscribers += 1
+        if (modelMetaState.subscribers === 1) {
+          void modelMetaState.refresh()
+          modelMetaState.timer = window.setInterval(() => void modelMetaState.refresh(), 30000)
+        }
+        listener()
+        return () => {
+          modelMetaState.listeners.delete(listener)
+          modelMetaState.subscribers -= 1
+          if (modelMetaState.subscribers === 0 && modelMetaState.timer !== null) {
+            window.clearInterval(modelMetaState.timer)
+            modelMetaState.timer = null
+          }
+        }
+      },
+    }
+
     function QwenGlyph({ size = 18 }) {
       return h('svg', {
         viewBox: '0 0 24 24',
@@ -214,7 +277,7 @@ window.__ModuleLoader__.load({
     }
 
     /** Model name that marquees only while hovered and only when it overflows. */
-    function ModelName({ name, marquee }) {
+    function ModelName({ name, marquee, color }) {
       const outerRef = React.useRef(null)
       const innerRef = React.useRef(null)
       const [hovered, setHovered] = React.useState(false)
@@ -228,12 +291,12 @@ window.__ModuleLoader__.load({
         setDistance(Math.max(0, inner.scrollWidth - outer.clientWidth))
         inner.style.maxWidth = previous
       }
-      if (!marquee) return h('span', { style: S.modelName, title: name }, name)
+      if (!marquee) return h('span', { style: { ...S.modelName, color }, title: name }, name)
       const reduceMotion = typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true
       const duration = Math.max(4, Math.min(12, distance / 25))
       return h('span', {
         ref: outerRef,
-        style: { ...S.modelName, display: 'inline-block', maxWidth: '100%' },
+        style: { ...S.modelName, color, display: 'inline-block', maxWidth: '100%' },
         onMouseEnter: () => {
           setHovered(true)
           measure()
@@ -263,9 +326,12 @@ window.__ModuleLoader__.load({
     function ModelLabel({ provider, model, placement, selected, sessionId, getLocale }) {
       const [warmEnabled, setWarmEnabled] = React.useState(false)
       const [residentState, setResidentState] = React.useState('')
+      const [warmRevision, setWarmRevision] = React.useState(warmState.revision)
+      const [modelMeta, setModelMeta] = React.useState(null)
       React.useEffect(() => {
         const update = () => {
           setWarmEnabled((current) => current === warmState.enabled ? current : warmState.enabled)
+          setWarmRevision((current) => current === warmState.revision ? current : warmState.revision)
           if (placement === 'option' && provider?.id === 'from-geniex' && typeof model?.id === 'string') {
             const next = warmState.states.get(model.id) ?? ''
             setResidentState((current) => current === next ? current : next)
@@ -273,6 +339,12 @@ window.__ModuleLoader__.load({
         }
         return warmState.subscribe(update)
       }, [placement, provider?.id, model?.id])
+      React.useEffect(() => {
+        if (provider?.id !== 'from-geniex' || typeof model?.id !== 'string') return undefined
+        return modelMetaState.subscribe(() => {
+          setModelMeta(modelMetaState.models.get(model.id) ?? null)
+        })
+      }, [provider?.id, model?.id])
       React.useEffect(() => {
         if (placement !== 'trigger' || !selected) return
         const key = sessionId ?? 'global'
@@ -299,10 +371,11 @@ window.__ModuleLoader__.load({
           if (preheat.selected.get(key) !== modelId) return
           if (!preheat.enabled) return
           const loaded = warmState.states.has(modelId)
-          if (loaded && lastWarm.get(key) === modelId) return
           const modelKey = `${key}\u0000${modelId}`
-          if (loaded && Date.now() - (lastWarmAt.get(modelKey) ?? 0) < 15000) return
+          if (loaded && lastWarm.get(key) === modelId && lastWarmRevision.get(modelKey) === warmRevision) return
+          if (loaded && lastWarmRevision.get(modelKey) === warmRevision && Date.now() - (lastWarmAt.get(modelKey) ?? 0) < 15000) return
           lastWarm.set(key, modelId)
+          lastWarmRevision.set(modelKey, warmRevision)
           lastWarmAt.set(modelKey, Date.now())
           preheat.begin(modelKey)
           try {
@@ -315,7 +388,7 @@ window.__ModuleLoader__.load({
         })
         warmChain.set(key, job.catch(() => {}))
         void job
-      }, [placement, selected, provider?.id, model?.id, sessionId])
+      }, [placement, selected, provider?.id, model?.id, sessionId, warmRevision])
 
       const name = model?.name ?? model?.id ?? ''
       const dotKind = !warmEnabled || placement !== 'option'
@@ -391,7 +464,13 @@ window.__ModuleLoader__.load({
           }, text))
         }
       }
-      const nameNode = h(ModelName, { key: 'name', name, marquee: placement === 'option' })
+      const abliterated = modelMeta?.abliterated === true
+      const nameNode = h(ModelName, {
+        key: 'name',
+        name,
+        marquee: placement === 'option',
+        color: abliterated ? 'var(--dsw-alias-state-warn-primary)' : undefined,
+      })
       const parts = placement === 'trigger'
         ? [...badges, nameNode]
         : [nameNode, ...badges]
@@ -640,6 +719,7 @@ window.__ModuleLoader__.load({
     const lastWarm = new Map()
     const lastProvider = new Map()
     const lastWarmAt = new Map()
+    const lastWarmRevision = new Map()
     const warmChain = new Map()
 
     /** Replace the composer send button with a spinner while warmup is active. */
@@ -780,17 +860,28 @@ window.__ModuleLoader__.load({
     function QwenModePage(props) {
       const t = typeof props.t === 'function' ? props.t : (key) => key
       const [settings, setSettings] = React.useState(null)
+      const [modelInfo, setModelInfo] = React.useState(null)
+      const [samplingModel, setSamplingModel] = React.useState('')
       const [error, setError] = React.useState('')
       const [busy, setBusy] = React.useState('')
+
+      const refreshModelInfo = React.useCallback(async () => {
+        try {
+          setModelInfo(await call('modelInfo', undefined, { signal: AbortSignal.timeout(10000) }))
+        } catch {
+          // Model metadata is optional.
+        }
+      }, [])
 
       const load = React.useCallback(async () => {
         try {
           setSettings(await call('state', undefined, { signal: AbortSignal.timeout(15000) }))
           setError('')
+          void refreshModelInfo()
         } catch (reason) {
           setError(format(t('loadFailed'), { message: String(reason?.message ?? reason) }))
         }
-      }, [t])
+      }, [t, refreshModelInfo])
 
       React.useEffect(() => {
         void load()
@@ -809,7 +900,12 @@ window.__ModuleLoader__.load({
         setError('')
         try {
           const next = await operation()
-          if (next !== undefined) setSettings(next)
+          if (next !== undefined) {
+            setSettings(next)
+            void refreshModelInfo()
+            void modelMetaState.refresh()
+            void warmState.refresh()
+          }
         } catch (reason) {
           setError(format(t('saveFailed'), { message: String(reason?.message ?? reason) }))
         } finally {
@@ -834,7 +930,7 @@ window.__ModuleLoader__.load({
       const save = () => {
         if (settings === null) return
         const numeric = {}
-        for (const key of ['contextWindow', 'maxOutputTokens', 'temperature', 'topP', 'topK', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty']) {
+        for (const key of ['contextWindow', 'maxOutputTokens', 'temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty']) {
           const raw = settings[key]
           if (raw === null || raw === undefined || String(raw).trim() === '') {
             numeric[key] = null
@@ -851,7 +947,7 @@ window.__ModuleLoader__.load({
           }
           numeric[key] = value
         }
-        if (numeric.maxOutputTokens !== null) {
+        if (!settings.autoNctx && numeric.maxOutputTokens !== null) {
           const effectiveContext = numeric.contextWindow
             ?? (settings.protocol === 'qwen' ? DEFAULT_CONTEXT_WINDOW : null)
           if (effectiveContext !== null && numeric.maxOutputTokens > effectiveContext) {
@@ -865,10 +961,32 @@ window.__ModuleLoader__.load({
           protocol: settings.protocol,
           upstream: settings.upstream,
           apiKeyEnv: settings.apiKeyEnv,
+          autoNctx: settings.autoNctx === true,
+          mtp: settings.mtp === true,
           compute: settings.protocol === 'geniex' ? String(settings.compute ?? '').trim() : '',
           vitCompute: settings.vitCompute ?? 'npu',
           ...numeric,
         }))
+      }
+
+      const samplingEntries = Object.entries(modelInfo?.models ?? {})
+        .filter(([, meta]) => meta !== null && typeof meta === 'object' && meta.sampling !== null && typeof meta.sampling === 'object' && Object.keys(meta.sampling).length > 0)
+      const selectedSamplingId = samplingModel !== '' && samplingEntries.some(([id]) => id === samplingModel)
+        ? samplingModel
+        : samplingEntries[0]?.[0] ?? ''
+      const selectedSampling = selectedSamplingId === '' ? null : samplingEntries.find(([id]) => id === selectedSamplingId)?.[1]?.sampling ?? null
+      const fillRecommendedSampling = () => {
+        if (selectedSampling === null) return
+        const numericKeys = ['temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty']
+        setSettings((current) => {
+          if (current === null) return current
+          const next = { ...current }
+          for (const key of numericKeys) {
+            const value = selectedSampling[key]
+            if (typeof value === 'number' && Number.isFinite(value)) next[key] = value
+          }
+          return next
+        })
       }
 
       if (settings === null) {
@@ -993,13 +1111,23 @@ window.__ModuleLoader__.load({
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
             ]),
+            h('label', { key: 'auto-nctx', style: S.checkRow }, [
+              h('input', {
+                key: 'checkbox',
+                type: 'checkbox',
+                checked: settings.autoNctx === true,
+                onChange: (event) => update('autoNctx', event.target.checked),
+              }),
+              h('span', { key: 'label' }, t('autoNctx.label')),
+            ]),
+            h('div', { key: 'auto-nctx-hint', style: S.hint }, t('autoNctx.hint')),
           ]),
           h('div', { key: 'divider-sampling', style: S.divider }),
           h('div', { key: 'sampling', style: S.configSection }, [
             h('div', { key: 'heading', style: S.configHeading }, t('sampling.title')),
             h('div', { key: 'hint', style: S.hint }, t('sampling.hint')),
             h('div', { key: 'grid', style: S.grid }, [
-              ...['temperature', 'topP', 'topK', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty'].map((key) => h(Field, {
+              ...['temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty'].map((key) => h(Field, {
                 key,
                 label: t(`${key}.label`),
               }, h('input', {
@@ -1010,6 +1138,22 @@ window.__ModuleLoader__.load({
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
             ]),
+            samplingEntries.length === 0 ? h('div', { key: 'recommend-none', style: S.hint }, t('sampling.none')) : h('div', { key: 'recommend-row', style: S.row }, [
+              h('select', {
+                key: 'recommend-select',
+                style: { ...S.select, maxWidth: '320px' },
+                value: selectedSamplingId,
+                onChange: (event) => setSamplingModel(event.target.value),
+              }, samplingEntries.map(([id]) => h('option', { key: id, value: id }, id))),
+              h('button', {
+                key: 'recommend-fill',
+                type: 'button',
+                style: S.button,
+                disabled: busy !== '' || selectedSampling === null,
+                onClick: fillRecommendedSampling,
+              }, t('sampling.fill')),
+            ]),
+            h('div', { key: 'recommend-hint', style: S.hint }, t('sampling.recommendHint')),
           ]),
           settings.protocol === 'geniex' ? h('div', { key: 'inference-wrap' }, [
             h('div', { key: 'divider-inference', style: S.divider }),
@@ -1032,6 +1176,16 @@ window.__ModuleLoader__.load({
                     onClick: () => update('vitCompute', value),
                   }, t(`vit.${value}`))))),
               ]),
+              h('label', { key: 'mtp', style: S.checkRow }, [
+                h('input', {
+                  key: 'checkbox',
+                  type: 'checkbox',
+                  checked: settings.mtp === true,
+                  onChange: (event) => update('mtp', event.target.checked),
+                }),
+                h('span', { key: 'label' }, t('mtp.label')),
+              ]),
+              h('div', { key: 'mtp-hint', style: S.hint }, t('mtp.hint')),
               h('datalist', { key: 'compute-options', id: 'qwen-compute-options' },
                 ['cpu', 'gpu', 'npu', 'hybrid'].map((value) => h('option', { key: value, value }))),
             ]),
