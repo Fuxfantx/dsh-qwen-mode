@@ -45,7 +45,7 @@
 - **API Key**：留空时使用 DSH credential `local`，不读取同名环境变量；QwenCloud 可填写环境变量名，例如 `DASHSCOPE_API_KEY`。
 - **上下文窗口**：留空时，GenieX 视为由 `geniex serve --nctx <value>` 指定，不再下发上下文窗口字段；QwenCloud 使用默认 `262144`。
 - **推理后端**（仅 GenieX）：`Compute` 可留空或填写 `cpu/gpu/npu/hybrid`、设备列表；`Vision Encoder` 在 CPU/GPU/NPU 间切换，NPU 映射为 `HTP2`，且只对检测到的 VLM 下发。
-- **模型能力**：GenieX API 不提供 reasoning effort 元数据；插件按已知模型系列（如 `3.6-35B-A3B`、`3.8`）映射可选档位，未知模型不显示档位选择。
+- **模型能力**：已知模型系列使用快速映射；未知 GenieX 模型回退读取缓存 GGUF 的 `tokenizer.chat_template`，检测 `reasoning_effort` 档位，未知档位不显示。
 - **模型预热**：位于「接入来源 → 高级选项」，仅对 `From GenieX` 生效；发送最小 system prompt + 单 token 请求，预热期间发送按钮替换为转圈。耗时主要来自模型加载，prompt 本身占比很小。
 - **统计**：仅在该轮回复完成后显示；DSH 在流式阶段不提供可用的 TTFT/Decode TPS 结算值。
 - **GenieX reasoning_format**：固定使用 `none`。实测 `deepseek` 不返回独立 `reasoning_content`，且同样可能提前结束思考，因此不提供该选项。
@@ -102,7 +102,7 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers
 - **API Key**: empty uses DSH credential `local` and does not read an environment variable of that name. For QwenCloud, enter an environment variable such as `DASHSCOPE_API_KEY`.
 - **Context window**: when empty, GenieX assumes `geniex serve --nctx <value>` and the field is omitted; QwenCloud uses the default `262144`.
 - **Inference Backend** (GenieX only): `Compute` may be empty or contain `cpu/gpu/npu/hybrid` or a device list; `Vision Encoder` switches CPU/GPU/NPU, mapping NPU to `HTP2`, and is sent only for detected VLMs.
-- **Capabilities**: GenieX does not expose reasoning-effort metadata; the plugin maps known model families (e.g. `3.6-35B-A3B`, `3.8`) to available levels and shows none for unknown models.
+- **Capabilities**: known model families use a fast mapping; unknown GenieX models fall back to the cached GGUF `tokenizer.chat_template` to detect `reasoning_effort` levels. Unknown levels are not shown.
 - **Model Warmup**: under **Source → Advanced**, applies only to `From GenieX`; sends a minimal system prompt and a one-token request, replacing the send button with a spinner. Load time is dominated by model loading, not prompt length.
 - **Stats**: shown only after the reply completes; DSH does not expose settled TTFT/Decode TPS during streaming.
 - **GenieX reasoning_format**: fixed to `none`. In testing, `deepseek` did not return a separate `reasoning_content` and could still end thinking early, so it is not offered.

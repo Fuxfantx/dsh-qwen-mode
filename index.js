@@ -10,7 +10,7 @@
  */
 
 import { execFile } from 'node:child_process'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, open, readFile, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
 import { homedir } from 'node:os'
@@ -23,6 +23,12 @@ const STORE_FILE = 'qwen-mode.json'
 const MAX_BODY = 8 * 1024 * 1024
 const DEFAULT_PORT = 18182
 const VIT_COMPUTE_FIELD = { cpu: 'CPU', gpu: 'GPU', npu: 'HTP2' }
+const VISION_NAME = /(?:^|[/_-])(?:vl|vision)(?:[/_-]|$)/iu
+const REASONING_EFFORT_OVERRIDES = [
+  { match: '3.6-35b-a3b', efforts: { off: null, max: 'enabled' } },
+  { match: '3.8', efforts: { off: null, low: 'low', medium: 'medium', xhigh: 'xhigh' } },
+]
+const reasoningEffortsCache = new Map()
 
 const DEFAULTS = {
   version: 1,
@@ -603,24 +609,18 @@ function shortName(id) {
   return id.split('/').pop().replace(/:[^:]+$/u, '') || id
 }
 
-function modelSpec(id, settings, vision = false) {
-  const lower = id.toLowerCase()
-  // GenieX exposes no reasoning-effort metadata; map known model families.
-  const reasoningEfforts = lower.includes('3.6-35b-a3b')
-    ? { off: null, max: 'enabled' }
-    : lower.includes('3.8')
-      ? { off: null, low: 'low', medium: 'medium', xhigh: 'xhigh' }
-      : undefined
+function modelSpec(id, settings, vision = false, reasoningEfforts) {
+  const known = REASONING_EFFORT_OVERRIDES.find((entry) => id.toLowerCase().includes(entry.match))?.efforts
   const contextWindow = settings.contextWindow ?? (settings.protocol === 'qwen' ? DEFAULTS.contextWindow : null)
-  const spec = {
+  const model = {
     id,
     name: shortName(id),
     maxTokens: settings.maxOutputTokens,
-    reasoningEfforts,
+    reasoningEfforts: reasoningEfforts ?? known,
     input: vision ? ['text', 'image'] : ['text'],
   }
-  if (contextWindow !== null) spec.contextWindow = contextWindow
-  return spec
+  if (contextWindow !== null) model.contextWindow = contextWindow
+  return model
 }
 
 async function credentialHeader(ctx, settings) {
@@ -633,8 +633,51 @@ async function credentialHeader(ctx, settings) {
   }
 }
 
-async function modelSupportsVision(ctx, settings, id, headers) {
-  const byName = /(?:^|[/_-])(?:vl|vision)(?:[/_-]|$)/iu.test(id)
+async function reasoningEffortsFromCache(settings, id) {
+  if (settings.protocol !== 'geniex') return undefined
+  const cacheKey = `${settings.upstream}|${id}`
+  if (reasoningEffortsCache.has(cacheKey)) return reasoningEffortsCache.get(cacheKey)
+  let result
+  try {
+    const cacheRoot = await geniexCacheRoot()
+    const parts = id.split('/')
+    const owner = parts.shift() ?? 'local'
+    const leaf = (parts.join('/') || owner).replace(/:[^:]+$/u, '')
+    const meta = JSON.parse(await readFile(join(cacheRoot, owner, leaf, 'geniex.json'), 'utf8'))
+    const precision = id.includes(':') ? id.split(':').pop() : ''
+    const file = meta?.ModelFile?.[precision]?.Name
+      ?? Object.values(meta?.ModelFile ?? {}).find((entry) => entry?.Downloaded === true)?.Name
+    if (typeof file === 'string' && file !== '') {
+      const handle = await open(join(cacheRoot, owner, leaf, file), 'r')
+      try {
+        const buffer = Buffer.alloc(16 * 1024 * 1024)
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
+        const text = buffer.subarray(0, bytesRead).toString('utf8')
+        const start = text.indexOf('tokenizer.chat_template')
+        const template = start === -1 ? '' : text.slice(start, start + 200000)
+        if (template.includes('reasoning_effort')) {
+          const levels = new Set()
+          for (const match of template.matchAll(/['"](low|medium|high|xhigh)['"]/gu)) levels.add(match[1])
+          if (levels.size > 0) {
+            result = { off: null }
+            for (const level of levels) result[level] = level
+          }
+        } else if (template.includes('enable_thinking')) {
+          result = { off: null, max: 'enabled' }
+        }
+      } finally {
+        await handle.close()
+      }
+    }
+  } catch {
+    // The cache is optional; known model families still provide a fallback.
+  }
+  reasoningEffortsCache.set(cacheKey, result)
+  if (reasoningEffortsCache.size > 256) reasoningEffortsCache.delete(reasoningEffortsCache.keys().next().value)
+  return result
+}
+
+async function modelSupportsVision(settings, id, headers) {
   if (settings.protocol === 'geniex') {
     try {
       const detailUrl = upstreamURL(settings, 'models')
@@ -658,7 +701,7 @@ async function modelSupportsVision(ctx, settings, id, headers) {
       // Cache metadata is optional.
     }
   }
-  return byName
+  return VISION_NAME.test(id)
 }
 
 async function discoverModels(ctx, settings) {
@@ -668,9 +711,23 @@ async function discoverModels(ctx, settings) {
   if (!response.ok) throw httpError(502, `model discovery failed: HTTP ${response.status}`)
   const body = await response.json()
   const rows = Array.isArray(body?.data) ? body.data : []
-  const models = rows.map((row) => typeof row?.id === 'string' ? row.id : '').filter((id) => id !== '')
-  if (models.length === 0) throw httpError(502, 'model discovery returned no models')
-  return Promise.all(models.map(async (id) => modelSpec(id, settings, await modelSupportsVision(ctx, settings, id, headers))))
+  const entries = rows
+    .map((row) => ({
+      id: typeof row?.id === 'string' ? row.id : '',
+      modelType: typeof row?.model_type === 'string' ? row.model_type : null,
+    }))
+    .filter((entry) => entry.id !== '')
+  if (entries.length === 0) throw httpError(502, 'model discovery returned no models')
+  return Promise.all(entries.map(async ({ id, modelType }) => {
+    const known = REASONING_EFFORT_OVERRIDES.find((entry) => id.toLowerCase().includes(entry.match))
+    const [vision, reasoningEfforts] = await Promise.all([
+      modelType !== null
+        ? Promise.resolve(modelType.toLowerCase() === 'vlm')
+        : modelSupportsVision(settings, id, headers),
+      known === undefined ? reasoningEffortsFromCache(settings, id) : Promise.resolve(known.efforts),
+    ])
+    return modelSpec(id, settings, vision, reasoningEfforts)
+  }))
 }
 
 async function warmModel(ctx, settings, model) {
@@ -781,7 +838,6 @@ function providerStatus(ctx, settings) {
     const id = settings.managedProviderId
     const provider = id === null ? undefined : providers[id]
     return {
-      error: null,
       provider: id === null ? null : {
         id,
         displayName: provider?.displayName ?? providerNameFor(settings.protocol),
@@ -793,8 +849,8 @@ function providerStatus(ctx, settings) {
           : [],
       },
     }
-  } catch (error) {
-    return { error: String(error), provider: null }
+  } catch {
+    return { provider: null }
   }
 }
 
@@ -819,13 +875,9 @@ export async function apply(ctx) {
   const refreshManagedModels = () => {
     managedModels.clear()
     visionModels.clear()
-    try {
-      const provider = providerStatus(ctx, settings).provider
-      for (const id of provider?.models ?? []) managedModels.add(id)
-      for (const id of provider?.visionModels ?? []) visionModels.add(id)
-    } catch {
-      // The provider is maintained lazily when the settings page saves.
-    }
+    const provider = providerStatus(ctx, settings).provider
+    for (const id of provider?.models ?? []) managedModels.add(id)
+    for (const id of provider?.visionModels ?? []) visionModels.add(id)
   }
   refreshManagedModels()
   const isActive = (model) => {
