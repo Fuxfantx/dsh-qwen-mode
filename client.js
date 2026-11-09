@@ -46,10 +46,6 @@ window.__ModuleLoader__.load({
       'thinking.auto': '跟随请求',
       'thinking.on': '始终开启',
       'thinking.off': '始终关闭',
-      'reasoningFormat.label': 'GenieX reasoning_format',
-      'reasoningFormat.none': 'none（推荐，完整保留多段推理）',
-      'reasoningFormat.deepseek': 'deepseek（可能提前结束思考）',
-      'reasoningFormat.auto': 'auto（由上游决定）',
       'limits.title': '模型限制',
       'limits.hint': '上下文窗口留空时：GenieX 视为由 `geniex serve --nctx` 指定，不再下发该字段；QwenCloud 使用默认 262144。最大输出不能超过已设置的上下文窗口。',
       'limits.invalid': '最大输出长度不能大于上下文窗口。',
@@ -108,10 +104,6 @@ window.__ModuleLoader__.load({
       'thinking.auto': 'Follow request',
       'thinking.on': 'Always on',
       'thinking.off': 'Always off',
-      'reasoningFormat.label': 'GenieX reasoning_format',
-      'reasoningFormat.none': 'none (recommended; keeps all reasoning paragraphs)',
-      'reasoningFormat.deepseek': 'deepseek (may end thinking early)',
-      'reasoningFormat.auto': 'auto (upstream decides)',
       'limits.title': 'Model limits',
       'limits.hint': 'If the context window is empty: GenieX assumes `geniex serve --nctx` and the field is omitted; QwenCloud uses the default 262144. Max output cannot exceed an explicit context window.',
       'limits.invalid': 'Max output tokens cannot exceed the context window.',
@@ -701,7 +693,6 @@ window.__ModuleLoader__.load({
           upstream: settings.upstream,
           apiKeyEnv: settings.apiKeyEnv,
           thinking: settings.thinking,
-          reasoningFormat: settings.reasoningFormat,
           ...numeric,
         }))
       }
@@ -818,15 +809,6 @@ window.__ModuleLoader__.load({
               h('option', { key: 'on', value: 'on' }, t('thinking.on')),
               h('option', { key: 'off', value: 'off' }, t('thinking.off')),
             ])),
-            settings.protocol === 'geniex' ? h(Field, { key: 'format', label: t('reasoningFormat.label') }, h('select', {
-              style: S.select,
-              value: settings.reasoningFormat,
-              onChange: (event) => update('reasoningFormat', event.target.value),
-            }, [
-              h('option', { key: 'none', value: 'none' }, t('reasoningFormat.none')),
-              h('option', { key: 'deepseek', value: 'deepseek' }, t('reasoningFormat.deepseek')),
-              h('option', { key: 'auto', value: 'auto' }, t('reasoningFormat.auto')),
-            ])) : null,
           ]),
         ]),
         h('div', { key: 'limits', style: S.card }, [
@@ -933,6 +915,7 @@ window.__ModuleLoader__.load({
     }
   },
 })
+
 
 
 

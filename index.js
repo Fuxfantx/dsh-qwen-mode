@@ -167,7 +167,7 @@ function normalizeSettings(raw) {
     contextWindow,
     maxOutputTokens: effectiveContext === null ? maxOutput : Math.min(maxOutput, effectiveContext),
     thinking: ['auto', 'on', 'off'].includes(source.thinking) ? source.thinking : 'auto',
-    reasoningFormat: ['none', 'deepseek', 'auto'].includes(source.reasoningFormat) ? source.reasoningFormat : 'none',
+    reasoningFormat: 'none',
     temperature: numberOrNull(source.temperature),
     topP: numberOrNull(source.topP),
     topK: numberOrNull(source.topK),
