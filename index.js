@@ -73,6 +73,21 @@ function streamFirstTokenTime(stream) {
   return undefined
 }
 
+/** Build the compact UI metric for one settled assistant message. */
+function turnMetric(event, first, start) {
+  const source = event.data?.message?.source
+  if (typeof source?.provider !== 'string' || typeof source?.model !== 'string') return null
+  const outputTokens = event.data?.usage?.outputTokens ?? null
+  const decodeMs = Math.max(1, event.time - first)
+  return {
+    provider: source.provider,
+    model: source.model,
+    ttftMs: Math.max(0, Math.round(first - start)),
+    tps: outputTokens === null ? null : Math.round(outputTokens / (decodeMs / 1000) * 10) / 10,
+    outputTokens,
+  }
+}
+
 function loggerFor(ctx) {
   try {
     const scoped = ctx.logger(SCOPE)
@@ -563,8 +578,12 @@ async function warmModel(ctx, settings, model) {
   const url = upstreamURL(settings, 'chat/completions')
   const body = {
     model,
-    messages: [{ role: 'user', content: '' }],
+    messages: [
+      { role: 'system', content: `You are ${shortName(model)}, a helpful agent. This is the warming stage.` },
+      { role: 'user', content: 'Hi' },
+    ],
     max_completion_tokens: 1,
+    temperature: 0,
     stream: false,
     ...settings.protocol === 'qwen'
       ? { enable_thinking: false }
@@ -706,11 +725,46 @@ export async function apply(ctx) {
   const turnMetrics = new Map()
   const stepStarts = new Map()
   const firstTokens = new Map()
+  const derivedSessions = new Set()
   const trimMap = (map, max) => {
     while (map.size > max) {
       const oldest = map.keys().next().value
       if (oldest === undefined) return
       map.delete(oldest)
+    }
+  }
+  const deriveSessionMetrics = (session) => {
+    if (derivedSessions.has(session.id)) return
+    let events
+    try {
+      events = session.snapshotEvents()
+    } catch {
+      return
+    }
+    const starts = new Map()
+    const firsts = new Map()
+    for (const event of events) {
+      const turn = event.data?.turn
+      const step = event.data?.step
+      if (!Number.isInteger(turn) || !Number.isInteger(step)) continue
+      const key = `${turn}:${step}`
+      if (event.type === 'step/start') {
+        starts.set(key, event.time)
+      } else if (event.type === 'assistant/attempt') {
+        const first = streamFirstTokenTime(event.data.stream)
+        if (first !== undefined) firsts.set(key, first)
+      } else if (event.type === 'assistant/message') {
+        const first = firsts.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
+        const metric = turnMetric(event, first, starts.get(key) ?? first)
+        if (metric !== null) turnMetrics.set(`${session.id}:${turn}`, metric)
+      }
+    }
+    derivedSessions.add(session.id)
+    trimMap(turnMetrics, 2000)
+    while (derivedSessions.size > 200) {
+      const oldest = derivedSessions.values().next().value
+      if (oldest === undefined) break
+      derivedSessions.delete(oldest)
     }
   }
   ctx.effect(() => ctx.on('session/event', (session, event) => {
@@ -730,24 +784,14 @@ export async function apply(ctx) {
       return
     }
     if (event.type !== 'assistant/message') return
-    const source = event.data.message?.source
     const first = firstTokens.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
     const start = stepStarts.get(key) ?? first
     stepStarts.delete(key)
     firstTokens.delete(key)
-    if (typeof source?.provider !== 'string' || typeof source?.model !== 'string') return
-    const outputTokens = event.data.usage?.outputTokens ?? null
-    const decodeMs = Math.max(1, event.time - first)
-    const metric = {
-      provider: source.provider,
-      model: source.model,
-      ttftMs: Math.max(0, Math.round(first - start)),
-      tps: outputTokens === null ? null : Math.round(outputTokens / (decodeMs / 1000) * 10) / 10,
-      outputTokens,
-    }
-    const turnKey = `${session.id}:${turn}`
-    turnMetrics.set(turnKey, metric)
-    trimMap(turnMetrics, 500)
+    const metric = turnMetric(event, first, start)
+    if (metric === null) return
+    turnMetrics.set(`${session.id}:${turn}`, metric)
+    trimMap(turnMetrics, 2000)
   }), `${SCOPE}: turn metrics`)
 
   const state = () => ({
@@ -791,7 +835,13 @@ export async function apply(ctx) {
       const sessionId = text(payload?.sessionId)
       const turn = Number(payload?.turn)
       if (sessionId === '' || !Number.isInteger(turn)) return null
-      return turnMetrics.get(`${sessionId}:${turn}`) ?? null
+      const key = `${sessionId}:${turn}`
+      const cached = turnMetrics.get(key)
+      if (cached !== undefined) return cached
+      const session = ctx.sessions.get(sessionId)
+      if (session === undefined) return null
+      deriveSessionMetrics(session)
+      return turnMetrics.get(key) ?? null
     },
     permissionLabel: async (payload) => {
       const locale = text(payload?.locale)
