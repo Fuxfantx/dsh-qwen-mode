@@ -48,7 +48,7 @@
 - **模型能力**：已知模型系列使用快速映射；未知 GenieX 模型回退读取缓存 GGUF 的 `tokenizer.chat_template`，检测 `reasoning_effort` 档位，未知档位不显示。
 - **模型预热**：位于「接入来源 → 高级选项」，仅对 `From GenieX` 生效；发送最小 system prompt + 单 token 请求，预热期间发送按钮替换为转圈。耗时主要来自模型加载，prompt 本身占比很小。
 - **统计**：仅在该轮回复完成后显示；DSH 在流式阶段不提供可用的 TTFT/Decode TPS 结算值。
-- **GenieX reasoning_format**：固定使用 `none`。实测 `deepseek` 不返回独立 `reasoning_content`，且同样可能提前结束思考，因此不提供该选项。
+- **GenieX reasoning_format**：请求使用 `auto`；上游已分离出纯 `reasoning_content` 时直接透传，未分离时由代理回退解析内联思考。
 - **仅回复**：隐藏并拒绝工具调用，适合纯聊天。
 - **repetition_penalty**：可设为 `1.05`，降低 thinking 段落循环输出的概率。
 
@@ -105,7 +105,7 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers
 - **Capabilities**: known model families use a fast mapping; unknown GenieX models fall back to the cached GGUF `tokenizer.chat_template` to detect `reasoning_effort` levels. Unknown levels are not shown.
 - **Model Warmup**: under **Source → Advanced**, applies only to `From GenieX`; sends a minimal system prompt and a one-token request, replacing the send button with a spinner. Load time is dominated by model loading, not prompt length.
 - **Stats**: shown only after the reply completes; DSH does not expose settled TTFT/Decode TPS during streaming.
-- **GenieX reasoning_format**: fixed to `none`. In testing, `deepseek` did not return a separate `reasoning_content` and could still end thinking early, so it is not offered.
+- **GenieX reasoning_format**: requests use `auto`; when upstream separates pure `reasoning_content`, it is passed through, otherwise the proxy falls back to inline-thinking parsing.
 - **Reply Only**: hides and denies tools for a pure chat experience.
 - **repetition_penalty**: try `1.05` to reduce looping in thinking output.
 

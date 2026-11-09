@@ -3,8 +3,8 @@
  *
  * Starts a loopback OpenAI-compatible proxy and maintains dedicated
  * `llm-pi-ai` providers (`From GenieX`, `From QwenCloud`, ...) that point at
- * it. The proxy normalizes Qwen thinking controls and rewrites inline
- * `<think>` reasoning into `reasoning_content`.
+ * it. The proxy normalizes thinking parameters and passes through or rebuilds
+ * `reasoning_content` from tagged or inline reasoning.
  *
  * @module dsh-qwen-mode
  */
@@ -22,13 +22,16 @@ const API_PREFIX = '/qwen-mode/api'
 const STORE_FILE = 'qwen-mode.json'
 const MAX_BODY = 8 * 1024 * 1024
 const DEFAULT_PORT = 18182
-const VIT_COMPUTE_FIELD = { cpu: 'CPU', gpu: 'GPU', npu: 'HTP2' }
-const VISION_NAME = /(?:^|[/_-])(?:vl|vision)(?:[/_-]|$)/iu
-const REASONING_EFFORT_OVERRIDES = [
+const VIT_COMPUTE_VALUE = { cpu: 'CPU', gpu: 'GPU', npu: 'HTP2' }
+const VISION_MODEL_PATTERN = /(?:^|[/_-])(?:vl|vision)(?:[/_-]|$)/iu
+const KNOWN_REASONING_EFFORTS = [
   { match: '3.6-35b-a3b', efforts: { off: null, max: 'enabled' } },
   { match: '3.8', efforts: { off: null, low: 'low', medium: 'medium', xhigh: 'xhigh' } },
 ]
-const reasoningEffortsCache = new Map()
+const CAPABILITY_CACHE_TTL_MS = 5 * 60 * 1000
+const CAPABILITY_CACHE_LIMIT = 512
+const reasoningEffortCache = new Map()
+const visionCache = new Map()
 
 const DEFAULTS = {
   version: 1,
@@ -83,7 +86,7 @@ function streamFirstTokenTime(stream) {
 }
 
 /** Build the compact UI metric for one settled assistant message. */
-function turnMetric(event, first, start) {
+function buildTurnMetric(event, first, start) {
   const source = event.data?.message?.source
   if (typeof source?.provider !== 'string' || typeof source?.model !== 'string') return null
   const outputTokens = event.data?.usage?.outputTokens ?? null
@@ -213,10 +216,20 @@ function upstreamURL(settings, path) {
   return base
 }
 
-let geniexCacheRootPromise = null
-function geniexCacheRoot() {
-  if (geniexCacheRootPromise !== null) return geniexCacheRootPromise
-  geniexCacheRootPromise = new Promise((resolveRoot) => {
+function upstreamRequestURL(settings, requestUrl) {
+  const base = new URL(settings.upstream)
+  const basePath = base.pathname.replace(/\/+$/u, '')
+  let requestPath = requestUrl.pathname
+  if (basePath.endsWith('/v1') && (requestPath === '/v1' || requestPath.startsWith('/v1/'))) {
+    requestPath = requestPath.slice(3) || '/'
+  }
+  return new URL(`${basePath}${requestPath}${requestUrl.search}`, base)
+}
+
+let geniexModelsRootPromise = null
+function geniexModelsRoot() {
+  if (geniexModelsRootPromise !== null) return geniexModelsRootPromise
+  geniexModelsRootPromise = new Promise((resolveRoot) => {
     execFile(
       process.platform === 'win32' ? 'geniex.exe' : 'geniex',
       ['list'],
@@ -231,14 +244,14 @@ function geniexCacheRoot() {
       },
     )
   })
-  return geniexCacheRootPromise
+  return geniexModelsRootPromise
 }
 
 function thinkingEnabled(body) {
+  const effort = typeof body.reasoning_effort === 'string' ? body.reasoning_effort.trim().toLowerCase() : null
+  if (effort !== null && effort !== '') return !['off', 'none'].includes(effort)
   if (typeof body.enable_think === 'boolean') return body.enable_think
   if (typeof body.enable_thinking === 'boolean') return body.enable_thinking
-  const effort = body.reasoning_effort
-  if (typeof effort === 'string') return !['off', 'none'].includes(effort.toLowerCase())
   return true
 }
 
@@ -252,10 +265,12 @@ function applyRequestDefaults(body, settings, vision = false) {
   } else {
     output.enable_think = thinking
     delete output.enable_thinking
-    delete output.reasoning_effort
-    output.reasoning_format = 'none'
+    const effort = typeof body.reasoning_effort === 'string' ? body.reasoning_effort.trim().toLowerCase() : ''
+    if (thinking && ['low', 'medium', 'high', 'xhigh'].includes(effort)) output.reasoning_effort = effort
+    else delete output.reasoning_effort
+    output.reasoning_format = 'auto'
     if (settings.compute !== '') output.compute = settings.compute
-    if (vision) output.vit_compute = VIT_COMPUTE_FIELD[settings.vitCompute]
+    if (vision) output.vit_compute = VIT_COMPUTE_VALUE[settings.vitCompute]
   }
   const fill = (key, value) => {
     if (value !== null && output[key] === undefined) output[key] = value
@@ -275,8 +290,8 @@ function applyRequestDefaults(body, settings, vision = false) {
   return output
 }
 
-function thinkState(assumeReasoning = false) {
-  return { buffer: '', inThink: false, assumeReasoning, separated: false, pending: false }
+function createThinkState(assumeReasoning = false) {
+  return { buffer: '', inThink: false, assumeReasoning, separated: false, pending: false, serverSeparated: false }
 }
 
 /** Locate the first Markdown heading that likely starts the final answer. */
@@ -297,7 +312,12 @@ function pushPiece(out, type, value) {
   if (value !== '') out.push({ type, text: value })
 }
 
-function feedThink(value, state) {
+function feedReasoning(value, state) {
+  if (state.serverSeparated) {
+    const out = []
+    pushPiece(out, 'content', value)
+    return out
+  }
   state.buffer += value
   const out = []
   while (state.buffer !== '') {
@@ -379,9 +399,14 @@ function feedThink(value, state) {
   return out
 }
 
-function flushThink(state) {
+function flushReasoning(state) {
   const out = []
   if (state.buffer !== '') {
+    if (state.serverSeparated) {
+      pushPiece(out, 'content', state.buffer)
+      state.buffer = ''
+      return out
+    }
     if (state.pending) {
       const heading = headingStart(state.buffer)
       if (heading !== -1) {
@@ -403,7 +428,8 @@ function flushThink(state) {
 
 function rewriteMessage(message, state) {
   if (message === null || typeof message !== 'object' || typeof message.content !== 'string') return message
-  const pieces = [...feedThink(message.content, state), ...flushThink(state)]
+  if (typeof message.reasoning_content === 'string' && message.reasoning_content.trim() !== '') return message
+  const pieces = [...feedReasoning(message.content, state), ...flushReasoning(state)]
   const reasoning = pieces.filter((piece) => piece.type === 'reasoning').map((piece) => piece.text).join('')
   const content = pieces.filter((piece) => piece.type === 'content').map((piece) => piece.text).join('')
   return {
@@ -419,7 +445,20 @@ function rewriteChunk(chunk, state) {
   const out = []
   for (const choice of chunk.choices) {
     const delta = choice?.delta
-    if (delta === null || typeof delta !== 'object' || typeof delta.content !== 'string') {
+    if (delta === null || typeof delta !== 'object') {
+      out.push({ ...chunk, choices: [choice] })
+      continue
+    }
+    if (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '') {
+      state.serverSeparated = true
+      out.push({ ...chunk, choices: [choice] })
+      continue
+    }
+    if (state.serverSeparated) {
+      out.push({ ...chunk, choices: [choice] })
+      continue
+    }
+    if (typeof delta.content !== 'string') {
       out.push({ ...chunk, choices: [choice] })
       continue
     }
@@ -427,7 +466,7 @@ function rewriteChunk(chunk, state) {
       out.push({ ...chunk, choices: [choice] })
       continue
     }
-    const pieces = feedThink(delta.content, state)
+    const pieces = feedReasoning(delta.content, state)
     if (pieces.length === 0) {
       out.push({ ...chunk, choices: [{ ...choice, delta: { ...delta, content: '' } }] })
       continue
@@ -462,7 +501,7 @@ function transformSseEvent(raw, state, meta) {
     .join('\n')
   if (data === '') return `${raw}\n\n`
   if (data.trim() === '[DONE]') {
-    const tail = flushThink(state)
+    const tail = flushReasoning(state)
     let output = ''
     for (const piece of tail) {
       output += sseEvent({
@@ -511,7 +550,7 @@ function writeProxyResponse(upstream, res, active, assumeReasoning) {
       try {
         const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'))
         if (Array.isArray(payload.choices)) {
-          const state = thinkState(assumeReasoning)
+          const state = createThinkState(assumeReasoning)
           payload.choices = payload.choices.map((choice) => ({
             ...choice,
             message: rewriteMessage(choice.message, state),
@@ -525,7 +564,7 @@ function writeProxyResponse(upstream, res, active, assumeReasoning) {
     return
   }
   const decoder = new StringDecoder('utf8')
-  const state = thinkState(assumeReasoning)
+  const state = createThinkState(assumeReasoning)
   const meta = {}
   let buffer = ''
   upstream.on('data', (chunk) => {
@@ -544,13 +583,11 @@ function writeProxyResponse(upstream, res, active, assumeReasoning) {
   })
 }
 
-function forward(req, res, settings, logger, isActive, isVision) {
+function forward(req, res, settings, logger, ownsModel, isVision) {
   let upstreamUrl
   try {
-    const base = new URL(settings.upstream)
     const requestUrl = new URL(req.url ?? '/', 'http://qwen.invalid')
-    const basePath = base.pathname.replace(/\/+$/u, '')
-    upstreamUrl = new URL(`${basePath}${requestUrl.pathname}${requestUrl.search}`, base)
+    upstreamUrl = upstreamRequestURL(settings, requestUrl)
   } catch (error) {
     sendJson(res, 500, { ok: false, error: { message: `Invalid upstream URL: ${String(error)}` } })
     return
@@ -567,7 +604,7 @@ function forward(req, res, settings, logger, isActive, isVision) {
     if (settings.mode !== 'off' && body.length > 0) {
       try {
         const parsed = JSON.parse(body.toString('utf8'))
-        active = isActive(parsed?.model)
+        active = ownsModel(parsed?.model)
         if (active) {
           thinking = thinkingEnabled(parsed, settings)
           body = Buffer.from(JSON.stringify(applyRequestDefaults(parsed, settings, isVision(parsed?.model))), 'utf8')
@@ -609,8 +646,16 @@ function shortName(id) {
   return id.split('/').pop().replace(/:[^:]+$/u, '') || id
 }
 
-function modelSpec(id, settings, vision = false, reasoningEfforts) {
-  const known = REASONING_EFFORT_OVERRIDES.find((entry) => id.toLowerCase().includes(entry.match))?.efforts
+function splitModelId(id) {
+  const parts = id.split('/')
+  const owner = parts.shift() ?? 'local'
+  const leaf = (parts.join('/') || owner).replace(/:[^:]+$/u, '')
+  const colon = id.lastIndexOf(':')
+  return { owner, leaf, precision: colon === -1 ? '' : id.slice(colon + 1) }
+}
+
+function buildModelSpec(id, settings, vision = false, reasoningEfforts) {
+  const known = KNOWN_REASONING_EFFORTS.find((entry) => id.toLowerCase().includes(entry.match))?.efforts
   const contextWindow = settings.contextWindow ?? (settings.protocol === 'qwen' ? DEFAULTS.contextWindow : null)
   const model = {
     id,
@@ -633,18 +678,16 @@ async function credentialHeader(ctx, settings) {
   }
 }
 
-async function reasoningEffortsFromCache(settings, id) {
+async function detectReasoningEfforts(settings, id) {
   if (settings.protocol !== 'geniex') return undefined
   const cacheKey = `${settings.upstream}|${id}`
-  if (reasoningEffortsCache.has(cacheKey)) return reasoningEffortsCache.get(cacheKey)
+  const cached = reasoningEffortCache.get(cacheKey)
+  if (cached !== undefined && Date.now() - cached.at < CAPABILITY_CACHE_TTL_MS) return cached.value
   let result
   try {
-    const cacheRoot = await geniexCacheRoot()
-    const parts = id.split('/')
-    const owner = parts.shift() ?? 'local'
-    const leaf = (parts.join('/') || owner).replace(/:[^:]+$/u, '')
+    const cacheRoot = await geniexModelsRoot()
+    const { owner, leaf, precision } = splitModelId(id)
     const meta = JSON.parse(await readFile(join(cacheRoot, owner, leaf, 'geniex.json'), 'utf8'))
-    const precision = id.includes(':') ? id.split(':').pop() : ''
     const file = meta?.ModelFile?.[precision]?.Name
       ?? Object.values(meta?.ModelFile ?? {}).find((entry) => entry?.Downloaded === true)?.Name
     if (typeof file === 'string' && file !== '') {
@@ -672,12 +715,22 @@ async function reasoningEffortsFromCache(settings, id) {
   } catch {
     // The cache is optional; known model families still provide a fallback.
   }
-  reasoningEffortsCache.set(cacheKey, result)
-  if (reasoningEffortsCache.size > 256) reasoningEffortsCache.delete(reasoningEffortsCache.keys().next().value)
+  reasoningEffortCache.set(cacheKey, { value: result, at: Date.now() })
+  if (reasoningEffortCache.size > CAPABILITY_CACHE_LIMIT) reasoningEffortCache.delete(reasoningEffortCache.keys().next().value)
   return result
 }
 
-async function modelSupportsVision(settings, id, headers) {
+async function detectVision(settings, id, headers) {
+  const cacheKey = `${settings.protocol}|${settings.upstream}|${id}`
+  const cached = visionCache.get(cacheKey)
+  if (cached !== undefined && Date.now() - cached.at < CAPABILITY_CACHE_TTL_MS) return cached.value
+  const value = await detectVisionUncached(settings, id, headers)
+  visionCache.set(cacheKey, { value, at: Date.now() })
+  if (visionCache.size > CAPABILITY_CACHE_LIMIT) visionCache.delete(visionCache.keys().next().value)
+  return value
+}
+
+async function detectVisionUncached(settings, id, headers) {
   if (settings.protocol === 'geniex') {
     try {
       const detailUrl = upstreamURL(settings, 'models')
@@ -691,17 +744,15 @@ async function modelSupportsVision(settings, id, headers) {
       // Fall back to the cache metadata or the model name.
     }
     try {
-      const cacheRoot = await geniexCacheRoot()
-      const parts = id.split('/')
-      const owner = parts.shift() ?? 'local'
-      const leaf = (parts.join('/') || owner).replace(/:[^:]+$/u, '')
+      const cacheRoot = await geniexModelsRoot()
+      const { owner, leaf } = splitModelId(id)
       const meta = JSON.parse(await readFile(join(cacheRoot, owner, leaf, 'geniex.json'), 'utf8'))
       return meta?.ModelType === 'vlm' || meta?.MMProjFile?.Downloaded === true
     } catch {
       // Cache metadata is optional.
     }
   }
-  return VISION_NAME.test(id)
+  return VISION_MODEL_PATTERN.test(id)
 }
 
 async function discoverModels(ctx, settings) {
@@ -719,18 +770,18 @@ async function discoverModels(ctx, settings) {
     .filter((entry) => entry.id !== '')
   if (entries.length === 0) throw httpError(502, 'model discovery returned no models')
   return Promise.all(entries.map(async ({ id, modelType }) => {
-    const known = REASONING_EFFORT_OVERRIDES.find((entry) => id.toLowerCase().includes(entry.match))
+    const known = KNOWN_REASONING_EFFORTS.find((entry) => id.toLowerCase().includes(entry.match))
     const [vision, reasoningEfforts] = await Promise.all([
       modelType !== null
         ? Promise.resolve(modelType.toLowerCase() === 'vlm')
-        : modelSupportsVision(settings, id, headers),
-      known === undefined ? reasoningEffortsFromCache(settings, id) : Promise.resolve(known.efforts),
+        : detectVision(settings, id, headers),
+      known === undefined ? detectReasoningEfforts(settings, id) : Promise.resolve(known.efforts),
     ])
-    return modelSpec(id, settings, vision, reasoningEfforts)
+    return buildModelSpec(id, settings, vision, reasoningEfforts)
   }))
 }
 
-async function warmModel(ctx, settings, model) {
+async function warmUpModel(ctx, settings, model) {
   const url = upstreamURL(settings, 'chat/completions')
   const body = {
     model,
@@ -741,10 +792,9 @@ async function warmModel(ctx, settings, model) {
     max_completion_tokens: 1,
     temperature: 0,
     stream: false,
-    ...settings.protocol === 'qwen'
-      ? { enable_thinking: false }
-      : { enable_think: false, reasoning_format: 'none' },
   }
+  if (settings.protocol === 'qwen') body.enable_thinking = false
+  else Object.assign(body, { enable_think: false, reasoning_format: 'none' })
   const startedAt = Date.now()
   const response = await fetch(url, {
     method: 'POST',
@@ -763,7 +813,7 @@ async function warmModel(ctx, settings, model) {
   return { elapsedMs: Date.now() - startedAt, usage }
 }
 
-async function ensureProvider(ctx, settings) {
+async function upsertProvider(ctx, settings) {
   const { editor, entry } = readProviderConfig(ctx)
   const id = providerIdFor(settings.protocol)
   const keyRef = apiKeyRef(settings)
@@ -811,7 +861,7 @@ async function ensureProvider(ctx, settings) {
   }
 }
 
-async function removeProvider(ctx, settings) {
+async function deleteProvider(ctx, settings) {
   if (settings.managedProviderId === null) return
   const { editor, entry } = readProviderConfig(ctx)
   const id = settings.managedProviderId
@@ -832,7 +882,7 @@ async function removeProvider(ctx, settings) {
   settings.managedProviderId = null
 }
 
-function providerStatus(ctx, settings) {
+function readManagedProvider(ctx, settings) {
   try {
     const { providers } = readProviderConfig(ctx)
     const id = settings.managedProviderId
@@ -875,12 +925,12 @@ export async function apply(ctx) {
   const refreshManagedModels = () => {
     managedModels.clear()
     visionModels.clear()
-    const provider = providerStatus(ctx, settings).provider
+    const provider = readManagedProvider(ctx, settings).provider
     for (const id of provider?.models ?? []) managedModels.add(id)
     for (const id of provider?.visionModels ?? []) visionModels.add(id)
   }
   refreshManagedModels()
-  const isActive = (model) => {
+  const ownsModel = (model) => {
     if (settings.mode !== 'auto') return false
     return typeof model === 'string' && managedModels.has(model)
   }
@@ -917,7 +967,7 @@ export async function apply(ctx) {
         if (first !== undefined) firsts.set(key, first)
       } else if (event.type === 'assistant/message') {
         const first = firsts.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
-        const metric = turnMetric(event, first, starts.get(key) ?? first)
+        const metric = buildTurnMetric(event, first, starts.get(key) ?? first)
         if (metric !== null) turnMetrics.set(`${session.id}:${turn}`, metric)
       }
     }
@@ -950,7 +1000,7 @@ export async function apply(ctx) {
     const start = stepStarts.get(key) ?? first
     stepStarts.delete(key)
     firstTokens.delete(key)
-    const metric = turnMetric(event, first, start)
+    const metric = buildTurnMetric(event, first, start)
     if (metric === null) return
     turnMetrics.set(`${session.id}:${turn}`, metric)
     trimMap(turnMetrics, 2000)
@@ -959,17 +1009,17 @@ export async function apply(ctx) {
   const state = () => ({
     ...settings,
     proxyBaseURL: proxyBaseURL(settings),
-    ...providerStatus(ctx, settings),
+    ...readManagedProvider(ctx, settings),
   })
 
   const syncProvider = async () => {
     if (settings.mode === 'off') {
-      await removeProvider(ctx, settings)
+      await deleteProvider(ctx, settings)
       managedModels.clear()
       visionModels.clear()
       return
     }
-    const provider = await ensureProvider(ctx, settings)
+    const provider = await upsertProvider(ctx, settings)
     managedModels.clear()
     visionModels.clear()
     for (const id of provider.models) managedModels.add(id)
@@ -1042,7 +1092,7 @@ export async function apply(ctx) {
       if (!settings.warm) throw httpError(409, 'model warmup is disabled')
       const model = text(payload?.model)
       if (model === '' || !managedModels.has(model)) throw httpError(400, 'unknown managed model')
-      const result = await warmModel(ctx, settings, model)
+      const result = await warmUpModel(ctx, settings, model)
       return { warmed: true, model, ...result }
     },
     save: async (payload) => {
@@ -1060,7 +1110,7 @@ export async function apply(ctx) {
     },
     apply: async () => {
       try {
-        const provider = await ensureProvider(ctx, settings)
+        const provider = await upsertProvider(ctx, settings)
         managedModels.clear()
         visionModels.clear()
         for (const id of provider.models) managedModels.add(id)
@@ -1074,7 +1124,7 @@ export async function apply(ctx) {
     },
     remove: async () => {
       try {
-        await removeProvider(ctx, settings)
+        await deleteProvider(ctx, settings)
         managedModels.clear()
         visionModels.clear()
         settings.lastError = null
@@ -1172,7 +1222,7 @@ export async function apply(ctx) {
     // The permission catalog refresh is best-effort.
   }
 
-  const server = http.createServer((req, res) => forward(req, res, settings, logger, isActive, (model) => visionModels.has(model)))
+  const server = http.createServer((req, res) => forward(req, res, settings, logger, ownsModel, (model) => visionModels.has(model)))
   await new Promise((resolve, reject) => {
     server.once('error', reject)
     server.listen(settings.proxyPort, '127.0.0.1', resolve)
@@ -1186,6 +1236,8 @@ export async function apply(ctx) {
   }, 1500)
   ctx.effect(() => () => clearTimeout(labelTimer), `${SCOPE}: permission preset bootstrap`)
 }
+
+
 
 
 

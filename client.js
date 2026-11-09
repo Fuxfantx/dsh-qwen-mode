@@ -1,8 +1,8 @@
-/**
+﻿/**
  * Browser half of the Qwen mode bundle: one compact Settings section.
  *
  * The Host owns the provider entry (`From GenieX` / `From QwenCloud`), so this
- * page only exposes the source, thinking mode, and sampling defaults.
+ * page exposes the source, model limits, inference backend, and sampling defaults.
  *
  * @module dsh-qwen-mode/client
  */
@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
 
     const zh = {
       'section.title': 'Qwen 模式',
-      'section.subtitle': '自动创建并维护 Qwen Provider，补齐思考开关与采样参数',
+      'section.subtitle': '自动创建并维护 Qwen Provider，补齐思考参数与采样默认值',
       'mode.off': '关闭',
       'mode.auto': '自动',
       'source.title': '接入来源',
@@ -28,7 +28,6 @@ window.__ModuleLoader__.load({
       'upstream.label': '上游地址',
       'apiKeyEnv.label': 'API Key（可选）',
       'apiKeyEnv.placeholder': 'local',
-      'warm.title': '模型预热',
       'warm.label': '选择 From GenieX 模型时自动预热',
       'warm.hint': '发送一个最小 system prompt、单 token 且关闭推理的请求，让 GenieX 提前加载模型；预热期间发送按钮显示转圈。',
       'advanced': '高级选项',
@@ -86,7 +85,6 @@ window.__ModuleLoader__.load({
       'upstream.label': 'Upstream URL',
       'apiKeyEnv.label': 'API key (optional)',
       'apiKeyEnv.placeholder': 'local',
-      'warm.title': 'Model warmup',
       'warm.label': 'Warm up when selecting a From GenieX model',
       'warm.hint': 'Sends a minimal system prompt with a one-token, non-thinking request so GenieX loads the model; the send button shows a spinner while warming.',
       'advanced': 'Advanced',
@@ -957,6 +955,7 @@ window.__ModuleLoader__.load({
     }
   },
 })
+
 
 
 
