@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Host half of the Qwen mode bundle.
  *
  * Starts a loopback OpenAI-compatible proxy and maintains dedicated
@@ -32,8 +32,6 @@ const DEFAULTS = {
   managedProviderId: null,
   contextWindow: 262144,
   maxOutputTokens: 131072,
-  thinking: 'auto',
-  reasoningFormat: 'none',
   temperature: null,
   topP: null,
   topK: null,
@@ -166,8 +164,6 @@ function normalizeSettings(raw) {
     managedProviderId: text(source.managedProviderId) || null,
     contextWindow,
     maxOutputTokens: effectiveContext === null ? maxOutput : Math.min(maxOutput, effectiveContext),
-    thinking: ['auto', 'on', 'off'].includes(source.thinking) ? source.thinking : 'auto',
-    reasoningFormat: 'none',
     temperature: numberOrNull(source.temperature),
     topP: numberOrNull(source.topP),
     topK: numberOrNull(source.topK),
@@ -204,9 +200,7 @@ function upstreamURL(settings, path) {
   return base
 }
 
-function thinkingEnabled(body, settings) {
-  if (settings.thinking === 'on') return true
-  if (settings.thinking === 'off') return false
+function thinkingEnabled(body) {
   if (typeof body.enable_think === 'boolean') return body.enable_think
   if (typeof body.enable_thinking === 'boolean') return body.enable_thinking
   const effort = body.reasoning_effort
@@ -216,7 +210,7 @@ function thinkingEnabled(body, settings) {
 
 function applyRequestDefaults(body, settings) {
   const output = { ...body }
-  const thinking = thinkingEnabled(body, settings)
+  const thinking = thinkingEnabled(body)
   if (settings.protocol === 'qwen') {
     output.enable_thinking = thinking
     output.preserve_thinking = true
@@ -225,7 +219,7 @@ function applyRequestDefaults(body, settings) {
     output.enable_think = thinking
     delete output.enable_thinking
     delete output.reasoning_effort
-    output.reasoning_format = settings.reasoningFormat
+    output.reasoning_format = 'none'
   }
   const fill = (key, value) => {
     if (value !== null && output[key] === undefined) output[key] = value
@@ -245,8 +239,8 @@ function applyRequestDefaults(body, settings) {
   return output
 }
 
-function thinkState(assumeReasoning = false, format = 'none') {
-  return { buffer: '', inThink: false, assumeReasoning, format, separated: false, pending: false }
+function thinkState(assumeReasoning = false) {
+  return { buffer: '', inThink: false, assumeReasoning, separated: false, pending: false }
 }
 
 /** Locate the first Markdown heading that likely starts the final answer. */
@@ -364,9 +358,7 @@ function flushThink(state) {
       state.buffer = ''
       return out
     }
-    const type = state.inThink || (state.assumeReasoning && !state.separated && state.format !== 'none')
-      ? 'reasoning'
-      : 'content'
+    const type = state.inThink ? 'reasoning' : 'content'
     out.push({ type, text: state.buffer })
     state.buffer = ''
   }
@@ -463,7 +455,7 @@ function transformSseEvent(raw, state, meta) {
   return rewriteChunk(parsed, state).map(sseEvent).join('')
 }
 
-function writeProxyResponse(upstream, res, active, assumeReasoning, format) {
+function writeProxyResponse(upstream, res, active, assumeReasoning) {
   const headers = { ...upstream.headers }
   delete headers['content-length']
   delete headers['transfer-encoding']
@@ -483,7 +475,7 @@ function writeProxyResponse(upstream, res, active, assumeReasoning, format) {
       try {
         const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'))
         if (Array.isArray(payload.choices)) {
-          const state = thinkState(assumeReasoning, format)
+          const state = thinkState(assumeReasoning)
           payload.choices = payload.choices.map((choice) => ({
             ...choice,
             message: rewriteMessage(choice.message, state),
@@ -497,7 +489,7 @@ function writeProxyResponse(upstream, res, active, assumeReasoning, format) {
     return
   }
   const decoder = new StringDecoder('utf8')
-  const state = thinkState(assumeReasoning, format)
+  const state = thinkState(assumeReasoning)
   const meta = {}
   let buffer = ''
   upstream.on('data', (chunk) => {
@@ -550,7 +542,7 @@ function forward(req, res, settings, logger, isActive) {
     }
     headers['content-length'] = String(body.length)
     const upstreamReq = transport.request(upstreamUrl, { method: req.method, headers }, (upstreamRes) => {
-      writeProxyResponse(upstreamRes, res, active, thinking, settings.reasoningFormat)
+      writeProxyResponse(upstreamRes, res, active, thinking)
     })
     upstreamReq.setNoDelay(true)
     upstreamReq.on('error', (error) => {
@@ -1065,3 +1057,4 @@ export async function apply(ctx) {
   }, 1500)
   ctx.effect(() => () => clearTimeout(labelTimer), `${SCOPE}: permission preset bootstrap`)
 }
+

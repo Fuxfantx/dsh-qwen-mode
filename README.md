@@ -15,11 +15,11 @@
 - 从上游模型目录发现模型，并生成上下文窗口与最大输出限制。
 - GenieX 注入顶层 `enable_think`；QwenCloud 注入 `enable_thinking` 并保留 `reasoning_effort`。
 - 将 `<think>...</think>` 拆为 `reasoning_content`；无标签时识别 GenieX 的“推理段落 + 空行 + 正文”结构。
-- 为流式请求补 `stream_options.include_usage`，回复完成后显示模型名、TTFT、Decode TPS 和时间。
+- 为流式请求补 `stream_options.include_usage`，回复完成后显示模型名、TTFT、Decode TPS 和时间；历史对话同样可查看。
 - 安装 **仅回复 / Reply Only** 权限：只读、无审批，并隐藏/拒绝工具调用。
 - 可选模型预热：选择 `From GenieX` 模型时提前加载；预热请求串行执行。
 - 模型选择器显示量化精度（如 `Q4_0`），并隐藏官方 trigger 图标。
-- 可配置上下文窗口、最大输出、思考模式、采样默认值与 `repetition_penalty`。
+- 可配置上下文窗口、最大输出、采样默认值与 `repetition_penalty`。
 
 ### 要求与安装
 
@@ -34,7 +34,7 @@
 3. 选择来源并填写上游地址：
    - **GenieX**：填 `http://127.0.0.1:18181` 即可，插件自动使用 `/v1`。
    - **QwenCloud**：填写完整兼容端点，插件不会自动追加 `/v1`。
-4. 按需设置模型限制、思考与采样默认值。
+4. 按需设置模型限制与采样默认值。
 5. 点击「保存并应用」，插件自动创建/更新 Provider。
 6. 在模型选择器中选择该 Provider 下的模型。
 
@@ -42,6 +42,7 @@
 
 - **API Key**：留空时使用 DSH credential `local`，不读取同名环境变量；QwenCloud 可填写环境变量名，例如 `DASHSCOPE_API_KEY`。
 - **上下文窗口**：留空时，GenieX 视为由 `geniex serve --nctx <value>` 指定，不再下发上下文窗口字段；QwenCloud 使用默认 `262144`。
+- **思考**：固定跟随当前请求，不提供手动开关。
 - **模型预热**：位于「接入来源 → 高级选项」，仅对 `From GenieX` 生效；发送最小 system prompt + 单 token 请求，预热期间发送按钮替换为转圈。耗时主要来自模型加载，prompt 本身占比很小。
 - **统计**：仅在该轮回复完成后显示；DSH 在流式阶段不提供可用的 TTFT/Decode TPS 结算值。
 - **GenieX reasoning_format**：固定使用 `none`。实测 `deepseek` 不返回独立 `reasoning_content`，且同样可能提前结束思考，因此不提供该选项。
@@ -68,11 +69,11 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers
 - Discovers models and builds context-window / max-output limits.
 - Injects `enable_think` for GenieX; injects `enable_thinking` and preserves `reasoning_effort` for QwenCloud.
 - Splits `<think>...</think>` into `reasoning_content`; recognizes GenieX's reasoning-paragraph + blank-line + answer shape when tags are absent.
-- Adds `stream_options.include_usage` to streaming requests and shows model, TTFT, Decode TPS, and time after a reply completes.
+- Adds `stream_options.include_usage` to streaming requests and shows model, TTFT, Decode TPS, and time after a reply completes; historical turns are included.
 - Adds **仅回复 / Reply Only**: read-only, no approvals, tools hidden/denied.
 - Optional warmup for `From GenieX` models; warmups are serialized so models cannot evict each other.
 - Shows a quantization badge (for example `Q4_0`) and hides the shipped model-trigger icon.
-- Configurable context window, max output, thinking mode, sampling defaults, and `repetition_penalty`.
+- Configurable context window, max output, sampling defaults, and `repetition_penalty`.
 
 ### Requirements and Install
 
@@ -87,7 +88,7 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers
 3. Choose a source and enter the upstream URL:
    - **GenieX**: `http://127.0.0.1:18181`; the plugin appends `/v1` automatically.
    - **QwenCloud**: enter the full compatible endpoint; the plugin does not append `/v1`.
-4. Adjust model limits, thinking, and sampling defaults.
+4. Adjust model limits and sampling defaults.
 5. Click **Save and Apply**; the managed provider is created or updated.
 6. Select a model under that provider in the model picker.
 
@@ -95,6 +96,7 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers
 
 - **API Key**: empty uses DSH credential `local` and does not read an environment variable of that name. For QwenCloud, enter an environment variable such as `DASHSCOPE_API_KEY`.
 - **Context window**: when empty, GenieX assumes `geniex serve --nctx <value>` and the field is omitted; QwenCloud uses the default `262144`.
+- **Thinking**: always follows the current request; no manual switch.
 - **Model Warmup**: under **Source → Advanced**, applies only to `From GenieX`; sends a minimal system prompt and a one-token request, replacing the send button with a spinner. Load time is dominated by model loading, not prompt length.
 - **Stats**: shown only after the reply completes; DSH does not expose settled TTFT/Decode TPS during streaming.
 - **GenieX reasoning_format**: fixed to `none`. In testing, `deepseek` did not return a separate `reasoning_content` and could still end thinking early, so it is not offered.

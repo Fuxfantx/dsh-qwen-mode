@@ -41,19 +41,12 @@ window.__ModuleLoader__.load({
       'provider.rebuild': '重建 Provider',
       'provider.remove': '移除 Provider',
       'provider.hint': 'Provider 名称固定为 From GenieX / From QwenCloud，模型从上游 /v1/models 自动发现。',
-      'thinking.title': '思考控制',
-      'thinking.label': '思考模式',
-      'thinking.auto': '跟随请求',
-      'thinking.on': '始终开启',
-      'thinking.off': '始终关闭',
-      'limits.title': '模型限制',
-      'limits.hint': '上下文窗口留空时：GenieX 视为由 `geniex serve --nctx` 指定，不再下发该字段；QwenCloud 使用默认 262144。最大输出不能超过已设置的上下文窗口。',
+      'modelConfig.title': '模型配置',
       'limits.invalid': '最大输出长度不能大于上下文窗口。',
       'contextWindow.label': '上下文窗口',
-      'contextWindow.placeholder': '留空：GenieX 用 --nctx，QwenCloud 用 262144',
       'maxOutputTokens.label': '最大输出长度',
       'sampling.title': '采样默认值',
-      'sampling.hint': '仅在请求未自带该参数时填充；留空表示不注入。',
+      'sampling.hint': '仅在请求未携带该字段时填充；留空则不注入。',
       'temperature.label': 'temperature',
       'topP.label': 'top_p',
       'topK.label': 'top_k',
@@ -99,19 +92,12 @@ window.__ModuleLoader__.load({
       'provider.rebuild': 'Rebuild provider',
       'provider.remove': 'Remove provider',
       'provider.hint': 'The provider name is fixed to From GenieX / From QwenCloud; models are discovered from /v1/models.',
-      'thinking.title': 'Thinking',
-      'thinking.label': 'Thinking mode',
-      'thinking.auto': 'Follow request',
-      'thinking.on': 'Always on',
-      'thinking.off': 'Always off',
-      'limits.title': 'Model limits',
-      'limits.hint': 'If the context window is empty: GenieX assumes `geniex serve --nctx` and the field is omitted; QwenCloud uses the default 262144. Max output cannot exceed an explicit context window.',
+      'modelConfig.title': 'Model Configuration',
       'limits.invalid': 'Max output tokens cannot exceed the context window.',
       'contextWindow.label': 'Context window',
-      'contextWindow.placeholder': 'Empty: GenieX uses --nctx; QwenCloud uses 262144',
       'maxOutputTokens.label': 'Max output tokens',
-      'sampling.title': 'Sampling defaults',
-      'sampling.hint': 'Injected only when the request does not already carry the field; empty omits it.',
+      'sampling.title': 'Sampling Defaults',
+      'sampling.hint': 'Filled only when the request does not already carry the field; empty omits it.',
       'temperature.label': 'temperature',
       'topP.label': 'top_p',
       'topK.label': 'top_k',
@@ -412,20 +398,22 @@ window.__ModuleLoader__.load({
           }
         }
       }
-      let scheduled = false
+      let timer = null
       const schedule = () => {
-        if (scheduled) return
-        scheduled = true
-        requestAnimationFrame(() => {
-          scheduled = false
+        if (timer !== null) return
+        timer = window.setTimeout(() => {
+          timer = null
           scan()
-        })
+        }, 100)
       }
       const observer = new MutationObserver(schedule)
       if (document.body === null) return () => observer.disconnect()
       observer.observe(document.body, { childList: true, subtree: true })
       scan()
-      return () => observer.disconnect()
+      return () => {
+        observer.disconnect()
+        if (timer !== null) window.clearTimeout(timer)
+      }
     }
 
     const S = {
@@ -448,6 +436,9 @@ window.__ModuleLoader__.load({
       card: { display: 'flex', flexDirection: 'column', gap: '10px', padding: '14px', borderRadius: '10px', border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-1)' },
       cardHeader: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' },
       cardTitle: { fontSize: '13px', fontWeight: 600 },
+      configSection: { display: 'flex', flexDirection: 'column', gap: '6px' },
+      configHeading: { fontSize: '12px', fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
+      divider: { height: '1px', background: 'var(--dsw-alias-border-l1)', margin: '2px 0' },
       hint: { color: 'var(--dsw-alias-label-secondary)', fontSize: '11px', lineHeight: 1.5 },
       grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '10px' },
       field: { display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0 },
@@ -692,7 +683,6 @@ window.__ModuleLoader__.load({
           protocol: settings.protocol,
           upstream: settings.upstream,
           apiKeyEnv: settings.apiKeyEnv,
-          thinking: settings.thinking,
           ...numeric,
         }))
       }
@@ -797,51 +787,42 @@ window.__ModuleLoader__.load({
             ]),
           ]),
         ]),
-        h('div', { key: 'thinking', style: S.card }, [
-          h('div', { key: 'title', style: S.cardTitle }, t('thinking.title')),
-          h('div', { key: 'grid', style: S.grid }, [
-            h(Field, { key: 'thinking', label: t('thinking.label') }, h('select', {
-              style: S.select,
-              value: settings.thinking,
-              onChange: (event) => update('thinking', event.target.value),
-            }, [
-              h('option', { key: 'auto', value: 'auto' }, t('thinking.auto')),
-              h('option', { key: 'on', value: 'on' }, t('thinking.on')),
-              h('option', { key: 'off', value: 'off' }, t('thinking.off')),
-            ])),
+        h('div', { key: 'model-config', style: S.card }, [
+          h('div', { key: 'title', style: S.cardTitle }, t('modelConfig.title')),
+          h('div', { key: 'divider-top', style: S.divider }),
+          h('div', { key: 'limits', style: S.configSection }, [
+            h('div', { key: 'grid', style: S.grid }, [
+              ...['contextWindow', 'maxOutputTokens'].map((key) => h(Field, {
+                key,
+                label: t(`${key}.label`),
+              }, h('input', {
+                key: 'input',
+                style: S.input,
+                inputMode: 'numeric',
+                value: numberValue(key),
+                placeholder: key === 'contextWindow'
+                  ? settings.protocol === 'qwen' ? '262144' : 'GENIEX_NCTX or 4096'
+                  : undefined,
+                onChange: (event) => setNumber(key, event.target.value),
+              }))),
+            ]),
           ]),
-        ]),
-        h('div', { key: 'limits', style: S.card }, [
-          h('div', { key: 'title', style: S.cardTitle }, t('limits.title')),
-          h('div', { key: 'hint', style: S.hint }, t('limits.hint')),
-          h('div', { key: 'grid', style: S.grid }, [
-            ...['contextWindow', 'maxOutputTokens'].map((key) => h(Field, {
-              key,
-              label: t(`${key}.label`),
-            }, h('input', {
-              key: 'input',
-              style: S.input,
-              inputMode: 'numeric',
-              value: numberValue(key),
-              placeholder: key === 'contextWindow' ? t('contextWindow.placeholder') : undefined,
-              onChange: (event) => setNumber(key, event.target.value),
-            }))),
-          ]),
-        ]),
-        h('div', { key: 'sampling', style: S.card }, [
-          h('div', { key: 'title', style: S.cardTitle }, t('sampling.title')),
-          h('div', { key: 'hint', style: S.hint }, t('sampling.hint')),
-          h('div', { key: 'grid', style: S.grid }, [
-            ...['temperature', 'topP', 'topK', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty'].map((key) => h(Field, {
-              key,
-              label: t(`${key}.label`),
-            }, h('input', {
-              key: 'input',
-              style: S.input,
-              inputMode: 'decimal',
-              value: numberValue(key),
-              onChange: (event) => setNumber(key, event.target.value),
-            }))),
+          h('div', { key: 'divider-sampling', style: S.divider }),
+          h('div', { key: 'sampling', style: S.configSection }, [
+            h('div', { key: 'heading', style: S.configHeading }, t('sampling.title')),
+            h('div', { key: 'hint', style: S.hint }, t('sampling.hint')),
+            h('div', { key: 'grid', style: S.grid }, [
+              ...['temperature', 'topP', 'topK', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty'].map((key) => h(Field, {
+                key,
+                label: t(`${key}.label`),
+              }, h('input', {
+                key: 'input',
+                style: S.input,
+                inputMode: 'decimal',
+                value: numberValue(key),
+                onChange: (event) => setNumber(key, event.target.value),
+              }))),
+            ]),
           ]),
         ]),
         h('div', { key: 'footer', style: S.footer }, [
@@ -915,6 +896,7 @@ window.__ModuleLoader__.load({
     }
   },
 })
+
 
 
 
