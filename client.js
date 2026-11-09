@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Browser half of the Qwen mode bundle: one compact Settings section.
  *
  * The Host owns the provider entry (`From GenieX` / `From QwenCloud`), so this
@@ -35,12 +35,12 @@ window.__ModuleLoader__.load({
       'provider.title': '自动维护的 Provider',
       'provider.name': 'Provider',
       'provider.baseURL': 'baseURL',
-      'provider.models': '模型',
       'provider.exists': '已创建',
       'provider.missing': '未创建',
       'provider.rebuild': '重建 Provider',
       'provider.remove': '移除 Provider',
-      'provider.hint': 'Provider 名称固定为 From GenieX / From QwenCloud，模型从上游 /v1/models 自动发现。',
+      'provider.modelsFound': '自 /models 处发现 {count} 个模型：{models}',
+      'noModels': '尚未发现模型',
       'modelConfig.title': '模型配置',
       'limits.invalid': '最大输出长度不能大于上下文窗口。',
       'contextWindow.label': '上下文窗口',
@@ -59,8 +59,6 @@ window.__ModuleLoader__.load({
       'saveFailed': '操作失败：{message}',
       'numberInvalid': '{field} 需要是数字或留空',
       'footer.hint': '保存后自动重建 Provider 与模型目录；切换来源会移除另一个来源的 Provider。',
-      'modelCount': '{count} 个模型',
-      'noModels': '尚未发现模型',
       'stats.ttft': 'TTFT: {value}',
       'stats.tps': '{value} tok/s',
       'stats.ms': '{value} ms',
@@ -86,12 +84,12 @@ window.__ModuleLoader__.load({
       'provider.title': 'Managed provider',
       'provider.name': 'Provider',
       'provider.baseURL': 'baseURL',
-      'provider.models': 'Models',
       'provider.exists': 'Created',
       'provider.missing': 'Missing',
       'provider.rebuild': 'Rebuild provider',
       'provider.remove': 'Remove provider',
-      'provider.hint': 'The provider name is fixed to From GenieX / From QwenCloud; models are discovered from /v1/models.',
+      'provider.modelsFound': 'Found {count} models from /models: {models}',
+      'noModels': 'No models discovered yet',
       'modelConfig.title': 'Model Configuration',
       'limits.invalid': 'Max output tokens cannot exceed the context window.',
       'contextWindow.label': 'Context window',
@@ -110,8 +108,6 @@ window.__ModuleLoader__.load({
       'saveFailed': 'Action failed: {message}',
       'numberInvalid': '{field} must be a number or empty',
       'footer.hint': 'Saving rebuilds the provider and model catalog; switching sources removes the other provider.',
-      'modelCount': '{count} models',
-      'noModels': 'No models discovered yet',
       'stats.ttft': 'TTFT: {value}',
       'stats.tps': '{value} tok/s',
       'stats.ms': '{value} ms',
@@ -440,6 +436,7 @@ window.__ModuleLoader__.load({
       configHeading: { fontSize: '12px', fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
       divider: { height: '1px', background: 'var(--dsw-alias-border-l1)', margin: '2px 0' },
       hint: { color: 'var(--dsw-alias-label-secondary)', fontSize: '11px', lineHeight: 1.5 },
+      modelList: { color: 'var(--dsw-alias-label-secondary)', fontSize: '11px', lineHeight: 1.5, overflowWrap: 'anywhere' },
       grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: '10px' },
       field: { display: 'flex', flexDirection: 'column', gap: '4px', minWidth: 0 },
       label: { color: 'var(--dsw-alias-label-secondary)', fontSize: '11px' },
@@ -722,12 +719,14 @@ window.__ModuleLoader__.load({
             h('span', { key: 'title', style: S.cardTitle }, t('provider.title')),
             h('span', { key: 'badge', style: providerExists ? S.badgeOn : S.badge }, providerExists ? t('provider.exists') : t('provider.missing')),
           ]),
-          h('div', { key: 'hint', style: S.hint }, t('provider.hint')),
+          h('div', { key: 'divider', style: S.divider }),
           h('div', { key: 'grid', style: S.grid }, [
             h(Field, { key: 'name', label: t('provider.name') }, h('div', { style: S.code }, provider?.displayName ?? (settings.protocol === 'qwen' ? 'From QwenCloud' : 'From GenieX'))),
             h(Field, { key: 'baseURL', label: t('provider.baseURL') }, h('div', { style: S.code, title: provider?.baseURL ?? settings.proxyBaseURL }, provider?.baseURL || settings.proxyBaseURL)),
           ]),
-          h('div', { key: 'models', style: S.hint }, models.length === 0 ? t('noModels') : `${format(t('modelCount'), { count: models.length })}: ${models.join(', ')}`),
+          h('div', { key: 'models', style: S.modelList }, models.length === 0
+            ? t('noModels')
+            : format(t('provider.modelsFound'), { count: models.length, models: models.join(', ') })),
           h('div', { key: 'actions', style: S.row }, [
             h('button', {
               key: 'rebuild',
@@ -747,6 +746,7 @@ window.__ModuleLoader__.load({
         ]),
         h('div', { key: 'source', style: S.card }, [
           h('div', { key: 'title', style: S.cardTitle }, t('source.title')),
+          h('div', { key: 'divider', style: S.divider }),
           h('div', { key: 'grid', style: S.grid }, [
             h(Field, { key: 'protocol', label: t('protocol.label') }, h('select', {
               style: S.select,
@@ -896,6 +896,7 @@ window.__ModuleLoader__.load({
     }
   },
 })
+
 
 
 
