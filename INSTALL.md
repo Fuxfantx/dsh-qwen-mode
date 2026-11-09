@@ -1,13 +1,13 @@
 ﻿# DSH Qwen mode — offline install / 离线安装
 
-Version / 版本: **1.3.41**
+Version / 版本: **1.3.42**
 
 ## 中文
 
 压缩包内容：
 
 - `dsh-qwen-mode/` — 解压后的插件目录。
-- `dsh-qwen-mode-1.3.41.tgz` — npm tarball。
+- `dsh-qwen-mode-1.3.42.tgz` — npm tarball。
 - `INSTALL.md` — 本说明。
 
 安装：
@@ -28,7 +28,7 @@ Version / 版本: **1.3.41**
 Archive contents:
 
 - `dsh-qwen-mode/` — unpacked plugin directory.
-- `dsh-qwen-mode-1.3.41.tgz` — npm tarball.
+- `dsh-qwen-mode-1.3.42.tgz` — npm tarball.
 - `INSTALL.md` — this file.
 
 Install:
@@ -43,6 +43,7 @@ Install:
 6. Select a model under that provider in the model picker.
 
 The package has no npm dependencies, so offline installation needs no network access. The proxy listens on `127.0.0.1:18182`.
+
 
 
 

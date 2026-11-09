@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Browser half of the Qwen mode bundle: one compact Settings section.
  *
  * The Host owns the provider entry (`From GenieX` / `From QwenCloud`), so this
@@ -377,8 +377,24 @@ window.__ModuleLoader__.load({
         span.appendChild(svg)
         return span
       }
+      const hasReplyLabel = (host) => [...host.childNodes].some((node) =>
+        node.nodeType === Node.TEXT_NODE && REPLY_LABELS.has(node.nodeValue?.trim() ?? ''))
+      const guardIcon = (host, icon) => {
+        const guard = new MutationObserver(() => {
+          if (!host.isConnected || !hasReplyLabel(host)) {
+            icon.remove()
+            guard.disconnect()
+          }
+        })
+        guard.observe(host, { childList: true, characterData: true, subtree: true })
+      }
       const scan = () => {
         if (document.body === null) return
+        for (const icon of document.querySelectorAll('[data-qwen-reply-icon]')) {
+          const host = icon.parentElement
+          if (host === null) continue
+          if (!hasReplyLabel(host)) icon.remove()
+        }
         const seen = new Set()
         for (const button of document.querySelectorAll('button[role="option"], button')) {
           const walker = document.createTreeWalker(button, NodeFilter.SHOW_TEXT)
@@ -390,26 +406,26 @@ window.__ModuleLoader__.load({
             if (label === null || label === undefined || host === null || host === undefined) continue
             if (seen.has(host) || host.querySelector('[data-qwen-reply-icon]') !== null) continue
             seen.add(host)
-            host.insertBefore(createIcon(), label)
+            const icon = createIcon()
+            host.insertBefore(icon, label)
+            guardIcon(host, icon)
           }
         }
       }
-      let timer = null
+      let scheduled = false
       const schedule = () => {
-        if (timer !== null) return
-        timer = window.setTimeout(() => {
-          timer = null
+        if (scheduled) return
+        scheduled = true
+        requestAnimationFrame(() => {
+          scheduled = false
           scan()
-        }, 100)
+        })
       }
       const observer = new MutationObserver(schedule)
       if (document.body === null) return () => observer.disconnect()
       observer.observe(document.body, { childList: true, subtree: true })
       scan()
-      return () => {
-        observer.disconnect()
-        if (timer !== null) window.clearTimeout(timer)
-      }
+      return () => observer.disconnect()
     }
 
     const S = {
