@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Host half of the Qwen mode bundle.
  *
  * Starts a loopback OpenAI-compatible proxy and maintains dedicated
@@ -9,9 +9,11 @@
  * @module dsh-qwen-mode
  */
 
+import { execFile } from 'node:child_process'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 
@@ -20,6 +22,7 @@ const API_PREFIX = '/qwen-mode/api'
 const STORE_FILE = 'qwen-mode.json'
 const MAX_BODY = 8 * 1024 * 1024
 const DEFAULT_PORT = 18182
+const VIT_COMPUTE_FIELD = { cpu: 'CPU', gpu: 'GPU', npu: 'HTP2' }
 
 const DEFAULTS = {
   version: 1,
@@ -32,6 +35,8 @@ const DEFAULTS = {
   managedProviderId: null,
   contextWindow: 262144,
   maxOutputTokens: 131072,
+  compute: '',
+  vitCompute: 'npu',
   temperature: null,
   topP: null,
   topK: null,
@@ -164,6 +169,8 @@ function normalizeSettings(raw) {
     managedProviderId: text(source.managedProviderId) || null,
     contextWindow,
     maxOutputTokens: effectiveContext === null ? maxOutput : Math.min(maxOutput, effectiveContext),
+    compute: text(source.compute).slice(0, 100),
+    vitCompute: ['cpu', 'gpu', 'npu'].includes(source.vitCompute) ? source.vitCompute : DEFAULTS.vitCompute,
     temperature: numberOrNull(source.temperature),
     topP: numberOrNull(source.topP),
     topK: numberOrNull(source.topK),
@@ -200,6 +207,27 @@ function upstreamURL(settings, path) {
   return base
 }
 
+let geniexCacheRootPromise = null
+function geniexCacheRoot() {
+  if (geniexCacheRootPromise !== null) return geniexCacheRootPromise
+  geniexCacheRootPromise = new Promise((resolveRoot) => {
+    execFile(
+      process.platform === 'win32' ? 'geniex.exe' : 'geniex',
+      ['list'],
+      { windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 },
+      (error, stdout) => {
+        if (error) {
+          resolveRoot(join(homedir(), '.cache', 'geniex', 'models'))
+          return
+        }
+        const match = /Models cached in\s+(.+)/iu.exec(stdout)
+        resolveRoot(match === null ? join(homedir(), '.cache', 'geniex', 'models') : match[1].trim())
+      },
+    )
+  })
+  return geniexCacheRootPromise
+}
+
 function thinkingEnabled(body) {
   if (typeof body.enable_think === 'boolean') return body.enable_think
   if (typeof body.enable_thinking === 'boolean') return body.enable_thinking
@@ -208,7 +236,7 @@ function thinkingEnabled(body) {
   return true
 }
 
-function applyRequestDefaults(body, settings) {
+function applyRequestDefaults(body, settings, vision = false) {
   const output = { ...body }
   const thinking = thinkingEnabled(body)
   if (settings.protocol === 'qwen') {
@@ -220,6 +248,8 @@ function applyRequestDefaults(body, settings) {
     delete output.enable_thinking
     delete output.reasoning_effort
     output.reasoning_format = 'none'
+    if (settings.compute !== '') output.compute = settings.compute
+    if (vision) output.vit_compute = VIT_COMPUTE_FIELD[settings.vitCompute]
   }
   const fill = (key, value) => {
     if (value !== null && output[key] === undefined) output[key] = value
@@ -508,7 +538,7 @@ function writeProxyResponse(upstream, res, active, assumeReasoning) {
   })
 }
 
-function forward(req, res, settings, logger, isActive) {
+function forward(req, res, settings, logger, isActive, isVision) {
   let upstreamUrl
   try {
     const base = new URL(settings.upstream)
@@ -534,7 +564,7 @@ function forward(req, res, settings, logger, isActive) {
         active = isActive(parsed?.model)
         if (active) {
           thinking = thinkingEnabled(parsed, settings)
-          body = Buffer.from(JSON.stringify(applyRequestDefaults(parsed, settings)), 'utf8')
+          body = Buffer.from(JSON.stringify(applyRequestDefaults(parsed, settings, isVision(parsed?.model))), 'utf8')
         }
       } catch {
         // Preserve non-JSON bodies unchanged.
@@ -573,12 +603,13 @@ function shortName(id) {
   return id.split('/').pop().replace(/:[^:]+$/u, '') || id
 }
 
-function modelSpec(id, settings) {
+function modelSpec(id, settings, vision = false) {
   const lower = id.toLowerCase()
+  // GenieX exposes no reasoning-effort metadata; map known model families.
   const reasoningEfforts = lower.includes('3.6-35b-a3b')
     ? { off: null, max: 'enabled' }
     : lower.includes('3.8')
-      ? { off: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh' }
+      ? { off: null, low: 'low', medium: 'medium', xhigh: 'xhigh' }
       : undefined
   const contextWindow = settings.contextWindow ?? (settings.protocol === 'qwen' ? DEFAULTS.contextWindow : null)
   const spec = {
@@ -586,7 +617,7 @@ function modelSpec(id, settings) {
     name: shortName(id),
     maxTokens: settings.maxOutputTokens,
     reasoningEfforts,
-    input: ['text'],
+    input: vision ? ['text', 'image'] : ['text'],
   }
   if (contextWindow !== null) spec.contextWindow = contextWindow
   return spec
@@ -602,6 +633,34 @@ async function credentialHeader(ctx, settings) {
   }
 }
 
+async function modelSupportsVision(ctx, settings, id, headers) {
+  const byName = /(?:^|[/_-])(?:vl|vision)(?:[/_-]|$)/iu.test(id)
+  if (settings.protocol === 'geniex') {
+    try {
+      const detailUrl = upstreamURL(settings, 'models')
+      detailUrl.pathname = `${detailUrl.pathname.replace(/\/+$/u, '')}/${id.split('/').map(encodeURIComponent).join('/')}`
+      const response = await fetch(detailUrl, { headers, signal: AbortSignal.timeout(8000) })
+      if (response.ok) {
+        const detail = await response.json()
+        if (typeof detail?.model_type === 'string') return detail.model_type.toLowerCase() === 'vlm'
+      }
+    } catch {
+      // Fall back to the cache metadata or the model name.
+    }
+    try {
+      const cacheRoot = await geniexCacheRoot()
+      const parts = id.split('/')
+      const owner = parts.shift() ?? 'local'
+      const leaf = (parts.join('/') || owner).replace(/:[^:]+$/u, '')
+      const meta = JSON.parse(await readFile(join(cacheRoot, owner, leaf, 'geniex.json'), 'utf8'))
+      return meta?.ModelType === 'vlm' || meta?.MMProjFile?.Downloaded === true
+    } catch {
+      // Cache metadata is optional.
+    }
+  }
+  return byName
+}
+
 async function discoverModels(ctx, settings) {
   const url = upstreamURL(settings, 'models')
   const headers = { accept: 'application/json', ...await credentialHeader(ctx, settings) }
@@ -611,7 +670,7 @@ async function discoverModels(ctx, settings) {
   const rows = Array.isArray(body?.data) ? body.data : []
   const models = rows.map((row) => typeof row?.id === 'string' ? row.id : '').filter((id) => id !== '')
   if (models.length === 0) throw httpError(502, 'model discovery returned no models')
-  return models.map((id) => modelSpec(id, settings))
+  return Promise.all(models.map(async (id) => modelSpec(id, settings, await modelSupportsVision(ctx, settings, id, headers))))
 }
 
 async function warmModel(ctx, settings, model) {
@@ -686,7 +745,13 @@ async function ensureProvider(ctx, settings) {
   } catch {
     // Catalog refresh is best-effort; the provider config is already committed.
   }
-  return { id, displayName: desired.displayName, baseURL: desired.baseURL, models: models.map((model) => model.id) }
+  return {
+    id,
+    displayName: desired.displayName,
+    baseURL: desired.baseURL,
+    models: models.map((model) => model.id),
+    visionModels: models.filter((model) => model.input.includes('image')).map((model) => model.id),
+  }
 }
 
 async function removeProvider(ctx, settings) {
@@ -723,6 +788,9 @@ function providerStatus(ctx, settings) {
         baseURL: provider?.baseURL ?? '',
         exists: provider !== undefined,
         models: Array.isArray(provider?.models) ? provider.models.map((model) => model.id) : [],
+        visionModels: Array.isArray(provider?.models)
+          ? provider.models.filter((model) => Array.isArray(model.input) && model.input.includes('image')).map((model) => model.id)
+          : [],
       },
     }
   } catch (error) {
@@ -747,11 +815,14 @@ export async function apply(ctx) {
   await persist().catch((error) => logger.warn(`[${SCOPE}] cannot save settings: ${String(error)}`))
 
   const managedModels = new Set()
+  const visionModels = new Set()
   const refreshManagedModels = () => {
     managedModels.clear()
+    visionModels.clear()
     try {
       const provider = providerStatus(ctx, settings).provider
       for (const id of provider?.models ?? []) managedModels.add(id)
+      for (const id of provider?.visionModels ?? []) visionModels.add(id)
     } catch {
       // The provider is maintained lazily when the settings page saves.
     }
@@ -761,7 +832,6 @@ export async function apply(ctx) {
     if (settings.mode !== 'auto') return false
     return typeof model === 'string' && managedModels.has(model)
   }
-
   const turnMetrics = new Map()
   const stepStarts = new Map()
   const firstTokens = new Map()
@@ -844,11 +914,14 @@ export async function apply(ctx) {
     if (settings.mode === 'off') {
       await removeProvider(ctx, settings)
       managedModels.clear()
+      visionModels.clear()
       return
     }
     const provider = await ensureProvider(ctx, settings)
     managedModels.clear()
+    visionModels.clear()
     for (const id of provider.models) managedModels.add(id)
+    for (const id of provider.visionModels) visionModels.add(id)
   }
 
   const api = {
@@ -922,7 +995,8 @@ export async function apply(ctx) {
     },
     save: async (payload) => {
       const mode = ['off', 'auto', 'always'].includes(payload?.mode) ? payload.mode : settings.mode
-      settings = normalizeSettings({ ...settings, ...payload, mode })
+      const next = normalizeSettings({ ...settings, ...payload, mode })
+      settings = next
       try {
         await syncProvider()
         settings.lastError = null
@@ -936,7 +1010,9 @@ export async function apply(ctx) {
       try {
         const provider = await ensureProvider(ctx, settings)
         managedModels.clear()
+        visionModels.clear()
         for (const id of provider.models) managedModels.add(id)
+        for (const id of provider.visionModels) visionModels.add(id)
         settings.lastError = null
       } catch (error) {
         settings.lastError = String(error)
@@ -948,6 +1024,7 @@ export async function apply(ctx) {
       try {
         await removeProvider(ctx, settings)
         managedModels.clear()
+        visionModels.clear()
         settings.lastError = null
       } catch (error) {
         settings.lastError = String(error)
@@ -1043,7 +1120,7 @@ export async function apply(ctx) {
     // The permission catalog refresh is best-effort.
   }
 
-  const server = http.createServer((req, res) => forward(req, res, settings, logger, isActive))
+  const server = http.createServer((req, res) => forward(req, res, settings, logger, isActive, (model) => visionModels.has(model)))
   await new Promise((resolve, reject) => {
     server.once('error', reject)
     server.listen(settings.proxyPort, '127.0.0.1', resolve)
@@ -1057,4 +1134,7 @@ export async function apply(ctx) {
   }, 1500)
   ctx.effect(() => () => clearTimeout(labelTimer), `${SCOPE}: permission preset bootstrap`)
 }
+
+
+
 

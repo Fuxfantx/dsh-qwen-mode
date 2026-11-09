@@ -1,6 +1,6 @@
 {
   "name": "dsh-qwen-mode",
-  "version": "1.3.42",
+  "version": "1.4.6",
   "description": "Qwen mode for DSH: managed Qwen/GenieX providers, reasoning parsing, model limits, warmup and per-turn stats through a loopback OpenAI-compatible proxy.",
   "type": "module",
   "main": "index.js",

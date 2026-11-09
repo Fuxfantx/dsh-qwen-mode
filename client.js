@@ -42,8 +42,17 @@ window.__ModuleLoader__.load({
       'provider.modelsFound': '自 /models 处发现 {count} 个模型：{models}',
       'noModels': '尚未发现模型',
       'modelConfig.title': '模型配置',
+      'inference.title': '推理后端',
+      'compute.label': 'Compute',
+      'compute.hint': '留空则使用 GenieX 默认值。',
+      'vit.label': 'Vision Encoder',
+      'vit.hint': '仅对 VLM 生效；NPU 映射为 GenieX 的 HTP2。',
+      'vit.cpu': 'CPU',
+      'vit.gpu': 'GPU',
+      'vit.npu': 'NPU',
       'limits.invalid': '最大输出长度不能大于上下文窗口。',
       'contextWindow.label': '上下文窗口',
+      'contextWindow.geniexPlaceholder': 'GENIEX_NCTX（default 4096）',
       'maxOutputTokens.label': '最大输出长度',
       'sampling.title': '采样默认值',
       'sampling.hint': '仅在请求未携带该字段时填充；留空则不注入。',
@@ -91,8 +100,17 @@ window.__ModuleLoader__.load({
       'provider.modelsFound': 'Found {count} models from /models: {models}',
       'noModels': 'No models discovered yet',
       'modelConfig.title': 'Model Configuration',
+      'inference.title': 'Inference Backend',
+      'compute.label': 'Compute',
+      'compute.hint': 'Empty uses the GenieX default.',
+      'vit.label': 'Vision Encoder',
+      'vit.hint': 'Applies to VLM models only; NPU maps to GenieX HTP2.',
+      'vit.cpu': 'CPU',
+      'vit.gpu': 'GPU',
+      'vit.npu': 'NPU',
       'limits.invalid': 'Max output tokens cannot exceed the context window.',
       'contextWindow.label': 'Context window',
+      'contextWindow.geniexPlaceholder': 'GENIEX_NCTX (default 4096)',
       'maxOutputTokens.label': 'Max output tokens',
       'sampling.title': 'Sampling Defaults',
       'sampling.hint': 'Filled only when the request does not already carry the field; empty omits it.',
@@ -696,6 +714,8 @@ window.__ModuleLoader__.load({
           protocol: settings.protocol,
           upstream: settings.upstream,
           apiKeyEnv: settings.apiKeyEnv,
+          compute: settings.protocol === 'geniex' ? String(settings.compute ?? '').trim() : '',
+          vitCompute: settings.vitCompute ?? 'npu',
           ...numeric,
         }))
       }
@@ -817,7 +837,7 @@ window.__ModuleLoader__.load({
                 inputMode: 'numeric',
                 value: numberValue(key),
                 placeholder: key === 'contextWindow'
-                  ? settings.protocol === 'qwen' ? '262144' : 'GENIEX_NCTX or 4096'
+                  ? settings.protocol === 'qwen' ? '262144' : t('contextWindow.geniexPlaceholder')
                   : undefined,
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
@@ -840,6 +860,31 @@ window.__ModuleLoader__.load({
               }))),
             ]),
           ]),
+          settings.protocol === 'geniex' ? h('div', { key: 'inference-wrap' }, [
+            h('div', { key: 'divider-inference', style: S.divider }),
+            h('div', { key: 'inference', style: S.configSection }, [
+              h('div', { key: 'heading', style: { ...S.configHeading, marginTop: '6px' } }, t('inference.title')),
+              h('div', { key: 'grid', style: S.grid }, [
+                h(Field, { key: 'compute', label: t('compute.label'), hint: t('compute.hint') }, h('input', {
+                  key: 'input',
+                  style: S.input,
+                  list: 'qwen-compute-options',
+                  value: settings.compute ?? '',
+                  onChange: (event) => update('compute', event.target.value),
+                })),
+                h(Field, { key: 'vit', label: t('vit.label'), hint: t('vit.hint') }, h('div',
+                  { style: S.segments },
+                  ['cpu', 'gpu', 'npu'].map((value) => h('button', {
+                    key: value,
+                    type: 'button',
+                    style: settings.vitCompute === value ? S.segmentActive : S.segment,
+                    onClick: () => update('vitCompute', value),
+                  }, t(`vit.${value}`))))),
+              ]),
+              h('datalist', { key: 'compute-options', id: 'qwen-compute-options' },
+                ['cpu', 'gpu', 'npu', 'hybrid'].map((value) => h('option', { key: value, value }))),
+            ]),
+          ]) : null,
         ]),
         h('div', { key: 'footer', style: S.footer }, [
           h('div', { key: 'hint', style: S.footerHint }, t('footer.hint')),
@@ -912,6 +957,9 @@ window.__ModuleLoader__.load({
     }
   },
 })
+
+
+
 
 
 

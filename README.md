@@ -13,6 +13,8 @@
 - **关闭 / 自动** 两档模式；自动档只处理 `From GenieX` / `From QwenCloud` 下的模型。
 - GenieX 自动创建 **From GenieX**，QwenCloud 自动创建 **From QwenCloud**。
 - 从上游模型目录发现模型，并生成上下文窗口与最大输出限制。
+- GenieX 通过 `/v1/models/{id}` 的 `model_type`（并回退到缓存中的 `mmproj`/`geniex.json`）识别 VLM，为模型 Provider 同时声明文本与图片输入；缓存目录由 `geniex list` 的 `Models cached in ...` 输出定位。
+- GenieX 请求支持覆盖 `compute` 与 `vit_compute` 推理参数。
 - GenieX 注入顶层 `enable_think`；QwenCloud 注入 `enable_thinking` 并保留 `reasoning_effort`。
 - 将 `<think>...</think>` 拆为 `reasoning_content`；无标签时识别 GenieX 的“推理段落 + 空行 + 正文”结构。
 - 为流式请求补 `stream_options.include_usage`，回复完成后显示模型名、TTFT、Decode TPS 和时间；历史对话同样可查看。
@@ -34,7 +36,7 @@
 3. 选择来源并填写上游地址：
    - **GenieX**：填 `http://127.0.0.1:18181` 即可，插件自动使用 `/v1`。
    - **QwenCloud**：填写完整兼容端点，插件不会自动追加 `/v1`。
-4. 按需设置模型限制与采样默认值。
+4. 按需设置模型限制、推理后端与采样默认值。
 5. 点击「保存并应用」，插件自动创建/更新 Provider。
 6. 在模型选择器中选择该 Provider 下的模型。
 
@@ -42,7 +44,8 @@
 
 - **API Key**：留空时使用 DSH credential `local`，不读取同名环境变量；QwenCloud 可填写环境变量名，例如 `DASHSCOPE_API_KEY`。
 - **上下文窗口**：留空时，GenieX 视为由 `geniex serve --nctx <value>` 指定，不再下发上下文窗口字段；QwenCloud 使用默认 `262144`。
-- **思考**：固定跟随当前请求，不提供手动开关。
+- **推理后端**（仅 GenieX）：`Compute` 可留空或填写 `cpu/gpu/npu/hybrid`、设备列表；`Vision Encoder` 在 CPU/GPU/NPU 间切换，NPU 映射为 `HTP2`，且只对检测到的 VLM 下发。
+- **模型能力**：GenieX API 不提供 reasoning effort 元数据；插件按已知模型系列（如 `3.6-35B-A3B`、`3.8`）映射可选档位，未知模型不显示档位选择。
 - **模型预热**：位于「接入来源 → 高级选项」，仅对 `From GenieX` 生效；发送最小 system prompt + 单 token 请求，预热期间发送按钮替换为转圈。耗时主要来自模型加载，prompt 本身占比很小。
 - **统计**：仅在该轮回复完成后显示；DSH 在流式阶段不提供可用的 TTFT/Decode TPS 结算值。
 - **GenieX reasoning_format**：固定使用 `none`。实测 `deepseek` 不返回独立 `reasoning_content`，且同样可能提前结束思考，因此不提供该选项。
@@ -60,13 +63,15 @@
 
 ## English
 
-DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers, thinking controls, reasoning parsing, and per-turn model performance.
+DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers, thinking parameter normalization, reasoning parsing, and per-turn model performance.
 
 ### Features
 
 - **Off / Auto** only; Auto applies only to models under `From GenieX` / `From QwenCloud`.
 - GenieX creates **From GenieX**; QwenCloud creates **From QwenCloud**.
 - Discovers models and builds context-window / max-output limits.
+- Detects GenieX VLMs through `/v1/models/{id}` `model_type` (falling back to cache `mmproj`/`geniex.json`) and declares both text and image inputs; the cache root is read from `geniex list`'s `Models cached in ...` line.
+- GenieX requests can override `compute` and `vit_compute` inference parameters.
 - Injects `enable_think` for GenieX; injects `enable_thinking` and preserves `reasoning_effort` for QwenCloud.
 - Splits `<think>...</think>` into `reasoning_content`; recognizes GenieX's reasoning-paragraph + blank-line + answer shape when tags are absent.
 - Adds `stream_options.include_usage` to streaming requests and shows model, TTFT, Decode TPS, and time after a reply completes; historical turns are included.
@@ -88,7 +93,7 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers
 3. Choose a source and enter the upstream URL:
    - **GenieX**: `http://127.0.0.1:18181`; the plugin appends `/v1` automatically.
    - **QwenCloud**: enter the full compatible endpoint; the plugin does not append `/v1`.
-4. Adjust model limits and sampling defaults.
+4. Adjust model limits, inference backend, and sampling defaults.
 5. Click **Save and Apply**; the managed provider is created or updated.
 6. Select a model under that provider in the model picker.
 
@@ -96,7 +101,8 @@ DSH integration for OpenAI-compatible Qwen / GenieX endpoints: managed providers
 
 - **API Key**: empty uses DSH credential `local` and does not read an environment variable of that name. For QwenCloud, enter an environment variable such as `DASHSCOPE_API_KEY`.
 - **Context window**: when empty, GenieX assumes `geniex serve --nctx <value>` and the field is omitted; QwenCloud uses the default `262144`.
-- **Thinking**: always follows the current request; no manual switch.
+- **Inference Backend** (GenieX only): `Compute` may be empty or contain `cpu/gpu/npu/hybrid` or a device list; `Vision Encoder` switches CPU/GPU/NPU, mapping NPU to `HTP2`, and is sent only for detected VLMs.
+- **Capabilities**: GenieX does not expose reasoning-effort metadata; the plugin maps known model families (e.g. `3.6-35B-A3B`, `3.8`) to available levels and shows none for unknown models.
 - **Model Warmup**: under **Source → Advanced**, applies only to `From GenieX`; sends a minimal system prompt and a one-token request, replacing the send button with a spinner. Load time is dominated by model loading, not prompt length.
 - **Stats**: shown only after the reply completes; DSH does not expose settled TTFT/Decode TPS during streaming.
 - **GenieX reasoning_format**: fixed to `none`. In testing, `deepseek` did not return a separate `reasoning_content` and could still end thinking early, so it is not offered.
