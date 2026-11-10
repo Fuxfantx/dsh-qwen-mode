@@ -1059,15 +1059,21 @@ window.__ModuleLoader__.load({
       }, [])
 
       const load = React.useCallback(async () => {
-        try {
-          const next = await call('state', undefined, { signal: AbortSignal.timeout(15000) })
-          setSettings(next)
-          setError('')
-          if (next.protocol === 'geniex') void refreshModelInfo('geniex')
-          else setModelInfo({ revision: 0, models: {} })
-        } catch (reason) {
-          setError(format(t('loadFailed'), { message: String(reason?.message ?? reason) }))
+        let lastError
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            const next = await call('state', undefined, { signal: AbortSignal.timeout(15000) })
+            setSettings(next)
+            setError('')
+            if (next.protocol === 'geniex') void refreshModelInfo('geniex')
+            else setModelInfo({ revision: 0, models: {} })
+            return
+          } catch (reason) {
+            lastError = reason
+            if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 400))
+          }
         }
+        setError(format(t('loadFailed'), { message: String(lastError?.message ?? lastError) }))
       }, [t, refreshModelInfo])
 
       React.useEffect(() => {
@@ -1097,7 +1103,7 @@ window.__ModuleLoader__.load({
           const next = await operation()
           if (next !== undefined) {
             setSettings(next)
-            void refreshModelInfo(settings?.protocol)
+            void refreshModelInfo(next.protocol)
             void modelMetaState.refresh()
             void warmState.refresh()
           }
