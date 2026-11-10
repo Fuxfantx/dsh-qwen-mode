@@ -47,7 +47,7 @@ window.__ModuleLoader__.load({
       'apiKeyEnv.hint': '填写保存 Key 的环境变量名或 DSH 凭据名，而不是 Key 本身；GenieX 不校验 Key，留空即可。',
       'apiKeyEnv.invalid': 'Key 变量名只能包含字母、数字和下划线，且不能以数字开头。',
       'warm.label': '选择 From GenieX 模型时自动预热',
-      'warm.hint': '发送仅含 system 消息的原生预热请求，让 GenieX 按相同加载参数提前驻留模型；预热期间发送按钮显示转圈。',
+      'warm.hint': '切换到 From GenieX 模型后，让 GenieX 提前将模型加载到内存中；预热期间发送按钮显示转圈。',
       'advanced': '高级选项',
       'provider.title': '自动维护的 Provider',
       'provider.name': 'Provider',
@@ -71,7 +71,7 @@ window.__ModuleLoader__.load({
       'vit.npu': 'NPU',
       'limits.invalid': '最大输出长度不能大于上下文窗口。',
       'contextWindow.label': '上下文窗口',
-      'contextWindow.geniexPlaceholder': '留空：有 GGUF 元数据时用模型值，否则 131072',
+      'contextWindow.placeholder': '不向请求注入',
       'autoNctx.label': '优先使用模型上下文阈限',
       'autoNctx.sublabel': '( GGUF context_length )',
       'maxOutputTokens.label': '最大输出长度',
@@ -88,7 +88,8 @@ window.__ModuleLoader__.load({
       'mtp.disableHint': '需要重新加载模型',
       'mtp.cancel': '取消',
       'sampling.title': '采样默认值',
-      'sampling.hint': '仅在请求未携带该字段时填充；留空则不注入。min_p 仅对 GenieX 生效。',
+      'sampling.hint': '仅在请求未携带该字段时填充；留空则不注入。',
+      'sampling.hint.geniex': '仅在请求未携带该字段时填充；留空则不注入。min_p 仅对 GenieX 生效。',
       'sampling.fill': '读取推荐值',
       'sampling.none': '当前没有带推荐采样值的模型',
       'temperature.label': 'temperature',
@@ -131,7 +132,7 @@ window.__ModuleLoader__.load({
       'apiKeyEnv.hint': 'Name of the environment variable or DSH credential that holds the key, not the key itself; GenieX ignores it.',
       'apiKeyEnv.invalid': 'The reference may contain only letters, digits, and underscores, and cannot start with a digit.',
       'warm.label': 'Warm up when selecting a From GenieX model',
-      'warm.hint': "Sends GenieX's native warm-up request (a single system message) so the model loads with the same load parameters; the send button shows a spinner while warming.",
+      'warm.hint': 'After switching to a From GenieX model, GenieX loads the model into memory ahead of time; the send button shows a spinner while warming.',
       'advanced': 'Advanced',
       'provider.title': 'Managed provider',
       'provider.name': 'Provider',
@@ -155,7 +156,7 @@ window.__ModuleLoader__.load({
       'vit.npu': 'NPU',
       'limits.invalid': 'Max output tokens cannot exceed the context window.',
       'contextWindow.label': 'Context window',
-      'contextWindow.geniexPlaceholder': 'Empty: the model value when GGUF metadata exists, else 131072',
+      'contextWindow.placeholder': 'Not injected into requests',
       'autoNctx.label': 'Prefer model context limit',
       'autoNctx.sublabel': '( GGUF context_length )',
       'maxOutputTokens.label': 'Max output tokens',
@@ -172,7 +173,8 @@ window.__ModuleLoader__.load({
       'mtp.disableHint': 'The model must reload',
       'mtp.cancel': 'Cancel',
       'sampling.title': 'Sampling Defaults',
-      'sampling.hint': 'Filled only when the request does not already carry the field; empty omits it. min_p applies to GenieX only.',
+      'sampling.hint': 'Filled only when the request does not already carry the field; empty omits it.',
+      'sampling.hint.geniex': 'Filled only when the request does not already carry the field; empty omits it. min_p applies to GenieX only.',
       'sampling.fill': 'Read recommended',
       'sampling.none': 'No model currently exposes recommended sampling',
       'temperature.label': 'temperature',
@@ -1689,6 +1691,10 @@ window.__ModuleLoader__.load({
         ? null
         : Math.max(0, Math.floor((compactionThreshold - 5000) / 1000) * 1000)
       const formatTokens = (value) => value === null ? '—' : tokenFormatter.format(value)
+      // min_p is a GenieX sampler; QwenCloud neither shows it nor receives it.
+      const samplingFields = settings.protocol === 'geniex'
+        ? ['temperature', 'topP', 'topK', 'minP']
+        : ['temperature', 'topP', 'topK']
 
       const provider = settings.provider
       const providerExists = provider !== null && provider !== undefined && provider.exists === true
@@ -1805,9 +1811,7 @@ window.__ModuleLoader__.load({
                 style: S.input,
                 inputMode: 'numeric',
                 value: numberValue(key),
-                placeholder: key === 'contextWindow'
-                  ? settings.protocol === 'qwen' ? '262144' : t('contextWindow.geniexPlaceholder')
-                  : undefined,
+                placeholder: key === 'contextWindow' ? t('contextWindow.placeholder') : undefined,
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
             ]),
@@ -1867,18 +1871,15 @@ window.__ModuleLoader__.load({
           h('div', { key: 'divider-sampling', style: S.divider }),
           h('div', { key: 'sampling', style: S.configSection }, [
             h('div', { key: 'heading', style: S.configHeading }, t('sampling.title')),
-            h('div', { key: 'hint', style: S.hint }, t('sampling.hint')),
+            h('div', { key: 'hint', style: S.hint }, t(settings.protocol === 'geniex' ? 'sampling.hint.geniex' : 'sampling.hint')),
             h('div', {
               key: 'grid',
               style: {
                 ...S.grid,
-                gridTemplateColumns: `repeat(${settings.protocol === 'geniex' ? 4 : 3}, minmax(0, 1fr))`,
+                gridTemplateColumns: `repeat(${samplingFields.length}, minmax(0, 1fr))`,
               },
             }, [
-              ...(settings.protocol === 'geniex'
-                ? ['temperature', 'topP', 'topK', 'minP']
-                : ['temperature', 'topP', 'topK']
-              ).map((key) => h(Field, {
+              ...samplingFields.map((key) => h(Field, {
                 key,
                 label: t(`${key}.label`),
               }, h('input', {
