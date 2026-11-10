@@ -35,8 +35,8 @@ window.__ModuleLoader__.load({
       'apiKeyEnv.placeholder': 'DASHSCOPE_API_KEY',
       'apiKeyEnv.hint': '填写保存 Key 的环境变量名，而不是 Key 本身。',
       'apiKeyEnv.invalid': 'Key 变量名只能包含字母、数字和下划线，且不能以数字开头。',
-      'warm.label': '选择 From GenieX 模型时自动预热',
-      'warm.hint': '切换到 From GenieX 模型后，让 GenieX 提前将模型加载到内存中；预热期间发送按钮显示转圈。',
+      'warm.label': '开始输入消息时自动预热',
+      'warm.hint': '开始输入消息后，让 GenieX 提前将当前 From GenieX 模型加载到内存；预热期间发送按钮显示转圈。',
       'provider.title': '自动维护的 Provider',
       'provider.name': 'Provider',
       'provider.baseURL': 'baseURL',
@@ -116,8 +116,8 @@ window.__ModuleLoader__.load({
       'apiKeyEnv.placeholder': 'DASHSCOPE_API_KEY',
       'apiKeyEnv.hint': 'Name of the environment variable that holds the key, not the key itself.',
       'apiKeyEnv.invalid': 'The reference may contain only letters, digits, and underscores, and cannot start with a digit.',
-      'warm.label': 'Warm up when selecting a From GenieX model',
-      'warm.hint': 'After switching to a From GenieX model, GenieX loads the model into memory ahead of time; the send button shows a spinner while warming.',
+      'warm.label': 'Warm up when I start typing',
+      'warm.hint': 'Once you start typing, GenieX loads the current From GenieX model into memory ahead of time; the send button shows a spinner while warming.',
       'provider.title': 'Managed provider',
       'provider.name': 'Provider',
       'provider.baseURL': 'baseURL',
@@ -405,12 +405,16 @@ window.__ModuleLoader__.load({
     function ModelLabel({ provider, model, placement, selected, sessionId, getLocale }) {
       const [warmEnabled, setWarmEnabled] = React.useState(false)
       const [preheatEnabled, setPreheatEnabled] = React.useState(preheat.enabled)
+      const [composerHasText, setComposerHasText] = React.useState(preheat.hasText)
       const [residentState, setResidentState] = React.useState('')
       const [warmRevision, setWarmRevision] = React.useState(warmState.revision)
       const [modelMetaEntry, setModelMetaEntry] = React.useState(null)
       const modelMetaKey = `${provider?.id ?? ''}\u0000${model?.id ?? ''}`
       const modelMeta = modelMetaEntry?.key === modelMetaKey ? modelMetaEntry.meta : null
-      React.useEffect(() => preheat.subscribe(() => setPreheatEnabled(preheat.enabled)), [])
+      React.useEffect(() => preheat.subscribe(() => {
+        setPreheatEnabled((current) => current === preheat.enabled ? current : preheat.enabled)
+        setComposerHasText((current) => current === preheat.hasText ? current : preheat.hasText)
+      }), [])
       React.useEffect(() => {
         const update = () => {
           setWarmEnabled((current) => current === warmState.enabled ? current : warmState.enabled)
@@ -435,6 +439,7 @@ window.__ModuleLoader__.load({
       }, [provider?.id, model?.id])
       React.useEffect(() => {
         if (placement !== 'trigger' || !selected) return
+        preheat.scheduleComposerProbe()
         const key = sessionId ?? 'global'
         const selectedModel = provider?.id === 'from-geniex' && typeof model?.id === 'string' ? model.id : null
         preheat.setSelected(key, selectedModel)
@@ -450,6 +455,8 @@ window.__ModuleLoader__.load({
         if (selectedModel === null) {
           return
         }
+        if (!composerHasText) return
+        if (!preheatEnabled) return
         const modelId = selectedModel
         const previous = warmChain.get(key) ?? Promise.resolve()
         const job = previous.then(async () => {
@@ -459,7 +466,7 @@ window.__ModuleLoader__.load({
           await preheat.bootDelay
           if (preheat.ready !== null) await preheat.ready
           if (preheat.selected.get(key) !== modelId) return
-          if (!preheat.enabled) return
+          if (!preheat.enabled || !preheat.hasText) return
           const loaded = warmState.states.has(modelId)
           const modelKey = `${key}\u0000${modelId}`
           const warmedRevision = lastWarmRevision.get(modelKey)
@@ -493,11 +500,12 @@ window.__ModuleLoader__.load({
                 failure = String(error?.message ?? error)
                 if (attempt === 0
                   && preheat.enabled
+                  && preheat.hasText
                   && preheat.selected.get(key) === modelId) {
                   // Provider discovery and the first model load can still be
                   // settling; retry once before reporting a warm failure.
                   await new Promise((resolve) => setTimeout(resolve, 800))
-                  if (!preheat.enabled || preheat.selected.get(key) !== modelId) break
+                  if (!preheat.enabled || !preheat.hasText || preheat.selected.get(key) !== modelId) break
                   continue
                 }
                 break
@@ -521,7 +529,7 @@ window.__ModuleLoader__.load({
         warmChain.set(key, job.catch(() => {}))
         trimWarmTracking()
         void job
-      }, [placement, selected, provider?.id, model?.id, sessionId, warmRevision, preheatEnabled])
+      }, [placement, selected, provider?.id, model?.id, sessionId, warmRevision, preheatEnabled, composerHasText])
 
       const name = model?.name ?? model?.id ?? ''
       const dotKind = !warmEnabled || placement !== 'option'
@@ -1098,6 +1106,25 @@ window.__ModuleLoader__.load({
     }
     const SEND_LABELS = new Set(['发送消息', 'Send message', '发送', 'Send'])
     const REPLY_LABELS = new Set(['仅回复', 'Reply Only'])
+    function findComposerEditor() {
+      if (preheat.editor?.isConnected === true) return preheat.editor
+      const button = findSendButton()
+      if (button === null) return null
+      let node = button.parentElement
+      for (let depth = 0; depth < 10 && node !== null; depth += 1) {
+        const editor = node.querySelector('[contenteditable="true"]') ?? node.querySelector('textarea')
+        if (editor !== null && editor.disabled !== true) {
+          preheat.editor = editor
+          return editor
+        }
+        node = node.parentElement
+      }
+      return null
+    }
+    function composerHasText(editor) {
+      const value = editor.isContentEditable === true ? editor.textContent : editor.value
+      return typeof value === 'string' && value.replace(/[\u200b-\u200d\ufeff]/gu, '').trim() !== ''
+    }
     function clearSendWarm() {
       if (sendWarm.timer !== null) {
         clearTimeout(sendWarm.timer)
@@ -1338,6 +1365,11 @@ window.__ModuleLoader__.load({
       enabled: false,
       ready: null,
       bootDelay: null,
+      hasText: false,
+      editor: null,
+      textFrame: null,
+      textObserver: null,
+      textObserverTarget: null,
       active: new Map(),
       selected: new Map(),
       listeners: new Set(),
@@ -1346,6 +1378,37 @@ window.__ModuleLoader__.load({
         return () => {
           preheat.listeners.delete(listener)
         }
+      },
+      setHasText(value) {
+        const next = value === true
+        if (preheat.hasText === next) return
+        preheat.hasText = next
+        for (const listener of preheat.listeners) listener()
+      },
+      observeComposer(editor) {
+        if (preheat.textObserver === null) {
+          preheat.textObserver = new MutationObserver(() => preheat.scheduleComposerProbe())
+        }
+        if (preheat.textObserverTarget === editor) return
+        preheat.textObserver.disconnect()
+        preheat.textObserver.observe(editor, { childList: true, subtree: true, characterData: true })
+        preheat.textObserverTarget = editor
+      },
+      probeComposerNow() {
+        const editor = findComposerEditor()
+        if (editor === null) {
+          preheat.setHasText(false)
+          return
+        }
+        preheat.observeComposer(editor)
+        preheat.setHasText(composerHasText(editor))
+      },
+      scheduleComposerProbe() {
+        if (preheat.textFrame !== null) return
+        preheat.textFrame = window.requestAnimationFrame(() => {
+          preheat.textFrame = null
+          preheat.probeComposerNow()
+        })
       },
       setSelected(sessionId, modelId) {
         const current = preheat.selected.get(sessionId)
@@ -1427,12 +1490,57 @@ window.__ModuleLoader__.load({
         try {
           const next = await readState()
           preheat.setEnabled(next?.mode === 'auto' && next?.warm === true)
+          preheat.scheduleComposerProbe()
           return
         } catch {
           if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 500))
         }
       }
     })()
+
+    /**
+     * Detect whether the composer holds text without polling it. Input,
+     * composition, focus, and composer mutations are coalesced into one rAF
+     * read, so typing cost stays O(one DOM read per frame), not per keystroke.
+     */
+    function installComposerTextProbe() {
+      if (typeof document === 'undefined') return () => {}
+      const inComposer = (target) => {
+        if (!(target instanceof Node)) return false
+        const editor = findComposerEditor()
+        return editor !== null && editor.contains(target)
+      }
+      const probe = (event) => {
+        if (inComposer(event.target)) preheat.scheduleComposerProbe()
+      }
+      const onClick = (event) => {
+        const target = event.target
+        if (!(target instanceof Element)) return
+        const button = target.closest('button[aria-label]')
+        if (button !== null && SEND_LABELS.has((button.getAttribute('aria-label') ?? '').trim())) {
+          preheat.scheduleComposerProbe()
+        }
+      }
+      document.addEventListener('input', probe, true)
+      document.addEventListener('compositionend', probe, true)
+      document.addEventListener('focusin', probe, true)
+      document.addEventListener('click', onClick, true)
+      preheat.scheduleComposerProbe()
+      return () => {
+        document.removeEventListener('input', probe, true)
+        document.removeEventListener('compositionend', probe, true)
+        document.removeEventListener('focusin', probe, true)
+        document.removeEventListener('click', onClick, true)
+        if (preheat.textFrame !== null) {
+          window.cancelAnimationFrame(preheat.textFrame)
+          preheat.textFrame = null
+        }
+        preheat.textObserver?.disconnect()
+        preheat.textObserver = null
+        preheat.textObserverTarget = null
+        preheat.editor = null
+      }
+    }
 
     function Field({ label, hint, children }) {
       return h('div', { style: S.field }, [
@@ -2111,6 +2219,7 @@ window.__ModuleLoader__.load({
         }
 
         ctx.effect(() => installMtpSendGuard(t), 'qwen-mode: VLM MTP send guard')
+        ctx.effect(() => installComposerTextProbe(), 'qwen-mode: composer text')
 
         ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section',
