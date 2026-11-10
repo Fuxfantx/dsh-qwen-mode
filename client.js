@@ -189,6 +189,7 @@ window.__ModuleLoader__.load({
     const warmState = {
       states: new Map(),
       warming: new Map(),
+      remoteWarming: new Set(),
       enabled: false,
       revision: 0,
       listeners: new Set(),
@@ -201,10 +202,12 @@ window.__ModuleLoader__.load({
         try {
           const status = await call('modelStatus', undefined, { signal: AbortSignal.timeout(3000) })
           warmState.states = new Map(Object.entries(status?.states ?? {}))
+          warmState.remoteWarming = new Set(Array.isArray(status?.warming) ? status.warming : [])
           warmState.enabled = status?.active === true
           warmState.revision = Number.isSafeInteger(status?.revision) ? status.revision : 0
         } catch {
           warmState.states = new Map()
+          warmState.remoteWarming = new Set()
           warmState.enabled = false
         }
         warmState.refreshing = false
@@ -367,7 +370,7 @@ window.__ModuleLoader__.load({
           setWarmEnabled((current) => current === warmState.enabled ? current : warmState.enabled)
           setWarmRevision((current) => current === warmState.revision ? current : warmState.revision)
           if (placement === 'option' && provider?.id === 'from-geniex' && typeof model?.id === 'string') {
-            const next = warmState.warming.has(model.id)
+            const next = warmState.warming.has(model.id) || warmState.remoteWarming.has(model.id)
               ? 'loading'
               : warmState.states.get(model.id) ?? ''
             setResidentState((current) => current === next ? current : next)

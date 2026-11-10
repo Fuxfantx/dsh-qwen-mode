@@ -1483,12 +1483,12 @@ export async function apply(ctx) {
   const statusCache = { key: '', at: 0, value: null }
   const readGeniexStatus = async () => {
     const active = settings.mode === 'auto' && settings.protocol === 'geniex' && settings.warm === true
-    if (!active) return { active: false, models: [], revision: modelRevision }
+    if (!active) return { active: false, models: [], warming: [], revision: modelRevision }
     const key = settings.upstream
     if (statusCache.key === key && Date.now() - statusCache.at < 1500) {
-      return { ...statusCache.value, revision: modelRevision }
+      return { ...statusCache.value, warming: [...warmingModels], revision: modelRevision }
     }
-    let value = { active: true, models: [] }
+    let value = { active: true, models: [], warming: [] }
     try {
       const url = new URL(settings.upstream)
       url.pathname = '/status'
@@ -1506,11 +1506,13 @@ export async function apply(ctx) {
           active: true,
           models: models.map((model) => model.id),
           states: Object.fromEntries(models.map((model) => [model.id, model.state])),
+          warming: [...warmingModels],
         }
       }
     } catch {
       // A missing status endpoint means the client cannot classify warm models.
     }
+    value.warming = [...warmingModels]
     value.revision = modelRevision
     statusCache.key = key
     statusCache.at = Date.now()
@@ -1519,6 +1521,7 @@ export async function apply(ctx) {
   }
 
   let warmQueue = Promise.resolve()
+  const warmingModels = new Set()
   const api = {
     state: () => state(),
     modelStatus: readGeniexStatus,
@@ -1639,18 +1642,23 @@ export async function apply(ctx) {
         if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
         const model = text(payload?.model)
         if (model === '' || !managedModels.has(model)) throw httpError(400, 'unknown managed model')
-        if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
-        const result = await warmUpModel(
-          ctx,
-          settings,
-          model,
-          visionModels.has(model),
-          modelLoadContext(model),
-          useMtp(model),
-          mtpFileFor(model),
-        )
+        warmingModels.add(model)
         statusCache.at = 0
-        return { warmed: true, model, ...result }
+        try {
+          const result = await warmUpModel(
+            ctx,
+            settings,
+            model,
+            visionModels.has(model),
+            modelLoadContext(model),
+            useMtp(model),
+            mtpFileFor(model),
+          )
+          return { warmed: true, model, ...result }
+        } finally {
+          warmingModels.delete(model)
+          statusCache.at = 0
+        }
       }
       const result = warmQueue.then(operation, operation)
       warmQueue = result.catch(() => {})
