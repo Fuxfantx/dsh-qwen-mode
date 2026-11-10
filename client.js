@@ -423,7 +423,9 @@ window.__ModuleLoader__.load({
       const [preheatEnabled, setPreheatEnabled] = React.useState(preheat.enabled)
       const [residentState, setResidentState] = React.useState('')
       const [warmRevision, setWarmRevision] = React.useState(warmState.revision)
-      const [modelMeta, setModelMeta] = React.useState(null)
+      const [modelMetaEntry, setModelMetaEntry] = React.useState(null)
+      const modelMetaKey = `${provider?.id ?? ''}\u0000${model?.id ?? ''}`
+      const modelMeta = modelMetaEntry?.key === modelMetaKey ? modelMetaEntry.meta : null
       React.useEffect(() => preheat.subscribe(() => setPreheatEnabled(preheat.enabled)), [])
       React.useEffect(() => {
         const update = () => {
@@ -442,8 +444,9 @@ window.__ModuleLoader__.load({
       }, [placement, provider?.id, model?.id])
       React.useEffect(() => {
         if (provider?.id !== 'from-geniex' || typeof model?.id !== 'string') return undefined
+        const key = `${provider.id}\u0000${model.id}`
         return modelMetaState.subscribe(() => {
-          setModelMeta(modelMetaState.models.get(model.id) ?? null)
+          setModelMetaEntry({ key, meta: modelMetaState.models.get(model.id) ?? null })
         })
       }, [provider?.id, model?.id])
       React.useEffect(() => {
