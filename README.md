@@ -47,7 +47,7 @@
 - **API Key**：填写保存 Key 的**环境变量名或 DSH 凭据名**（如 `DASHSCOPE_API_KEY`），不是 Key 本身；GenieX 不校验，留空即可。
 - **预热**：选中 GenieX 模型时提前加载权重。圆点状态：黄色预热中、绿色已驻留、红色未驻留、蓝色其它 Provider。
 - **采样默认值**：可手动填写，也可用「读取推荐值」填入模型推荐参数；之后仍需保存。数值会按上游合法范围校验/收敛。`min_p` 仅对 GenieX 生效。
-- **MTP**：仅对支持的 GenieX 模型生效。GGUF 模型需要模型主体包含 mtp / nextn 张量，并在模型目录注入 `mtp-*.gguf`；请求会以该文件的绝对路径作为草稿模型（等价于 `--draft-model C:\my\mtp-model.gguf`）。QAIRT 模型使用名称配对的 assistant 草稿模型（会从聊天目录隐藏）。图片模型启用 MTP 时，发送图片会要求选择直接发送或关闭本次 MTP。
+- **MTP**：仅对支持的 GenieX 模型生效。GGUF 模型需要模型主体包含 mtp / nextn 张量，并在模型目录注入 `mtp-*.gguf`；请求会以该文件的绝对路径作为草稿模型（等价于 `--draft-model C:\my\mtp-model.gguf`），并下发 `spec_n_max` / `spec_n_min` / `spec_p_min`。QAIRT 模型使用名称配对的 assistant 草稿模型（会从聊天目录隐藏），只下发 `spec_type` 与 `spec_draft_model`，不下发上述三个 llama.cpp 专用参数。图片模型启用 MTP 时，发送图片会要求选择直接发送或关闭本次 MTP。
 - **推理后端**：GenieX 可设置 Compute 与 Vision Encoder；留空使用上游默认值。
 - **模型高亮**：破限 / 无审查模型使用明亮橙黄色名称。
 - **会话用量**：含 From GenieX 回复的会话只显示累计 token；点击后显示输入与输出。
@@ -61,6 +61,7 @@
 - MTP 与图片同时使用时，图片可能不被上游处理，发送前会要求选择。
 - 模型目录来自上游模型列表；上游不可用时不会创建模型。QwenCloud 的模型目录来自 `/api/v1/models`，若网关只提供标准 `/models` 会自动回退。
 - 预热、MTP、GGUF 元数据和推理后端仅适用于 GenieX 来源；QwenCloud 来源保留 Provider 管理、采样、思考参数、统计和仅回复。
+- 预热与随后的请求复用同一份加载参数（上下文/nctx、Compute、Vision Encoder、MTP 草稿）；参数不一致时 GenieX 会卸载并重新加载模型。更改这些设置、关闭本次 MTP 或选择其它模型都会触发重新加载；GenieX 的 keepalive 到期也会卸载空闲模型。
 - 上游不可达时插件仍会启动（设置页可用），Provider 刷新会在后台重试并显示错误。
 
 
@@ -109,7 +110,7 @@ Connect DSH to Qwen, GenieX, and QwenCloud. Qwen Mode maintains the provider aut
 - **API key**: enter the **environment variable or DSH credential name** that stores the key (for example `DASHSCOPE_API_KEY`), not the key itself; GenieX ignores it.
 - **Warmup**: loads GenieX model weights when selected. Dots: yellow warming, green resident, red not resident, blue another provider.
 - **Sampling defaults**: enter values manually, or use **Read recommended** and then save. Values are validated/clamped to the upstream's accepted ranges. `min_p` applies to GenieX only.
-- **MTP**: available only on supported GenieX models. A GGUF model needs mtp / nextn tensors in the weights plus an injected `mtp-*.gguf` in the model directory; the request names that file's absolute path as the draft (equivalent to `--draft-model C:\my\mtp-model.gguf`). A QAIRT model uses a name-paired assistant draft, which is hidden from the chat catalog. With an image model, an image send asks whether to send directly or disable MTP for that send.
+- **MTP**: available only on supported GenieX models. A GGUF model needs mtp / nextn tensors in the weights plus an injected `mtp-*.gguf` in the model directory; the request names that file's absolute path as the draft (equivalent to `--draft-model C:\my\mtp-model.gguf`) and sends `spec_n_max` / `spec_n_min` / `spec_p_min`. A QAIRT model uses a name-paired assistant draft, which is hidden from the chat catalog, and receives only `spec_type` and `spec_draft_model` — never those three llama.cpp-only knobs. With an image model, an image send asks whether to send directly or disable MTP for that send.
 - **Inference backend**: GenieX Compute and Vision Encoder; empty uses upstream defaults.
 - **Model highlight**: abliterated / uncensored models use a bright orange-yellow name.
 - **Session usage**: sessions containing From GenieX replies show cumulative tokens only; click to see input and output.
@@ -123,6 +124,7 @@ Connect DSH to Qwen, GenieX, and QwenCloud. Qwen Mode maintains the provider aut
 - MTP with images may prevent the upstream from processing the image; the send flow asks first.
 - Model catalogs come from the upstream model list; no catalog means no models. QwenCloud uses `/api/v1/models` and falls back to the standard `/models` endpoint.
 - Warmup, MTP, GGUF metadata, and inference backends are GenieX-only; QwenCloud keeps provider management, sampling, thinking parameters, stats, and Reply Only.
+- Warmup and the request that follows it reuse the same load parameters (context/nctx, Compute, Vision Encoder, MTP draft); GenieX unloads and reloads the model when they differ. Changing those settings, disabling MTP for one send, or selecting another model reloads it, and GenieX's keepalive unloads an idle model.
 - An unreachable upstream no longer blocks activation: the settings page stays available, discovery retries in the background, and the failure is shown as an error.
 
 ---

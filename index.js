@@ -223,16 +223,27 @@ function inferenceFields(settings, vision) {
   return fields
 }
 
-function loadFields(settings, context, mtp, mtpDraft) {
+/**
+ * GenieX model-load fields.
+ *
+ * GenieX keeps a single loaded model and keys its cache on exactly these
+ * values, so the warm-up and the following request must be produced by this
+ * one function; any difference destroys the warmed model on the first send.
+ */
+function loadFields(settings, options) {
   const fields = {}
   if (settings.protocol !== 'geniex') return fields
-  if (typeof context === 'number' && context > 0) fields.nctx = context
-  if (mtp === true && mtpDraft !== '') {
+  if (typeof options.context === 'number' && options.context > 0) fields.nctx = options.context
+  if (options.mtp === true && options.mtpDraft !== '') {
     fields.spec_type = MTP_SPEC_TYPE
-    fields.spec_draft_model = mtpDraft
-    fields.spec_n_max = settings.mtpDraftTokens
-    fields.spec_n_min = settings.mtpDraftMin
-    fields.spec_p_min = settings.mtpDraftPMin
+    fields.spec_draft_model = options.mtpDraft
+    // n_max / n_min / p_min are llama.cpp draft knobs. A QAIRT model takes
+    // only the draft model name and must not receive them.
+    if (options.qairt !== true) {
+      fields.spec_n_max = settings.mtpDraftTokens
+      fields.spec_n_min = settings.mtpDraftMin
+      fields.spec_p_min = settings.mtpDraftPMin
+    }
   }
   return fields
 }
@@ -284,7 +295,7 @@ function applyRequestDefaults(body, settings, options) {
     else delete output.reasoning_effort
     output.reasoning_format = 'auto'
     Object.assign(output, inferenceFields(settings, options.vision))
-    Object.assign(output, loadFields(settings, options.context, options.mtp, options.mtpDraft))
+    Object.assign(output, loadFields(settings, options))
   }
   // Both protocols share one window between prompt and completion.
   if (typeof options.context === 'number' && options.context > 0) {
@@ -802,6 +813,22 @@ function modelLoadContext(model) {
   return effectiveContext(runtime.settings, runtime.modelContexts.get(model) ?? null)
 }
 
+/**
+ * The load parameters shared by warmup and requests. Keeping one producer is
+ * what prevents a warmup from being thrown away by a mismatched first request.
+ * @param model - managed model id.
+ * @param mtp - the MTP decision for this request (defaults to the text path).
+ */
+function loadOptions(model, mtp = useMtp(model)) {
+  return {
+    vision: runtime.visionModels.has(model),
+    qairt: runtime.modelCapabilities.get(model)?.runtime === 'qairt',
+    context: modelLoadContext(model),
+    mtp,
+    mtpDraft: mtpDraftFor(model),
+  }
+}
+
 /** The thinking capability of one managed model: true, false, or undefined. */
 function modelReasoning(model) {
   const value = runtime.modelCapabilities.get(model)?.reasoningEfforts
@@ -1020,12 +1047,9 @@ function handleProxyRequest(req, res) {
             : useMtp(model)
           mtpActive = mtp
           body = Buffer.from(JSON.stringify(applyRequestDefaults(parsed, settings, {
+            ...loadOptions(model, mtp),
             thinking,
             reasoning,
-            vision,
-            context: modelLoadContext(model),
-            mtp,
-            mtpDraft: mtpDraftFor(model),
           })), 'utf8')
           consumeMtpChoice(model)
         }
@@ -1131,8 +1155,12 @@ async function warmUpModel(ctx, settings, model, options) {
     stream: false,
     enable_think: false,
     reasoning_format: 'auto',
+    // GenieX raises NCtx to max_completion_tokens for llama.cpp. Without an
+    // explicit value the server default (2048) can beat a small nctx and make
+    // the warm-up cache key differ from the following request's.
+    max_completion_tokens: 1,
     ...inferenceFields(settings, options.vision),
-    ...loadFields(settings, options.context, options.mtp, options.mtpDraft),
+    ...loadFields(settings, options),
   }
   const startedAt = Date.now()
   const response = await fetch(url, {
@@ -1365,12 +1393,7 @@ function createApi(ctx) {
         runtime.warmingModels.add(model)
         runtime.statusCache.at = 0
         try {
-          const result = await warmUpModel(ctx, settings, model, {
-            vision: runtime.visionModels.has(model),
-            context: modelLoadContext(model),
-            mtp: useMtp(model),
-            mtpDraft: mtpDraftFor(model),
-          })
+          const result = await warmUpModel(ctx, settings, model, loadOptions(model))
           return { warmed: true, model, ...result }
         } finally {
           runtime.warmingModels.delete(model)

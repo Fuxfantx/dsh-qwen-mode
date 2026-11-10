@@ -472,19 +472,55 @@ try {
     stream: false,
   })
   const qairtBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
-  check('QAIRT MTP names the paired assistant model', () => {
+  check('QAIRT MTP names the paired assistant model without llama.cpp knobs', () => {
     assert.equal(qairtBody.spec_type, 'draft-mtp')
     assert.equal(qairtBody.spec_draft_model, 'qnn/qwen3-8b-assistant')
+    assert.equal(qairtBody.spec_n_max, undefined)
+    assert.equal(qairtBody.spec_n_min, undefined)
+    assert.equal(qairtBody.spec_p_min, undefined)
+  })
+  const loadFieldsOf = (body) => ({
+    nctx: body.nctx,
+    compute: body.compute,
+    vit_compute: body.vit_compute,
+    spec_type: body.spec_type,
+    spec_draft_model: body.spec_draft_model,
+    spec_n_max: body.spec_n_max,
+    spec_n_min: body.spec_n_min,
+    spec_p_min: body.spec_p_min,
+  })
+  await callApi(ctx, 'warm', { model: 'qnn/qwen3-8b' })
+  const qairtWarmBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
+  await callProxy(port, {
+    model: 'qnn/qwen3-8b',
+    messages: [{ role: 'user', content: 'qairt after warm' }],
+    stream: false,
+  })
+  const qairtChatBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
+  check('QAIRT warmup and the following request share load parameters', () => {
+    assert.deepEqual(loadFieldsOf(qairtWarmBody), loadFieldsOf(qairtChatBody))
+    assert.equal(qairtWarmBody.spec_n_max, undefined)
   })
 
   const warm = (await callApi(ctx, 'warm', { model: 'org/qwen3.8-27b:Q4_0' })).body
+  const ggufWarmBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
   check('warmup uses the native GenieX warm-up shape', () => {
     assert.equal(warm.ok, true, JSON.stringify(warm))
     assert.equal(warm.value.warmed, true)
-    const body = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
-    assert.equal(body.messages.length, 1)
-    assert.equal(body.messages[0].role, 'system')
-    assert.equal(body.enable_think, false)
+    assert.equal(ggufWarmBody.messages.length, 1)
+    assert.equal(ggufWarmBody.messages[0].role, 'system')
+    assert.equal(ggufWarmBody.enable_think, false)
+    assert.equal(ggufWarmBody.max_completion_tokens, 1)
+  })
+  await callProxy(port, {
+    model: 'org/qwen3.8-27b:Q4_0',
+    messages: [{ role: 'user', content: 'after warm' }],
+    stream: false,
+  })
+  const ggufChatBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
+  check('GGUF warmup and the following request share load parameters', () => {
+    assert.deepEqual(loadFieldsOf(ggufWarmBody), loadFieldsOf(ggufChatBody))
+    assert.equal(ggufWarmBody.spec_n_max, 3)
   })
 
   const status = (await callApi(ctx, 'modelStatus')).body.value
