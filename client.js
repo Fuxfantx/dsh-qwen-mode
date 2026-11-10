@@ -64,7 +64,8 @@ window.__ModuleLoader__.load({
       'compute.label': 'Compute',
       'compute.hint': '留空则使用 GenieX 默认值。',
       'vit.label': 'Vision Encoder',
-      'vit.hint': '仅对 VLM 生效；NPU 映射为 GenieX 的 HTP2。',
+      'vit.hint': '仅对 VLM 生效；留空则使用 GenieX 默认值。',
+      'vit.default': '默认',
       'vit.cpu': 'CPU',
       'vit.gpu': 'GPU',
       'vit.npu': 'NPU',
@@ -75,7 +76,7 @@ window.__ModuleLoader__.load({
       'autoNctx.sublabel': '( GGUF context_length )',
       'maxOutputTokens.label': '最大输出长度',
       'mtp.label': 'MTP 投机解码',
-      'mtp.hint': 'GGUF 模型需内含 mtp / nextn 张量，并在模型目录注入 mtp-*.gguf；QAIRT 模型使用配对 assistant 草稿模型，且不下发 n_max / n_min / p_min。MTP 启用时暂不支持添加图片。',
+      'mtp.hint': '仅对自带 MTP 张量的 GGUF 模型生效，需在模型目录放入匹配的 mtp-*.gguf 草稿文件。启用 MTP 时发送图片会改用纯文本路径。',
       'mtp.tokens': 'spec_n_max',
       'mtp.min': 'spec_n_min',
       'mtp.pmin': 'spec_p_min',
@@ -147,7 +148,8 @@ window.__ModuleLoader__.load({
       'compute.label': 'Compute',
       'compute.hint': 'Empty uses the GenieX default.',
       'vit.label': 'Vision Encoder',
-      'vit.hint': 'Applies to VLM models only; NPU maps to GenieX HTP2.',
+      'vit.hint': 'Applies to VLM models only; empty uses the GenieX default.',
+      'vit.default': 'Default',
       'vit.cpu': 'CPU',
       'vit.gpu': 'GPU',
       'vit.npu': 'NPU',
@@ -158,7 +160,7 @@ window.__ModuleLoader__.load({
       'autoNctx.sublabel': '( GGUF context_length )',
       'maxOutputTokens.label': 'Max output tokens',
       'mtp.label': 'MTP speculative decoding',
-      'mtp.hint': 'GGUF models need mtp / nextn tensors plus an injected mtp-*.gguf in the model directory; QAIRT models use a paired assistant draft model and are sent no n_max / n_min / p_min. Images are not supported while MTP is enabled.',
+      'mtp.hint': 'Available for GGUF models that ship MTP tensors, with a matching mtp-*.gguf draft file in the model directory. While MTP is enabled, image sends switch to the text-only path.',
       'mtp.tokens': 'spec_n_max',
       'mtp.min': 'spec_n_min',
       'mtp.pmin': 'spec_p_min',
@@ -247,6 +249,7 @@ window.__ModuleLoader__.load({
       warming: new Map(),
       remoteWarming: new Set(),
       enabled: false,
+      failures: 0,
       revision: 0,
       listeners: new Set(),
       timer: null,
@@ -271,15 +274,20 @@ window.__ModuleLoader__.load({
           warmState.states = new Map(Object.entries(status?.states ?? {}))
           warmState.remoteWarming = new Set(Array.isArray(status?.warming) ? status.warming : [])
           warmState.enabled = status?.active === true
+          warmState.failures = 0
           warmState.revision = Number.isSafeInteger(status?.revision) ? status.revision : 0
         } catch {
-          warmState.states = new Map()
-          warmState.remoteWarming = new Set()
-          warmState.enabled = false
+          // A transient status failure must not repaint every model as cold or
+          // stop polling while warmup is still configured.
+          warmState.failures += 1
+          if (warmState.failures >= 3) {
+            warmState.states = new Map()
+            warmState.remoteWarming = new Set()
+            warmState.enabled = false
+          }
         }
         warmState.refreshing = false
-        // Warming state changes rarely; only poll while warmup is enabled.
-        if (warmState.enabled) warmState.startPolling()
+        if (warmState.enabled || preheat.enabled) warmState.startPolling()
         else warmState.stopPolling()
         for (const listener of warmState.listeners) {
           try {
@@ -332,7 +340,7 @@ window.__ModuleLoader__.load({
         modelMetaState.subscribers += 1
         if (modelMetaState.subscribers === 1) {
           void modelMetaState.refresh()
-          modelMetaState.timer = window.setInterval(() => void modelMetaState.refresh(), 8000)
+          modelMetaState.timer = window.setInterval(() => void modelMetaState.refresh(), 12000)
         }
         listener()
         return () => {
@@ -699,12 +707,12 @@ window.__ModuleLoader__.load({
         : (usage.uncachedInputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
       const output = usage?.outputTokens ?? 0
       const total = input + output
-      const signature = `${usage?.uncachedInputTokens ?? 0}:${usage?.cacheReadTokens ?? 0}:${usage?.cacheWriteTokens ?? 0}:${output}`
+      const totalRef = React.useRef(total)
+      totalRef.current = total
 
       React.useEffect(() => {
         if (typeof sessionId !== 'string' || sessionId === '') return undefined
-        const cached = sessionProviderCache.get(sessionId) === true
-        if (cached) {
+        if (sessionProviderCache.get(sessionId) === true) {
           setProviderState((current) => current.sessionId === sessionId && current.geniex
             ? current
             : { sessionId, geniex: true })
@@ -712,33 +720,39 @@ window.__ModuleLoader__.load({
         }
         let cancelled = false
         let timer = null
-        let attempt = 0
-        const check = async () => {
+        let checks = 0
+        // A session may not contain a From GenieX reply until a turn finishes,
+        // so poll briefly instead of re-probing on every streamed token.
+        const tick = async () => {
+          if (cancelled || checks >= 12 || totalRef.current <= 0) return
+          checks += 1
           try {
             const value = await call('sessionProvider', { sessionId }, { signal: AbortSignal.timeout(3000) })
             if (cancelled) return
-            const geniex = value?.geniex === true
-            if (geniex) sessionProviderCache.set(sessionId, true)
-            if (sessionProviderCache.size > 500) sessionProviderCache.delete(sessionProviderCache.keys().next().value)
-            setProviderState((current) => current.sessionId === sessionId && current.geniex === geniex
-              ? current
-              : { sessionId, geniex })
-            if (!geniex && value?.pending === true && attempt < 8) {
-              attempt += 1
-              timer = setTimeout(() => void check(), 300 * attempt)
+            if (value?.geniex === true) {
+              sessionProviderCache.set(sessionId, true)
+              while (sessionProviderCache.size > 500) sessionProviderCache.delete(sessionProviderCache.keys().next().value)
+              setProviderState((current) => current.sessionId === sessionId && current.geniex
+                ? current
+                : { sessionId, geniex: true })
+              if (timer !== null) clearInterval(timer)
+              timer = null
             }
           } catch {
-            if (cancelled || attempt >= 2) return
-            attempt += 1
-            timer = setTimeout(() => void check(), 500 * attempt)
+            // Transient status failures are retried by the next tick.
+          }
+          if (checks >= 12 && timer !== null) {
+            clearInterval(timer)
+            timer = null
           }
         }
-        void check()
+        void tick()
+        timer = setInterval(() => void tick(), 5000)
         return () => {
           cancelled = true
-          if (timer !== null) clearTimeout(timer)
+          if (timer !== null) clearInterval(timer)
         }
-      }, [sessionId, signature])
+      }, [sessionId])
 
       React.useEffect(() => {
         if (!open) return undefined
@@ -852,24 +866,15 @@ window.__ModuleLoader__.load({
       return null
     }
 
-    /** Remove icon artifacts left by earlier versions. */
-    function cleanupReplyIconArtifacts() {
-      if (typeof document === 'undefined') return
-      document.getElementById('qwen-reply-only-icon')?.remove()
-      for (const element of document.querySelectorAll('[data-qwen-reply-icon]')) {
-        if (element.tagName === 'SPAN' && element.querySelector('svg') !== null) element.remove()
-        else element.removeAttribute('data-qwen-reply-icon')
-      }
-    }
-
     /**
      * The permission picker only owns SVGs for shipped preset values. Add the
      * same 14px currentColor outline icon for the custom reply-only label in the
-     * trigger, popup menu, and settings select.
+     * trigger and popup menu.
      */
     function installReplyOnlyIcon() {
       if (typeof document === 'undefined') return () => {}
-      cleanupReplyIconArtifacts()
+      // Drop icons a previous mount left behind before decorating again.
+      for (const element of document.querySelectorAll('[data-qwen-reply-icon]')) element.remove()
       let alignStyle = document.getElementById('qwen-permission-align')
       if (alignStyle === null) {
         alignStyle = document.createElement('style')
@@ -956,19 +961,28 @@ window.__ModuleLoader__.load({
         }
       }
       let scheduled = false
+      let timer = null
       const schedule = () => {
         if (scheduled) return
         scheduled = true
-        requestAnimationFrame(() => {
+        // Streaming messages mutate the DOM continuously; a short debounce
+        // keeps the presets decorated without rescanning on every frame.
+        timer = window.setTimeout(() => {
           scheduled = false
+          timer = null
           scan()
-        })
+        }, 150)
       }
       const observer = new MutationObserver(schedule)
       if (document.body === null) return () => observer.disconnect()
       observer.observe(document.body, { childList: true, subtree: true })
       scan()
-      return () => observer.disconnect()
+      return () => {
+        observer.disconnect()
+        if (timer !== null) window.clearTimeout(timer)
+        for (const icon of document.querySelectorAll('[data-qwen-reply-icon]')) icon.remove()
+        alignStyle?.remove()
+      }
     }
 
     const S = {
@@ -1073,7 +1087,7 @@ window.__ModuleLoader__.load({
     /** Force a choice before a VLM image send that would otherwise ignore the images under MTP. */
     function installMtpSendGuard(t) {
       if (typeof document === 'undefined') return () => {}
-      const panel = { node: null, busy: false }
+      const panel = { node: null, busy: false, openedAt: 0 }
       const imageSelectors = ['[data-attachment-kind="image"]', '[class*="rail"] img', '[class*="attachment"] img', '[class*="imagePreview"]', '[class*="image-preview"]']
       const composerHasImages = (button) => {
         let node = button.parentElement
@@ -1163,12 +1177,27 @@ window.__ModuleLoader__.load({
         node.append(title, body, option(t('mtp.direct'), t('mtp.directHint'), '', true), option(t('mtp.disable'), '', t('mtp.disableHint'), false), cancel)
         document.body.appendChild(node)
         panel.node = node
+        panel.openedAt = Date.now()
       }
 
       let mtpGuardBypass = false
       const onClick = (event) => {
         const button = findSendButton()
-        if (button === null || !(event.target instanceof Node) || !button.contains(event.target)) return
+        const isSend = button !== null && event.target instanceof Node && button.contains(event.target)
+        if (panel.node !== null && event.target instanceof Node && !panel.node.contains(event.target)) {
+          if (isSend) {
+            // Keep the choice panel open instead of letting a second send
+            // bypass the image/MTP decision.
+            event.preventDefault()
+            event.stopImmediatePropagation()
+            return
+          }
+          if (Date.now() - panel.openedAt > 250) {
+            close()
+            return
+          }
+        }
+        if (!isSend) return
         if (mtpGuardBypass) {
           mtpGuardBypass = false
           return
@@ -1277,6 +1306,9 @@ window.__ModuleLoader__.load({
       setSelected(sessionId, modelId) {
         if (modelId === null) preheat.selected.delete(sessionId)
         else preheat.selected.set(sessionId, modelId)
+        while (preheat.selected.size > WARM_TRACKING_LIMIT) {
+          preheat.selected.delete(preheat.selected.keys().next().value)
+        }
         for (const listener of preheat.listeners) listener()
       },
       setEnabled(value) {
@@ -1423,7 +1455,7 @@ window.__ModuleLoader__.load({
       const syncFollow = React.useRef(0)
       const followPendingSync = React.useCallback(async () => {
         const token = ++syncFollow.current
-        for (let attempt = 0; attempt < 120; attempt += 1) {
+        for (let attempt = 0; attempt < 360; attempt += 1) {
           await new Promise((resolve) => setTimeout(resolve, 500))
           if (syncFollow.current !== token) return
           let next
@@ -1600,7 +1632,7 @@ window.__ModuleLoader__.load({
             autoNctx: settings.autoNctx === true,
             mtp: settings.mtp === true,
             compute: String(settings.compute ?? '').trim(),
-            vitCompute: settings.vitCompute ?? 'npu',
+            vitCompute: settings.vitCompute ?? '',
           })
         }
         void action('save', () => call('save', payload, { signal: AbortSignal.timeout(30000) }))
@@ -1889,12 +1921,12 @@ window.__ModuleLoader__.load({
                 })),
                 h(Field, { key: 'vit', label: t('vit.label'), hint: t('vit.hint') }, h('div',
                   { style: S.segments },
-                  ['cpu', 'gpu', 'npu'].map((value) => h('button', {
-                    key: value,
+                  ['', 'cpu', 'gpu', 'npu'].map((value) => h('button', {
+                    key: value === '' ? 'default' : value,
                     type: 'button',
-                    style: settings.vitCompute === value ? S.segmentActive : S.segment,
+                    style: (settings.vitCompute ?? '') === value ? S.segmentActive : S.segment,
                     onClick: () => update('vitCompute', value),
-                  }, t(`vit.${value}`))))),
+                  }, t(value === '' ? 'vit.default' : `vit.${value}`))))),
               ]),
               h('label', { key: 'mtp', style: S.checkRow }, [
                 h('input', {
