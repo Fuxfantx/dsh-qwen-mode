@@ -147,7 +147,7 @@ window.__ModuleLoader__.load({
       'compute.label': 'Compute',
       'compute.placeholder': 'Determined by GenieX',
       'vit.label': 'Vision Encoder',
-      'vit.default': 'Determined by GenieX',
+      'vit.default': 'Default',
       'vit.cpu': 'CPU',
       'vit.gpu': 'GPU',
       'vit.npu': 'NPU',
