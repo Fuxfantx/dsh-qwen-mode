@@ -1040,6 +1040,8 @@ window.__ModuleLoader__.load({
 
     function QwenModePage(props) {
       const t = typeof props.t === 'function' ? props.t : (key) => key
+      const tRef = React.useRef(t)
+      tRef.current = t
       const [settings, setSettings] = React.useState(null)
       const [modelInfo, setModelInfo] = React.useState(null)
       const [samplingModel, setSamplingModel] = React.useState('')
@@ -1073,8 +1075,8 @@ window.__ModuleLoader__.load({
             if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 400))
           }
         }
-        setError(format(t('loadFailed'), { message: String(lastError?.message ?? lastError) }))
-      }, [t, refreshModelInfo])
+        setError(format(tRef.current('loadFailed'), { message: String(lastError?.message ?? lastError) }))
+      }, [refreshModelInfo])
 
       React.useEffect(() => {
         void load()
