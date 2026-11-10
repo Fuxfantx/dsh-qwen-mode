@@ -64,7 +64,8 @@ window.__ModuleLoader__.load({
       'limits.invalid': '最大输出长度不能大于上下文窗口。',
       'contextWindow.label': '上下文窗口',
       'contextWindow.geniexPlaceholder': 'GENIEX_NCTX（default 4096）',
-      'autoNctx.label': '优先使用模型上下文阈限（GGUF context_length）',
+      'autoNctx.label': '优先使用模型上下文阈限',
+      'autoNctx.sublabel': '（GGUF context_length）',
       'maxOutputTokens.label': '最大输出长度',
       'mtp.label': 'MTP 投机解码',
       'mtp.hint': '仅对内含 mtp / nextn 张量、目录下存在 mtp-*.gguf 文件的 GGUF 模型生效；MTP 启用时暂不支持添加图片。',
@@ -144,7 +145,8 @@ window.__ModuleLoader__.load({
       'limits.invalid': 'Max output tokens cannot exceed the context window.',
       'contextWindow.label': 'Context window',
       'contextWindow.geniexPlaceholder': 'GENIEX_NCTX (default 4096)',
-      'autoNctx.label': 'Prefer model context limit (GGUF context_length)',
+      'autoNctx.label': 'Prefer model context limit',
+      'autoNctx.sublabel': '(GGUF context_length)',
       'maxOutputTokens.label': 'Max output tokens',
       'mtp.label': 'MTP speculative decoding',
       'mtp.hint': 'Applies only to GGUF models containing mtp / nextn tensors and an mtp-*.gguf file in the model directory; images are not supported while MTP is enabled.',
@@ -1221,6 +1223,34 @@ window.__ModuleLoader__.load({
       ])
     }
 
+    class QwenModeBoundary extends React.Component {
+      constructor(props) {
+        super(props)
+        this.state = { error: null }
+      }
+
+      static getDerivedStateFromError(error) {
+        return { error }
+      }
+
+      componentDidCatch(error, info) {
+        void call('clientError', {
+          message: String(error?.message ?? error),
+          stack: String(error?.stack ?? info?.componentStack ?? ''),
+        }).catch(() => {})
+      }
+
+      render() {
+        if (this.state.error === null) return this.props.children
+        return h('div', { style: S.root }, h('div', { style: S.page },
+          h('div', { style: S.banner }, `Qwen mode settings error: ${String(this.state.error?.message ?? this.state.error)}`)))
+      }
+    }
+
+    function QwenModePageSafe(props) {
+      return h(QwenModeBoundary, null, h(QwenModePage, props))
+    }
+
     function QwenModePage(props) {
       const t = typeof props.t === 'function' ? props.t : (key) => key
       const tRef = React.useRef(t)
@@ -1529,21 +1559,42 @@ window.__ModuleLoader__.load({
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
             ]),
-            settings.protocol === 'geniex' ? h('label', { key: 'auto-nctx', style: S.checkRow }, [
-              h('input', {
-                key: 'checkbox',
-                type: 'checkbox',
-                checked: settings.autoNctx === true,
-                onChange: (event) => update('autoNctx', event.target.checked),
-              }),
-              h('span', { key: 'label' }, t('autoNctx.label')),
-            ]) : null,
             h('div', {
-              key: 'compaction-metrics',
-              style: { display: 'flex', gap: '18px', flexWrap: 'wrap', color: 'var(--dsw-alias-label-secondary)', fontSize: '11px' },
+              key: 'auto-row',
+              style: { display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '16px', flexWrap: 'wrap' },
             }, [
-              h('span', { key: 'threshold' }, `${t('compaction.dsh')}: ${formatTokens(compactionThreshold)}`),
-              h('span', { key: 'gate' }, `${t('compaction.gate')}: ${formatTokens(recommendedGate)}`),
+              settings.protocol === 'geniex' ? h('label', { key: 'auto-nctx', style: { ...S.checkRow, alignItems: 'flex-start' } }, [
+                h('input', {
+                  key: 'checkbox',
+                  type: 'checkbox',
+                  checked: settings.autoNctx === true,
+                  onChange: (event) => update('autoNctx', event.target.checked),
+                }),
+                h('span', {
+                  key: 'label',
+                  style: { display: 'flex', flexDirection: 'column', gap: '1px' },
+                }, [
+                  h('span', { key: 'main' }, t('autoNctx.label')),
+                  h('span', { key: 'sub' }, t('autoNctx.sublabel')),
+                ]),
+              ]) : null,
+              h('div', {
+                key: 'compaction-metrics',
+                style: {
+                  marginLeft: 'auto',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'flex-end',
+                  gap: '2px',
+                  color: 'var(--dsw-alias-label-secondary)',
+                  fontSize: '11px',
+                  lineHeight: 1.5,
+                  textAlign: 'right',
+                },
+              }, [
+                h('span', { key: 'threshold' }, `${t('compaction.dsh')}: ${formatTokens(compactionThreshold)}`),
+                h('span', { key: 'gate' }, `${t('compaction.gate')}: ${formatTokens(recommendedGate)}`),
+              ]),
             ]),
             h('div', { key: 'compaction-hint', style: S.hint },
               compactionThreshold === null ? t('compaction.invalid') : t('compaction.hint')),
@@ -1661,6 +1712,21 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale'],
       apply(ctx) {
+        ctx.effect(() => {
+          const report = (message, stack) => {
+            const text = `${message}\n${stack}`
+            if (!/qwen|QwenMode|qwen-usage/i.test(text)) return
+            void call('clientError', { message: String(message), stack: String(stack) }).catch(() => {})
+          }
+          const onError = (event) => report(event.message, event.error?.stack ?? '')
+          const onRejection = (event) => report(String(event.reason?.message ?? event.reason ?? ''), event.reason?.stack ?? '')
+          window.addEventListener('error', onError)
+          window.addEventListener('unhandledrejection', onRejection)
+          return () => {
+            window.removeEventListener('error', onError)
+            window.removeEventListener('unhandledrejection', onRejection)
+          }
+        }, 'qwen-mode: client error diagnostics')
         if (typeof document !== 'undefined') {
           const style = document.createElement('style')
           style.id = 'qwen-model-option-warm'
@@ -1726,7 +1792,7 @@ window.__ModuleLoader__.load({
           order: 12,
           label: () => t('section.title'),
           locale: NS,
-        }, QwenModePage))
+        }, QwenModePageSafe))
 
         ctx.slots.inject('settings.section.icon', () => ctx.slots.register({
           name: 'settings.section.icon',

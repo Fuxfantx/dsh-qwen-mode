@@ -10,7 +10,7 @@
  */
 
 import { execFile } from 'node:child_process'
-import { mkdir, open, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, open, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
 import { homedir } from 'node:os'
@@ -1303,6 +1303,7 @@ export async function apply(ctx) {
       }
     }
   }
+  settings.lastError = null
   await persist().catch((error) => logger.warn(`[${SCOPE}] cannot save settings: ${String(error)}`))
 
   const managedModels = new Set()
@@ -1497,7 +1498,6 @@ export async function apply(ctx) {
     await syncProvider()
     settings.lastError = null
   } catch (error) {
-    settings.lastError = String(error)
     logger.warn(`[${SCOPE}] cannot refresh managed provider: ${String(error)}`)
   }
 
@@ -1638,6 +1638,18 @@ export async function apply(ctx) {
         if (session !== undefined) deriveSessionMetrics(session)
       }
       return { geniex: sessionProviders.get(sessionId) === true }
+    },
+    clientError: async (payload) => {
+      const message = text(payload?.message)
+      const stack = text(payload?.stack)
+      if (message === '' && stack === '') return { recorded: false }
+      const line = `${new Date().toISOString()} ${message}\n${stack}\n`
+      try {
+        await appendFile(join(profileDir, 'qwen-client-errors.log'), line, 'utf8')
+      } catch {
+        // Diagnostics must never break the settings page.
+      }
+      return { recorded: true }
     },
     permissionLabel: async (payload) => {
       const locale = text(payload?.locale).toLowerCase()
