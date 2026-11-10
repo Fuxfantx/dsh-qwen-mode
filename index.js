@@ -1221,6 +1221,7 @@ async function upsertProvider(ctx, settings) {
   settings.lastError = null
   try {
     ctx.emit('llm/models-updated', id)
+    ctx.emit('llm/adapters-updated')
   } catch {
     // Catalog refresh is best-effort; the provider config is already committed.
   }
@@ -1642,6 +1643,8 @@ export async function apply(ctx) {
         setTimeout(() => {
           try {
             deriveSessionMetrics(session)
+          } catch {
+            // A malformed historical session must not fail the usage pill.
           } finally {
             derivingSessions.delete(sessionId)
           }
