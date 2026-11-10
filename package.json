@@ -1,6 +1,6 @@
 {
   "name": "dsh-qwen-mode",
-  "version": "1.8.0",
+  "version": "1.8.1",
   "description": "Qwen mode for DSH: managed Qwen/GenieX/QwenCloud providers, thinking normalization, local model capabilities, warmup, MTP and per-turn stats.",
   "type": "module",
   "main": "index.js",
