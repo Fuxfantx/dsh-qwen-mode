@@ -152,6 +152,7 @@ function normalizeSettings(raw) {
   const contextWindow = positiveIntOrNull(source.contextWindow)
   const maxOutput = positiveInt(source.maxOutputTokens, DEFAULTS.maxOutputTokens)
   const ceiling = contextWindow ?? (protocol === 'qwen' ? DEFAULT_QWEN_CONTEXT : null)
+  const mtpDraftTokens = integerOrNull(source.mtpDraftTokens, 1, 64) ?? DEFAULTS.mtpDraftTokens
   return {
     version: 1,
     mode: SUPPORTED_MODES.includes(source.mode) ? source.mode : source.enabled === true || source.mode === 'always' ? 'auto' : 'off',
@@ -165,8 +166,9 @@ function normalizeSettings(raw) {
     maxOutputTokens: ceiling === null ? maxOutput : Math.min(maxOutput, ceiling),
     autoNctx: source.autoNctx === true,
     mtp: source.mtp === true,
-    mtpDraftTokens: integerOrNull(source.mtpDraftTokens, 1, 64) ?? DEFAULTS.mtpDraftTokens,
-    mtpDraftMin: integerOrNull(source.mtpDraftMin, 0, 64) ?? 0,
+    mtpDraftTokens,
+    // A speculative minimum above the maximum makes GenieX reject the load.
+    mtpDraftMin: Math.min(integerOrNull(source.mtpDraftMin, 0, 64) ?? 0, mtpDraftTokens),
     mtpDraftPMin: clampedNumber(source.mtpDraftPMin, 0, 1) ?? 0,
     compute: text(source.compute).slice(0, 100),
     vitCompute: VIT_COMPUTE_VALUES.has(source.vitCompute) ? source.vitCompute : '',
@@ -1411,6 +1413,23 @@ async function ensureReplyOnlyPreset(ctx, locale) {
   return { updated: true, ...labels }
 }
 
+/** Wait for the background provider sync to publish the requested model. */
+async function waitForManagedModel(ctx, model, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs
+  while (!runtime.disposed && Date.now() < deadline) {
+    if (runtime.managedModels.has(model)) return true
+    if (runtime.pendingSync === 0) break
+    await delay(200)
+  }
+  if (runtime.managedModels.has(model)) return true
+  try {
+    await refreshManagedModels(ctx, true)
+  } catch {
+    // The caller reports the model as unavailable.
+  }
+  return runtime.managedModels.has(model)
+}
+
 async function warmUpModel(ctx, settings, model, options) {
   const url = upstreamURL(settings, 'chat/completions')
   // The warm-up path returns before generation, but GenieX still keys the
@@ -1671,21 +1690,38 @@ function createApi(ctx) {
       const generation = ++runtime.warmGeneration
       const operation = async () => {
         if (generation !== runtime.warmGeneration) return { warmed: false, skipped: true }
-        const settings = runtime.settings
-        if (settings.protocol !== 'geniex') throw httpError(409, 'model warmup is GenieX-only')
-        if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
+        const currentSettings = () => {
+          const settings = runtime.settings
+          if (settings.protocol !== 'geniex') throw httpError(409, 'model warmup is GenieX-only')
+          if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
+          return settings
+        }
+        currentSettings()
         const model = text(payload?.model)
-        if (model === '' || !runtime.managedModels.has(model)) throw httpError(400, 'unknown managed model')
+        if (model === '') throw httpError(400, 'unknown managed model')
+        // A new conversation can ask for warmup before the background provider
+        // sync has published the catalog. Wait briefly instead of failing with
+        // a misleading "unknown model".
+        if (!(await waitForManagedModel(ctx, model))) {
+          throw httpError(409, runtime.settings.lastError ?? 'model is not available yet')
+        }
+        if (generation !== runtime.warmGeneration) return { warmed: false, skipped: true }
+        // The user may have disabled warmup or changed the source while this
+        // request waited for the catalog.
+        const settings = currentSettings()
         if (runtime.warmingModels.has(model)) return { warmed: false, model, skipped: true }
         if (!runtime.modelCapabilities.has(model)) {
           await refreshManagedModels(ctx, true)
-          if (!runtime.managedModels.has(model)) throw httpError(400, 'unknown managed model')
+          if (!runtime.managedModels.has(model)) throw httpError(409, 'model is not available yet')
         }
         runtime.warmingModels.add(model)
         runtime.statusCache.at = 0
         try {
           const result = await warmUpModel(ctx, settings, model, loadOptions(model))
           return { warmed: true, model, ...result }
+        } catch (error) {
+          runtime.logger?.warn?.(`[${SCOPE}] warmup failed for ${model}: ${userError(error)}`)
+          throw error
         } finally {
           runtime.warmingModels.delete(model)
           runtime.statusCache.at = 0

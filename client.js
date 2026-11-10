@@ -249,6 +249,7 @@ window.__ModuleLoader__.load({
       revisions: new Map(),
       warming: new Map(),
       remoteWarming: new Set(),
+      errors: new Map(),
       enabled: false,
       failures: 0,
       revision: 0,
@@ -276,6 +277,7 @@ window.__ModuleLoader__.load({
           warmState.revisions = new Map(Object.entries(status?.revisions ?? {}))
           warmState.remoteWarming = new Set(Array.isArray(status?.warming) ? status.warming : [])
           warmState.enabled = status?.active === true
+          for (const id of warmState.states.keys()) warmState.errors.delete(id)
           warmState.failures = 0
           warmState.revision = Number.isSafeInteger(status?.revision) ? status.revision : 0
         } catch {
@@ -493,11 +495,38 @@ window.__ModuleLoader__.load({
           lastWarmAt.set(modelKey, Date.now())
           trimWarmTracking()
           preheat.begin(modelKey, modelId)
+          let failure = null
           try {
-            await call('warm', { model: modelId })
-          } catch {
-            lastWarmRevision.delete(modelKey)
-            lastWarmAt.delete(modelKey)
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+              try {
+                await call('warm', { model: modelId })
+                failure = null
+                break
+              } catch (error) {
+                failure = String(error?.message ?? error)
+                if (attempt === 0
+                  && preheat.enabled
+                  && preheat.selected.get(key) === modelId) {
+                  // Provider discovery and the first model load can still be
+                  // settling; retry once before reporting a warm failure.
+                  await new Promise((resolve) => setTimeout(resolve, 800))
+                  if (!preheat.enabled || preheat.selected.get(key) !== modelId) break
+                  continue
+                }
+                break
+              }
+            }
+            if (failure !== null) {
+              lastWarmRevision.delete(modelKey)
+              lastWarmAt.delete(modelKey)
+              if (preheat.enabled) {
+                warmState.errors.set(modelId, failure)
+                while (warmState.errors.size > 64) warmState.errors.delete(warmState.errors.keys().next().value)
+                void call('clientError', { message: `warmup ${modelId}: ${failure}` }, { signal: AbortSignal.timeout(3000) }).catch(() => {})
+              }
+            } else {
+              warmState.errors.delete(modelId)
+            }
           } finally {
             preheat.end(modelKey, modelId)
           }
@@ -514,11 +543,15 @@ window.__ModuleLoader__.load({
           ? (residentState === 'loading' ? 'yellow' : residentState === 'active' || residentState === 'idle' ? 'green' : 'red')
           : 'blue'
       const warmZh = String(getLocale?.() ?? '').startsWith('zh')
-      const dotTitle = dotKind === null
+      const baseDotTitle = dotKind === null
         ? ''
         : warmZh
           ? (dotKind === 'yellow' ? '正在预热' : dotKind === 'green' ? '已预热' : dotKind === 'red' ? '未预热' : '无需预热')
           : (dotKind === 'yellow' ? 'Warming up' : dotKind === 'green' ? 'Warmed' : dotKind === 'red' ? 'Not warmed' : 'No warmup needed')
+      const warmError = typeof model?.id === 'string' ? warmState.errors.get(model.id) : undefined
+      const dotTitle = warmError === undefined
+        ? baseDotTitle
+        : `${baseDotTitle}: ${String(warmError).slice(0, 180)}`
       const dotFill = dotKind === 'green'
         ? 'var(--dsw-alias-state-success-primary)'
         : dotKind === 'yellow'
@@ -1350,7 +1383,7 @@ window.__ModuleLoader__.load({
     }
     function syncSendWarm(active) {
       if (typeof document === 'undefined') return
-      if (active) showSendWarm()
+      if (active && preheat.enabled) showSendWarm()
       else clearSendWarm()
     }
     const preheat = {
@@ -1376,6 +1409,22 @@ window.__ModuleLoader__.load({
         const next = value === true
         if (preheat.enabled === next) return
         preheat.enabled = next
+        if (!next) {
+          // A warm request may still be in flight when the user turns warmup
+          // off. Drop its local progress so a new conversation cannot inherit
+          // the spinner from the previous one.
+          preheat.active.clear()
+          warmState.warming.clear()
+          warmState.errors.clear()
+          clearSendWarm()
+          for (const listener of warmState.listeners) {
+            try {
+              listener()
+            } catch {
+              // A label can unmount while the setting is changing.
+            }
+          }
+        }
         for (const listener of preheat.listeners) listener()
       },
       isActive(sessionId) {
@@ -1385,6 +1434,7 @@ window.__ModuleLoader__.load({
       begin(key, modelId) {
         preheat.active.set(key, (preheat.active.get(key) ?? 0) + 1)
         if (typeof modelId === 'string') {
+          warmState.errors.delete(modelId)
           warmState.warming.set(modelId, (warmState.warming.get(modelId) ?? 0) + 1)
           for (const listener of warmState.listeners) {
             try {
