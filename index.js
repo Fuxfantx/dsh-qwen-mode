@@ -1394,7 +1394,7 @@ export async function apply(ctx) {
   const stepStarts = new Map()
   const firstTokens = new Map()
   const derivedSessions = new Set()
-  const derivingSessions = new Set()
+  const derivingPromises = new Map()
   const trimMap = (map, max) => {
     while (map.size > max) {
       const oldest = map.keys().next().value
@@ -1408,41 +1408,52 @@ export async function apply(ctx) {
     trimMap(sessionProviders, 2000)
   }
   const deriveSessionMetrics = (session) => {
-    if (derivedSessions.has(session.id)) return
+    if (derivedSessions.has(session.id)) return Promise.resolve()
+    const inFlight = derivingPromises.get(session.id)
+    if (inFlight !== undefined) return inFlight
     let events
     try {
       events = session.snapshotEvents()
     } catch {
-      return
+      return Promise.resolve()
     }
-    const starts = new Map()
-    const firsts = new Map()
-    for (const event of events) {
-      const turn = event.data?.turn
-      const step = event.data?.step
-      if (!Number.isInteger(turn) || !Number.isInteger(step)) continue
-      const key = `${turn}:${step}`
-      if (event.type === 'step/start') {
-        starts.set(key, event.time)
-      } else if (event.type === 'assistant/attempt') {
-        const first = streamFirstTokenTime(event.data.stream)
-        if (first !== undefined) firsts.set(key, first)
-      } else if (event.type === 'assistant/message') {
-        const first = firsts.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
-        const metric = buildTurnMetric(event, first, starts.get(key) ?? first)
-        if (metric !== null) {
-          turnMetrics.set(`${session.id}:${turn}`, metric)
-          markSessionProvider(session.id, metric.provider)
+    const promise = (async () => {
+      const starts = new Map()
+      const firsts = new Map()
+      for (let index = 0; index < events.length; index += 1) {
+        const event = events[index]
+        const turn = event.data?.turn
+        const step = event.data?.step
+        if (Number.isInteger(turn) && Number.isInteger(step)) {
+          const key = `${turn}:${step}`
+          if (event.type === 'step/start') {
+            starts.set(key, event.time)
+          } else if (event.type === 'assistant/attempt') {
+            const first = streamFirstTokenTime(event.data.stream)
+            if (first !== undefined) firsts.set(key, first)
+          } else if (event.type === 'assistant/message') {
+            const first = firsts.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
+            const metric = buildTurnMetric(event, first, starts.get(key) ?? first)
+            if (metric !== null) {
+              turnMetrics.set(`${session.id}:${turn}`, metric)
+              markSessionProvider(session.id, metric.provider)
+            }
+          }
         }
+        if (index % 400 === 399) await new Promise((resolve) => setImmediate(resolve))
       }
-    }
-    derivedSessions.add(session.id)
-    trimMap(turnMetrics, 2000)
-    while (derivedSessions.size > 200) {
-      const oldest = derivedSessions.values().next().value
-      if (oldest === undefined) break
-      derivedSessions.delete(oldest)
-    }
+      derivedSessions.add(session.id)
+      trimMap(turnMetrics, 2000)
+      while (derivedSessions.size > 200) {
+        const oldest = derivedSessions.values().next().value
+        if (oldest === undefined) break
+        derivedSessions.delete(oldest)
+      }
+    })().finally(() => {
+      derivingPromises.delete(session.id)
+    })
+    derivingPromises.set(session.id, promise)
+    return promise
   }
   ctx.effect(() => ctx.on('session/event', (session, event) => {
     const turn = event.data?.turn
@@ -1472,13 +1483,22 @@ export async function apply(ctx) {
     trimMap(turnMetrics, 2000)
   }), `${SCOPE}: turn metrics`)
 
-  const state = () => ({
-    ...settings,
-    proxyBaseURL: proxyBaseURL(settings),
-    ...readManagedProvider(ctx, settings),
-  })
+  let stateSnapshot = null
+  const invalidateState = () => {
+    stateSnapshot = null
+  }
+  const state = () => {
+    if (stateSnapshot !== null) return stateSnapshot
+    stateSnapshot = {
+      ...settings,
+      proxyBaseURL: proxyBaseURL(settings),
+      ...readManagedProvider(ctx, settings),
+    }
+    return stateSnapshot
+  }
 
   const syncProvider = async () => {
+    invalidateState()
     if (settings.mode === 'off') {
       await deleteProvider(ctx, settings)
       managedModels.clear()
@@ -1620,7 +1640,7 @@ export async function apply(ctx) {
       await persist()
       return state()
     },
-    turnStats: (payload) => {
+    turnStats: async (payload) => {
       const sessionId = text(payload?.sessionId)
       const turn = Number(payload?.turn)
       if (sessionId === '' || !Number.isInteger(turn)) return null
@@ -1629,7 +1649,7 @@ export async function apply(ctx) {
       if (cached !== undefined) return cached
       const session = ctx.sessions.get(sessionId)
       if (session === undefined) return null
-      deriveSessionMetrics(session)
+      await deriveSessionMetrics(session)
       return turnMetrics.get(key) ?? null
     },
     sessionProvider: (payload) => {
@@ -1638,20 +1658,10 @@ export async function apply(ctx) {
       if (sessionProviders.get(sessionId) === true) return { geniex: true, pending: false }
       const session = ctx.sessions.get(sessionId)
       if (session === undefined) return { geniex: false, pending: true }
-      if (!derivedSessions.has(sessionId) && !derivingSessions.has(sessionId)) {
-        derivingSessions.add(sessionId)
-        setTimeout(() => {
-          try {
-            deriveSessionMetrics(session)
-          } catch {
-            // A malformed historical session must not fail the usage pill.
-          } finally {
-            derivingSessions.delete(sessionId)
-          }
-        }, 0)
-        return { geniex: false, pending: true }
+      if (!derivedSessions.has(sessionId)) {
+        void deriveSessionMetrics(session).catch(() => {})
+        return { geniex: sessionProviders.get(sessionId) === true, pending: true }
       }
-      if (!derivedSessions.has(sessionId)) return { geniex: false, pending: true }
       return { geniex: sessionProviders.get(sessionId) === true, pending: false }
     },
     clientError: async (payload) => {
@@ -1743,11 +1753,8 @@ export async function apply(ctx) {
       })
       const providerChanged = ['protocol', 'upstream', 'apiKeyEnv', 'contextWindow', 'maxOutputTokens', 'autoNctx']
         .some((key) => next[key] !== previous[key])
-      const managedProvider = readManagedProvider(ctx, next).provider
-      const providerMissing = next.mode === 'auto'
-        && (managedProvider?.exists !== true || !Array.isArray(managedProvider.models) || managedProvider.models.length === 0)
       const providerRemoval = next.mode === 'off' && next.managedProviderId !== null
-      const requiresSync = next.mode !== previous.mode || providerChanged || providerMissing || providerRemoval
+      const requiresSync = next.mode !== previous.mode || providerChanged || providerRemoval
       const loadChanged = requiresSync
         || next.contextWindow !== previous.contextWindow
         || next.autoNctx !== previous.autoNctx
@@ -1760,6 +1767,7 @@ export async function apply(ctx) {
         || next.vitCompute !== previous.vitCompute
       const revisionBefore = modelRevision
       settings = next
+      invalidateState()
       statusCache.at = 0
       if (next.mtp && !previous.mtp && managedModels.size > 0) {
         capabilityRetryAt = 0
@@ -1791,6 +1799,7 @@ export async function apply(ctx) {
       return state()
     },
     remove: async () => {
+      invalidateState()
       try {
         await deleteProvider(ctx, settings)
         managedModels.clear()
