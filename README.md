@@ -15,7 +15,7 @@
 - 思考模式：在 DSH 中选择思考等级；QwenCloud 按模型支持的等级发送，GenieX 只在模型支持时启用思考。
 - 每轮显示模型名、首字延迟（TTFT）、解码速度与耗时。
 - 可选模型预热：选中 GenieX 模型时提前加载权重，模型列表用圆点显示驻留状态。
-- 采样默认值可手动填写，也可读取模型推荐的参数。
+- 采样参数可手动填写，也可读取模型推荐的参数。
 - 可选 MTP 投机解码，并在生效时显示接受率。
 - 破限 / 无审查模型名称高亮。
 - 可选「仅回复」权限：隐藏并拒绝工具调用，只进行纯文本对话。
@@ -49,7 +49,7 @@
 - **上下文窗口**：留空时使用模型自身声明的上下文；模型没有声明时使用默认值。勾选「优先使用模型上下文阈限」会忽略手动值。
 - **最大输出**：默认 16384，不会超过上下文窗口，也不会超过模型声明的最大输出。
 - **压缩提示**：设置页显示 DSH 压缩阈值与推荐 bigGate；上下文放不下压缩预留时会提示压缩不可用。
-- **采样默认值**：只补充请求中缺失的字段；留空表示不注入。可使用「读取推荐值」填入模型推荐参数，之后仍需保存。
+- **采样参数**：只补充请求中缺失的字段；留空表示不注入。可使用「读取推荐值」填入模型推荐参数，之后仍需保存。
 - **预热**：启用后，选择 From GenieX 模型会提前加载权重。圆点状态：黄色预热中、绿色已驻留、红色未驻留、蓝色其它来源。
 - **MTP**：适用于自带 MTP 张量并放置了配套草稿文件的本地 GGUF 模型。启用后发送图片时，会要求选择「直接发送」或「本次关闭 MTP」。
 - **推理后端**：Compute 与 Vision Encoder 留空时使用 GenieX 默认值；Vision Encoder 仅对图片模型生效。
@@ -76,7 +76,7 @@ Connect DSH to Qwen: use models running on a local GenieX server, or QwenCloud o
 - Thinking mode: choose a thinking level in DSH; QwenCloud receives only the levels the model supports, and GenieX enables thinking only on models that support it.
 - Shows the model name, time to first token (TTFT), decode speed, and elapsed time per turn.
 - Optional model warmup: loads GenieX weights ahead of time when a model is selected, with residency dots in the model list.
-- Sampling defaults can be entered manually or read from the model's recommended values.
+- Sampling parameters can be entered manually or read from the model's recommended values.
 - Optional MTP speculative decoding, with the acceptance rate shown while active.
 - Highlights abliterated / uncensored model names.
 - Optional **Reply Only** permission: hides and denies tool calls, keeping replies plain text.
@@ -110,7 +110,7 @@ Connect DSH to Qwen: use models running on a local GenieX server, or QwenCloud o
 - **Context window**: empty uses the model's declared context, or a default when the model declares none. **Prefer model context limit** ignores a manual value.
 - **Max output**: defaults to 16384 and never exceeds the context window or the model's declared output limit.
 - **Compaction hints**: the settings page shows the DSH compaction threshold and recommended bigGate; when the context cannot hold the compaction reserve it says compaction is unavailable.
-- **Sampling defaults**: only fields missing from the request are filled; empty means the field is omitted. **Read recommended** fills the model's values, which still need to be saved.
+- **Sampling parameters**: only fields missing from the request are filled; empty means the field is omitted. **Read recommended** fills the model's values, which still need to be saved.
 - **Warmup**: when enabled, selecting a From GenieX model loads its weights ahead of time. Dots: yellow warming, green resident, red not resident, blue another source.
 - **MTP**: for local GGUF models that ship MTP tensors and a matching draft file. While enabled, sending an image asks whether to send directly or disable MTP for that send.
 - **Inference backend**: empty Compute and Vision Encoder values use GenieX defaults; Vision Encoder applies to image models only.

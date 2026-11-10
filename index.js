@@ -94,6 +94,7 @@ const SAVE_FIELDS = [
   'repetitionPenalty',
   'presencePenalty',
   'frequencyPenalty',
+  'seed',
 ]
 
 const DEFAULTS = {
@@ -176,6 +177,8 @@ function normalizeSettings(raw) {
     repetitionPenalty: clampedNumber(source.repetitionPenalty, 0, 5),
     presencePenalty: clampedNumber(source.presencePenalty, -2, 2),
     frequencyPenalty: clampedNumber(source.frequencyPenalty, -2, 2),
+    // GenieX casts the seed to int32; keep one range valid for both sources.
+    seed: integerOrNull(source.seed, 0, 2147483647),
     lastError: text(source.lastError) || null,
   }
 }
@@ -350,6 +353,7 @@ function applyRequestDefaults(body, settings, options) {
   fill('repetition_penalty', settings.repetitionPenalty)
   fill('presence_penalty', settings.presencePenalty)
   fill('frequency_penalty', settings.frequencyPenalty)
+  fill('seed', settings.seed)
   if (output.stream === true) {
     const current = output.stream_options
     output.stream_options = {

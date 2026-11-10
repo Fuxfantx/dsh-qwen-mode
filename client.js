@@ -70,7 +70,7 @@ window.__ModuleLoader__.load({
       'vit.npu': 'NPU',
       'limits.invalid': '最大输出长度不能大于上下文窗口。',
       'contextWindow.label': '上下文窗口',
-      'contextWindow.placeholder': '不向请求注入',
+      'contextWindow.placeholder': '暂不指定',
       'autoNctx.label': '优先使用模型上下文阈限',
       'autoNctx.sublabel': '( GGUF context_length )',
       'maxOutputTokens.label': '最大输出长度',
@@ -86,9 +86,8 @@ window.__ModuleLoader__.load({
       'mtp.disable': '关闭 MTP 发送',
       'mtp.disableHint': '需要重新加载模型',
       'mtp.cancel': '取消',
-      'sampling.title': '采样默认值',
-      'sampling.hint': '仅在请求未携带该字段时填充；留空则不注入。',
-      'sampling.hint.geniex': '仅在请求未携带该字段时填充；留空则不注入。min_p 仅对 GenieX 生效。',
+      'sampling.title': '采样参数',
+      'sampling.placeholder': '不注入',
       'sampling.fill': '读取推荐值',
       'sampling.none': '当前没有带推荐采样值的模型',
       'temperature.label': 'temperature',
@@ -98,6 +97,7 @@ window.__ModuleLoader__.load({
       'repetitionPenalty.label': 'repetition_penalty',
       'presencePenalty.label': 'presence_penalty',
       'frequencyPenalty.label': 'frequency_penalty',
+      'seed.label': 'seed',
       'save': '保存并应用',
       'saving': '保存中…',
       'loadFailed': '读取设置失败：{message}',
@@ -154,7 +154,7 @@ window.__ModuleLoader__.load({
       'vit.npu': 'NPU',
       'limits.invalid': 'Max output tokens cannot exceed the context window.',
       'contextWindow.label': 'Context window',
-      'contextWindow.placeholder': 'Not injected into requests',
+      'contextWindow.placeholder': 'Not specified',
       'autoNctx.label': 'Prefer model context limit',
       'autoNctx.sublabel': '( GGUF context_length )',
       'maxOutputTokens.label': 'Max output tokens',
@@ -170,9 +170,8 @@ window.__ModuleLoader__.load({
       'mtp.disable': 'Send without MTP',
       'mtp.disableHint': 'The model must reload',
       'mtp.cancel': 'Cancel',
-      'sampling.title': 'Sampling Defaults',
-      'sampling.hint': 'Filled only when the request does not already carry the field; empty omits it.',
-      'sampling.hint.geniex': 'Filled only when the request does not already carry the field; empty omits it. min_p applies to GenieX only.',
+      'sampling.title': 'Sampling parameters',
+      'sampling.placeholder': 'Not injected',
       'sampling.fill': 'Read recommended',
       'sampling.none': 'No model currently exposes recommended sampling',
       'temperature.label': 'temperature',
@@ -182,6 +181,7 @@ window.__ModuleLoader__.load({
       'repetitionPenalty.label': 'repetition_penalty',
       'presencePenalty.label': 'presence_penalty',
       'frequencyPenalty.label': 'frequency_penalty',
+      'seed.label': 'seed',
       'save': 'Save and apply',
       'saving': 'Saving…',
       'loadFailed': 'Cannot read settings: {message}',
@@ -1589,9 +1589,9 @@ window.__ModuleLoader__.load({
           return
         }
         const numeric = {}
-        const numericKeys = ['contextWindow', 'maxOutputTokens', 'temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty']
+        const numericKeys = ['contextWindow', 'maxOutputTokens', 'temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty', 'seed']
         if (settings.protocol === 'geniex') numericKeys.push('mtpDraftTokens', 'mtpDraftMin', 'mtpDraftPMin')
-        const integerKeys = new Set(['contextWindow', 'maxOutputTokens', 'topK', 'mtpDraftTokens', 'mtpDraftMin'])
+        const integerKeys = new Set(['contextWindow', 'maxOutputTokens', 'topK', 'mtpDraftTokens', 'mtpDraftMin', 'seed'])
         const bounds = {
           temperature: [0, 2],
           topP: [0, 1],
@@ -1602,6 +1602,7 @@ window.__ModuleLoader__.load({
           mtpDraftTokens: [1, 64],
           mtpDraftMin: [0, 64],
           mtpDraftPMin: [0, 1],
+          seed: [0, 2147483647],
         }
         for (const key of numericKeys) {
           const raw = settings[key]
@@ -1693,6 +1694,7 @@ window.__ModuleLoader__.load({
       const samplingFields = settings.protocol === 'geniex'
         ? ['temperature', 'topP', 'topK', 'minP']
         : ['temperature', 'topP', 'topK']
+      const penaltyFields = ['repetitionPenalty', 'presencePenalty', 'frequencyPenalty', 'seed']
 
       const provider = settings.provider
       const providerExists = provider !== null && provider !== undefined && provider.exists === true
@@ -1869,7 +1871,6 @@ window.__ModuleLoader__.load({
           h('div', { key: 'divider-sampling', style: S.divider }),
           h('div', { key: 'sampling', style: S.configSection }, [
             h('div', { key: 'heading', style: S.configHeading }, t('sampling.title')),
-            h('div', { key: 'hint', style: S.hint }, t(settings.protocol === 'geniex' ? 'sampling.hint.geniex' : 'sampling.hint')),
             h('div', {
               key: 'grid',
               style: {
@@ -1885,18 +1886,20 @@ window.__ModuleLoader__.load({
                 style: S.input,
                 inputMode: key === 'topK' ? 'numeric' : 'decimal',
                 value: numberValue(key),
+                placeholder: t('sampling.placeholder'),
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
             ]),
-            h('div', { key: 'grid-penalties', style: { ...S.grid, gridTemplateColumns: 'repeat(3, minmax(0, 1fr))' } }, [
-              ...['repetitionPenalty', 'presencePenalty', 'frequencyPenalty'].map((key) => h(Field, {
+            h('div', { key: 'grid-penalties', style: { ...S.grid, gridTemplateColumns: `repeat(${penaltyFields.length}, minmax(0, 1fr))` } }, [
+              ...penaltyFields.map((key) => h(Field, {
                 key,
                 label: t(`${key}.label`),
               }, h('input', {
                 key: 'input',
                 style: S.input,
-                inputMode: 'decimal',
+                inputMode: key === 'seed' ? 'numeric' : 'decimal',
                 value: numberValue(key),
+                placeholder: t('sampling.placeholder'),
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
             ]),
