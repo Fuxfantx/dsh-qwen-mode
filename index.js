@@ -263,8 +263,8 @@ function requestedThinking(body) {
 function inferenceFields(settings, vision) {
   const fields = {}
   if (settings.compute !== '') fields.compute = settings.compute
-  // GenieX accepts the same compute aliases for the vision encoder; leave the
-  // field out so the server default and its VLM-session handling apply.
+  // Only image requests select the vision encoder; text requests keep the
+  // GenieX default for that backend.
   if (vision && settings.vitCompute !== '') fields.vit_compute = settings.vitCompute
   return fields
 }
@@ -498,7 +498,6 @@ function buildModelSpec(settings, id, capability) {
  * timeout is expected even on a healthy local server.
  */
 async function fetchJson(url, { headers, timeout, attempts = 1 }) {
-  let lastError
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       const response = await fetch(url, { headers, signal: AbortSignal.timeout(timeout) })
@@ -509,12 +508,11 @@ async function fetchJson(url, { headers, timeout, attempts = 1 }) {
       }
       return await response.json()
     } catch (error) {
-      lastError = error
       if (attempt >= attempts - 1 || error?.retryable === false) throw error
       await delay(500 * (attempt + 1))
     }
   }
-  throw lastError
+  throw httpError(502, 'model discovery failed')
 }
 
 /**
@@ -550,14 +548,14 @@ async function discoverModels(ctx, settings, capabilities) {
   }
 }
 
+/** The settings that make one provider build obsolete when they change. */
+function providerSettingsKey(settings = runtime.settings) {
+  return [settings.mode, settings.protocol, settings.upstream, apiKeyRef(settings), settings.contextWindow, settings.maxOutputTokens, settings.autoNctx].join('|')
+}
+
 /** Whether the settings that produced one provider snapshot are still current. */
 function providerSettingsCurrent(snapshot) {
-  const current = runtime.settings
-  return !runtime.disposed
-    && current.mode === 'auto'
-    && current.protocol === snapshot.protocol
-    && current.upstream === snapshot.upstream
-    && apiKeyRef(current) === apiKeyRef(snapshot)
+  return !runtime.disposed && providerSettingsKey(runtime.settings) === providerSettingsKey(snapshot)
 }
 
 async function upsertProvider(ctx, settings) {
@@ -584,26 +582,34 @@ async function upsertProvider(ctx, settings) {
   // the committed entry already equals the discovered one, skip the write:
   // a redundant edit rewrites the profile patch and wakes HMR for nothing.
   let changed = true
+  const otherIds = Object.values(PROVIDERS).map((provider) => provider.id).filter((providerId) => providerId !== id)
   try {
     const { providers } = readProviderConfig(ctx)
-    const staleSibling = Object.values(PROVIDERS).some((provider) => provider.id !== id && providers[provider.id] !== undefined)
-    changed = staleSibling || runtime.settings.managedProviderId !== id || !isDeepStrictEqual(providers[id], desired)
+    changed = settings.managedProviderId !== id
+      || !isDeepStrictEqual(providers[id], desired)
+      || otherIds.some((providerId) => providers[providerId] !== undefined)
   } catch {
     // The provider table is unreadable; let the edit surface the failure.
   }
   if (changed) {
     let committed = false
     await editProviders(ctx, (providers) => {
-      if (!providerSettingsCurrent(settings)) return
-      const previous = runtime.settings.managedProviderId
-      if (previous !== null && previous !== id) delete providers[previous]
-      for (const provider of Object.values(PROVIDERS)) {
-        if (provider.id !== id) delete providers[provider.id]
+      if (!providerSettingsCurrent(settings)) {
+        // Never let a stale discovery resurrect a provider after the user
+        // turned the mode off or changed the source.
+        for (const providerId of [id, ...otherIds]) delete providers[providerId]
+        return
       }
+      const previous = settings.managedProviderId
+      if (previous !== null && previous !== id) delete providers[previous]
+      for (const otherId of otherIds) delete providers[otherId]
       providers[id] = desired
       committed = true
     })
-    if (!committed || !providerSettingsCurrent(settings)) return null
+    if (!committed || !providerSettingsCurrent(settings)) {
+      await deleteProviders(ctx, [id, ...otherIds, settings.managedProviderId])
+      return null
+    }
   } else if (!providerSettingsCurrent(settings)) {
     return null
   }
@@ -628,7 +634,7 @@ async function upsertProvider(ctx, settings) {
   }
 }
 
-/** Every provider id this plugin may have written in an earlier install. */
+/** Provider ids this plugin owns, including entries left by an older install. */
 function managedProviderIds(settings) {
   return [settings.managedProviderId, PROVIDERS.geniex.id, PROVIDERS.qwen.id]
 }
@@ -660,17 +666,23 @@ function readManagedProvider(ctx, settings) {
     const { providers } = readProviderConfig(ctx)
     const id = settings.managedProviderId
     const provider = id === null ? undefined : providers[id]
+    const entries = Array.isArray(provider?.models) ? provider.models : []
+    const models = []
+    const visionModels = []
+    for (const model of entries) {
+      if (typeof model?.id !== 'string') continue
+      models.push(model.id)
+      if (Array.isArray(model.input) && model.input.includes('image')) visionModels.push(model.id)
+    }
     return {
       provider: id === null ? null : {
         id,
         displayName: provider?.displayName ?? providerNameFor(settings.protocol),
         baseURL: provider?.baseURL ?? '',
         exists: provider !== undefined,
-        models: Array.isArray(provider?.models) ? provider.models.map((model) => model?.id).filter((value) => typeof value === 'string') : [],
-        visionModels: Array.isArray(provider?.models)
-          ? provider.models.filter((model) => Array.isArray(model?.input) && model.input.includes('image')).map((model) => model.id)
-          : [],
-        entries: Array.isArray(provider?.models) ? provider.models : [],
+        models,
+        visionModels,
+        entries,
       },
     }
   } catch {
@@ -690,7 +702,6 @@ function createRuntime() {
     managedModels: new Set(),
     visionModels: new Set(),
     modelMaxTokens: new Map(),
-    mtpModels: new Set(),
     mtpDrafts: new Map(),
     modelContexts: new Map(),
     modelCapabilities: new Map(),
@@ -701,8 +712,6 @@ function createRuntime() {
     loadRevision: 0,
     modelRevision: 0,
     capabilityRetryAt: 0,
-    managedRefresh: null,
-    managedRefreshKey: '',
     pendingSync: 0,
     syncGeneration: 0,
     stateCache: null,
@@ -719,17 +728,27 @@ function createRuntime() {
     warmingModels: new Set(),
     warmQueue: Promise.resolve(),
     warmGeneration: 0,
+    providerChain: Promise.resolve(),
+    persistChain: Promise.resolve(),
     bindError: null,
     replyRestrictions: new Map(),
   }
 }
 
 let runtime = createRuntime()
-let providerChain = Promise.resolve()
-let persistChain = Promise.resolve()
 
 function invalidateState() {
   runtime.stateCache = null
+}
+
+function invalidateStatus() {
+  runtime.statusCache = { key: '', at: 0, value: null }
+}
+
+/** Advance the warm revision for the models whose load inputs changed. */
+function bumpLoadRevision(ids) {
+  runtime.loadRevision += 1
+  for (const id of ids) runtime.loadRevisions.set(id, runtime.loadRevision)
 }
 
 /** Apply one provider snapshot to the managed model sets. */
@@ -737,6 +756,7 @@ function applyManagedProvider(provider) {
   runtime.managedModels.clear()
   runtime.visionModels.clear()
   runtime.modelMaxTokens.clear()
+  runtime.modelContexts.clear()
   runtime.modelReasoning.clear()
   for (const id of provider?.models ?? []) runtime.managedModels.add(id)
   for (const id of provider?.visionModels ?? []) runtime.visionModels.add(id)
@@ -754,6 +774,13 @@ function applyManagedProvider(provider) {
   }
 }
 
+/** Drop every managed model and warm revision. */
+function clearManagedState() {
+  applyManagedProvider(null)
+  if (applyCapabilities(new Map())) runtime.modelRevision += 1
+  invalidateState()
+}
+
 /** Rebuild the capability-derived sets; returns whether anything changed. */
 function applyCapabilities(capabilities) {
   const sorted = [...capabilities].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
@@ -769,34 +796,33 @@ function applyCapabilities(capabilities) {
     capability?.tags ?? null,
     capability?.sampling ?? null,
   ]))
-  // Warm state must not follow unrelated metadata such as sampling defaults or
-  // tags: only these fields change what GenieX loads into memory. The revision
-  // is per model so a catalog change for another model cannot re-warm the
-  // model the user is looking at.
-  const loadFields = (capability) => JSON.stringify([
+  // Warm state must follow only what GenieX loads, not sampling/tags. Keep it
+  // per model so a catalog change for another model cannot re-warm this one.
+  const warmSignature = (capability) => JSON.stringify([
     capability?.contextLength ?? null,
     capability?.vision ?? null,
     capability?.runtime ?? null,
     capability?.mtpDraft ?? null,
     capability?.mtpReady ?? null,
   ])
-  runtime.mtpModels.clear()
   runtime.mtpDrafts.clear()
   runtime.modelContexts.clear()
   runtime.modelCapabilities.clear()
   for (const [id, capability] of capabilities) {
     runtime.modelCapabilities.set(id, capability)
     if (capability?.mtpReady === true && typeof capability?.mtpDraft === 'string' && capability.mtpDraft !== '') {
-      runtime.mtpModels.add(id)
       runtime.mtpDrafts.set(id, capability.mtpDraft)
     }
     if (positiveIntOrNull(capability?.contextLength) !== null) runtime.modelContexts.set(id, capability.contextLength)
-    if (capability === null || capability === undefined) continue
-    const signature = loadFields(capability)
-    if (runtime.loadSignatures.get(id) !== signature) {
-      runtime.loadSignatures.set(id, signature)
-      runtime.loadRevision += 1
-      runtime.loadRevisions.set(id, runtime.loadRevision)
+    if (capability === null || capability === undefined) {
+      runtime.loadSignatures.delete(id)
+      runtime.loadRevisions.delete(id)
+      continue
+    }
+    const rowSignature = warmSignature(capability)
+    if (runtime.loadSignatures.get(id) !== rowSignature) {
+      runtime.loadSignatures.set(id, rowSignature)
+      bumpLoadRevision([id])
     }
   }
   for (const id of [...runtime.loadSignatures.keys()]) {
@@ -821,68 +847,53 @@ function runtimeCapabilities(ctx) {
 }
 
 /** Resolve capabilities for every managed model and refresh both catalogs. */
-function refreshManagedModels(ctx, force = false) {
+async function refreshManagedModels(ctx) {
   const instance = runtime
   const snapshot = { ...instance.settings }
   const key = [snapshot.mode, snapshot.protocol, snapshot.upstream, snapshot.managedProviderId].join('|')
   const currentKey = () => [instance.settings.mode, instance.settings.protocol, instance.settings.upstream, instance.settings.managedProviderId].join('|')
-  if (!force && instance.managedRefresh !== null && instance.managedRefreshKey === key) return instance.managedRefresh
-  const promise = (async () => {
-    if (snapshot.mode !== 'auto') {
-      if (runtime !== instance || instance.disposed || currentKey() !== key) return
-      applyManagedProvider(null)
-      if (applyCapabilities(new Map())) runtime.modelRevision += 1
-      invalidateState()
-      return
-    }
-    const provider = readManagedProvider(ctx, snapshot).provider
-    const capabilities = new Map()
-    if (snapshot.protocol === 'geniex') {
-      const ids = provider?.models ?? []
-      await mapLimit(ids, 4, async (id) => {
-        capabilities.set(id, await runtimeCapabilities(ctx).resolve(snapshot, id))
-      })
-    }
+  if (snapshot.mode !== 'auto') {
     if (runtime !== instance || instance.disposed || currentKey() !== key) return
-    applyManagedProvider(provider)
-    if (snapshot.protocol === 'geniex' && applyCapabilities(capabilities)) runtime.modelRevision += 1
-    invalidateState()
-  })().finally(() => {
-    if (runtime === instance && instance.managedRefresh === promise) {
-      instance.managedRefresh = null
-      instance.managedRefreshKey = ''
-    }
-  })
-  instance.managedRefresh = promise
-  instance.managedRefreshKey = key
-  return promise
+    clearManagedState()
+    return
+  }
+  const provider = readManagedProvider(ctx, snapshot).provider
+  const capabilities = new Map()
+  if (snapshot.protocol === 'geniex') {
+    const ids = provider?.models ?? []
+    await mapLimit(ids, 4, async (id) => {
+      capabilities.set(id, await runtimeCapabilities(ctx).resolve(snapshot, id))
+    })
+  }
+  if (runtime !== instance || instance.disposed || currentKey() !== key) return
+  applyManagedProvider(provider)
+  if (snapshot.protocol === 'geniex') {
+    if (applyCapabilities(capabilities)) runtime.modelRevision += 1
+  } else if (applyCapabilities(new Map())) {
+    runtime.modelRevision += 1
+  }
+  invalidateState()
 }
 
-/** Serialize provider-config writes with background refreshes. */
-function providerTask(operation) {
-  const run = providerChain.then(operation, operation)
-  providerChain = run.then(() => undefined, () => undefined)
+/** Serialize provider-config work on the instance that owns it. */
+function providerTask(instance, operation) {
+  const run = instance.providerChain.then(operation, operation)
+  instance.providerChain = run.then(() => undefined, () => undefined)
   return run
-}
-
-/** The settings that make one provider build obsolete when they change. */
-function providerSettingsKey() {
-  const settings = runtime.settings
-  return [settings.mode, settings.protocol, settings.upstream, apiKeyRef(settings), settings.contextWindow, settings.maxOutputTokens, settings.autoNctx].join('|')
 }
 
 /** One provider-build attempt for the current settings. */
 async function syncProviderOnce(ctx) {
   const instance = runtime
   if (instance.disposed) return
-  const settings = instance.settings
+  // Snapshot, not a live reference: a mode/source change during discovery must
+  // make this attempt stale instead of mutating its own comparison key.
+  const settings = { ...instance.settings }
   if (settings.mode === 'off') {
     await deleteProviders(ctx, managedProviderIds(settings))
     if (runtime !== instance || instance.disposed) return
-    settings.managedProviderId = null
-    applyManagedProvider(null)
-    if (applyCapabilities(new Map())) runtime.modelRevision += 1
-    invalidateState()
+    instance.settings.managedProviderId = null
+    clearManagedState()
     return
   }
   if (runtime.bindError !== null) {
@@ -919,7 +930,7 @@ function syncProvider(ctx, attempts = 1) {
     for (let attempt = 0; ; attempt += 1) {
       if (runtime !== instance || instance.disposed || generation !== runtime.syncGeneration) return
       try {
-        await providerTask(() => syncProviderOnce(ctx))
+        await providerTask(instance, () => syncProviderOnce(ctx))
         return
       } catch (error) {
         if (runtime !== instance || instance.disposed || generation !== runtime.syncGeneration) return
@@ -952,7 +963,6 @@ function startBackgroundSync(ctx, attempts) {
 function canMtp(model) {
   return runtime.settings.mtp
     && runtime.settings.protocol === 'geniex'
-    && runtime.mtpModels.has(model)
     && runtime.mtpDrafts.has(model)
 }
 
@@ -1063,12 +1073,14 @@ function deriveSessionMetrics(session) {
       if (index % 400 === 399) await new Promise((resolve) => setImmediate(resolve))
     }
     runtime.derivedSessions.add(session.id)
-    while (runtime.derivedSessions.size > 200) {
-      const oldest = runtime.derivedSessions.values().next().value
-      if (oldest === undefined) break
-      runtime.derivedSessions.delete(oldest)
-    }
-  })().finally(() => {
+    trimMap(runtime.derivedSessions, 200)
+  })().catch((error) => {
+    // Mark the session as processed so the client stops polling a history that
+    // cannot be replayed.
+    runtime.logger?.warn?.(`[${SCOPE}] cannot derive session metrics: ${userError(error)}`)
+    runtime.derivedSessions.add(session.id)
+    trimMap(runtime.derivedSessions, 200)
+  }).finally(() => {
     runtime.deriving.delete(session.id)
   })
   runtime.deriving.set(session.id, promise)
@@ -1211,9 +1223,10 @@ function writeProxyResponse(upstream, res, { managed, onUsage }) {
   }
   upstream.on('data', (chunk) => {
     buffer += decoder.write(chunk)
-    while (true) {
-      const lf = buffer.indexOf('\n\n')
-      const crlf = buffer.indexOf('\r\n\r\n')
+    let start = 0
+    for (;;) {
+      const lf = buffer.indexOf('\n\n', start)
+      const crlf = buffer.indexOf('\r\n\r\n', start)
       let index = -1
       let width = 2
       if (crlf !== -1 && (lf === -1 || crlf < lf)) {
@@ -1224,10 +1237,10 @@ function writeProxyResponse(upstream, res, { managed, onUsage }) {
       } else {
         break
       }
-      const raw = buffer.slice(0, index)
-      buffer = buffer.slice(index + width)
-      if (!emit(raw)) return
+      if (!emit(buffer.slice(start, index))) return
+      start = index + width
     }
+    if (start > 0) buffer = buffer.slice(start)
     if (buffer.length > MAX_EVENT_BUFFER) {
       logger?.warn?.(`[${SCOPE}] upstream event exceeded ${MAX_EVENT_BUFFER} bytes`)
       upstream.destroy()
@@ -1325,7 +1338,7 @@ function handleProxyRequest(req, res) {
             reasoning,
             preserveThinking: supportsPreserveThinking(model),
           })), 'utf8')
-          consumeMtpChoice(model)
+          if (media && vision) consumeMtpChoice(model)
         }
       } catch {
         // Preserve non-JSON bodies unchanged.
@@ -1423,7 +1436,7 @@ async function waitForManagedModel(ctx, model, timeoutMs = 15000) {
   }
   if (runtime.managedModels.has(model)) return true
   try {
-    await refreshManagedModels(ctx, true)
+    await refreshManagedModels(ctx)
   } catch {
     // The caller reports the model as unavailable.
   }
@@ -1593,7 +1606,7 @@ function createApi(ctx) {
     mtpChoice: (payload) => {
       if (runtime.settings.protocol !== 'geniex') throw httpError(409, 'MTP is GenieX-only')
       const model = text(payload?.model)
-      if (!runtime.mtpModels.has(model) || !runtime.mtpDrafts.has(model)) throw httpError(400, 'model has no MTP draft')
+      if (!runtime.mtpDrafts.has(model)) throw httpError(400, 'model has no MTP draft')
       if (payload?.allow === true) {
         runtime.mtpApproved.add(model)
         runtime.mtpSuppressed.delete(model)
@@ -1609,8 +1622,29 @@ function createApi(ctx) {
       if (mode === runtime.settings.mode) return readState(ctx)
       const previous = runtime.settings.mode
       runtime.settings.mode = mode
-      runtime.statusCache = { key: '', at: 0, value: null }
+      invalidateStatus()
       invalidateState()
+      if (mode === 'off') {
+        // Removing the provider is local config work; an in-flight discovery
+        // sees the new mode when it tries to commit and skips.
+        runtime.syncGeneration += 1
+        try {
+          await deleteProviders(ctx, managedProviderIds(runtime.settings))
+          runtime.settings.managedProviderId = null
+          clearManagedState()
+          runtime.settings.lastError = null
+        } catch (error) {
+          runtime.settings.lastError = userError(error)
+        }
+        try {
+          await persistSettings()
+        } catch (error) {
+          runtime.settings.lastError = userError(error)
+          invalidateState()
+          throw httpError(500, userError(error))
+        }
+        return readState(ctx)
+      }
       try {
         await persistSettings()
       } catch (error) {
@@ -1619,26 +1653,7 @@ function createApi(ctx) {
         invalidateState()
         throw httpError(500, userError(error))
       }
-      if (mode === 'off') {
-        // Removal is local config work; do not sit behind a slow discovery.
-        // An in-flight discovery sees the new mode at commit time and skips.
-        runtime.syncGeneration += 1
-        try {
-          await deleteProviders(ctx, managedProviderIds(runtime.settings))
-          runtime.settings.managedProviderId = null
-          applyManagedProvider(null)
-          if (applyCapabilities(new Map())) runtime.modelRevision += 1
-          runtime.settings.lastError = null
-        } catch (error) {
-          runtime.settings.lastError = userError(error)
-        }
-        invalidateState()
-        await persistSettings().catch(() => {})
-        return readState(ctx)
-      }
-      // Turning on needs upstream discovery, which can take seconds (or time
-      // out) on a congested link. Persist and answer first, then build the
-      // provider in the background; `pendingSync` lets the page follow it.
+      // Discovery can take seconds; answer first, then build in the background.
       startBackgroundSync(ctx, 3)
       return readState(ctx)
     },
@@ -1711,11 +1726,11 @@ function createApi(ctx) {
         const settings = currentSettings()
         if (runtime.warmingModels.has(model)) return { warmed: false, model, skipped: true }
         if (!runtime.modelCapabilities.has(model)) {
-          await refreshManagedModels(ctx, true)
+          await refreshManagedModels(ctx)
           if (!runtime.managedModels.has(model)) throw httpError(409, 'model is not available yet')
         }
         runtime.warmingModels.add(model)
-        runtime.statusCache.at = 0
+        invalidateStatus()
         try {
           const result = await warmUpModel(ctx, settings, model, loadOptions(model))
           return { warmed: true, model, ...result }
@@ -1724,7 +1739,7 @@ function createApi(ctx) {
           throw error
         } finally {
           runtime.warmingModels.delete(model)
-          runtime.statusCache.at = 0
+          invalidateStatus()
         }
       }
       const result = runtime.warmQueue.then(operation, operation)
@@ -1772,7 +1787,7 @@ function createApi(ctx) {
       const revisionBefore = runtime.modelRevision
       runtime.settings = next
       invalidateState()
-      runtime.statusCache = { key: '', at: 0, value: null }
+      invalidateStatus()
       try {
         await persistSettings()
       } catch (error) {
@@ -1781,10 +1796,13 @@ function createApi(ctx) {
         throw httpError(500, userError(error))
       }
       runtime.settings.lastError = null
+      if (providerChanged) {
+        runtimeCapabilities(ctx).invalidate(next.upstream)
+        runtime.capabilityRetryAt = 0
+      }
       if (requiresSync) startBackgroundSync(ctx, 3)
       if (loadFlagsChanged) {
-        runtime.loadRevision += 1
-        for (const id of runtime.managedModels) runtime.loadRevisions.set(id, runtime.loadRevision)
+        bumpLoadRevision(runtime.managedModels)
       }
       if (loadChanged && runtime.modelRevision === revisionBefore) runtime.modelRevision += 1
       return readState(ctx)
@@ -1801,21 +1819,35 @@ function createApi(ctx) {
       runtime.syncGeneration += 1
       invalidateState()
       try {
-        await providerTask(async () => {
+        await providerTask(runtime, async () => {
           await deleteProviders(ctx, managedProviderIds(runtime.settings))
           runtime.settings.managedProviderId = null
         })
-        applyManagedProvider(null)
-        if (applyCapabilities(new Map())) runtime.modelRevision += 1
+        clearManagedState()
         runtime.settings.lastError = null
       } catch (error) {
         runtime.settings.lastError = userError(error)
       }
-      await persistSettings()
+      try {
+        await persistSettings()
+      } catch (error) {
+        runtime.settings.lastError = userError(error)
+        invalidateState()
+      }
       return readState(ctx)
     },
   }
   return api
+}
+
+/** Serialize the settings that are actually written to disk. */
+function settingsForStore(settings = runtime.settings) {
+  const { lastError, ...stored } = settings
+  return stored
+}
+
+function settingsFingerprint(settings = runtime.settings) {
+  return JSON.stringify(settingsForStore(settings))
 }
 
 /** Serialize settings writes. */
@@ -1824,9 +1856,7 @@ function persistSettings() {
   const run = async () => {
     if (instance.disposed) return
     await mkdir(instance.profileDir, { recursive: true })
-    const payload = { ...instance.settings }
-    delete payload.lastError
-    const body = `${JSON.stringify(payload, null, 2)}\n`
+    const body = `${JSON.stringify(settingsForStore(instance.settings), null, 2)}\n`
     const temporary = `${instance.storePath}.${process.pid}.${Date.now()}.tmp`
     await writeFile(temporary, body, 'utf8')
     if (instance.disposed) {
@@ -1848,8 +1878,8 @@ function persistSettings() {
       }
     }
   }
-  const next = persistChain.then(run, run)
-  persistChain = next.then(() => undefined, () => undefined)
+  const next = instance.persistChain.then(run, run)
+  instance.persistChain = next.then(() => undefined, () => undefined)
   return next
 }
 
@@ -1880,7 +1910,7 @@ async function startProxy() {
       bound = port
       break
     } catch (error) {
-      if (error?.code !== 'EADDRINUSE' && error?.code !== 'EACCES') {
+      if (error?.code !== 'EADDRINUSE') {
         instance.logger.warn(`[${SCOPE}] cannot bind proxy on ${port}: ${userError(error)}`)
         break
       }
@@ -1892,7 +1922,10 @@ async function startProxy() {
     return null
   }
   if (runtime !== instance || instance.disposed) {
-    await new Promise((resolve) => server.close(() => resolve()))
+    await new Promise((resolve) => {
+      server.close(() => resolve())
+      server.closeAllConnections?.()
+    })
     return null
   }
   instance.bindError = null
@@ -1907,7 +1940,7 @@ async function startProxy() {
   return server
 }
 
-/** Keep the settings page and tool guard wired to the reply-only preset. */
+/** Keep the per-agent tool restriction in sync with the reply-only preset. */
 function applyReplyOnly(ctx, agent) {
   const session = ctx.sessions.get(agent.id)
   if (session === undefined) return
@@ -1929,7 +1962,8 @@ function applyReplyOnly(ctx, agent) {
   try {
     const scoped = agent.ctx
     if (scoped?.tools?.restrict !== undefined) {
-      runtime.replyRestrictions.set(agent.id, scoped.tools.restrict({ allow: [] }))
+      const dispose = scoped.tools.restrict({ allow: [] })
+      if (typeof dispose === 'function') runtime.replyRestrictions.set(agent.id, dispose)
     }
   } catch (error) {
     runtime.logger.warn(`[${SCOPE}] cannot hide tools for reply-only session: ${userError(error)}`)
@@ -1984,8 +2018,6 @@ function serializeMutations(api) {
 export async function apply(ctx) {
   runtime = createRuntime()
   const instance = runtime
-  providerChain = Promise.resolve()
-  persistChain = Promise.resolve()
   // A reinstall can start before every async task of the previous instance has
   // settled. The flag lets those tasks stop instead of writing settings or
   // config after their plugin has been disposed.
@@ -1994,15 +2026,20 @@ export async function apply(ctx) {
   runtime.profileDir = text(process.env.DSH_PROFILE_DIR) || process.cwd()
   runtime.storePath = join(runtime.profileDir, STORE_FILE)
 
+  let stored = null
   let loaded = normalizeSettings({})
   try {
-    loaded = normalizeSettings(JSON.parse(await readFile(runtime.storePath, 'utf8')))
+    stored = JSON.parse(await readFile(runtime.storePath, 'utf8'))
+    loaded = normalizeSettings(stored)
   } catch (error) {
     if (error?.code !== 'ENOENT') runtime.logger.warn(`[${SCOPE}] cannot read settings: ${userError(error)}`)
   }
   runtime.settings = loaded
   runtime.settings.lastError = null
-  await persistSettings().catch((error) => runtime.logger.warn(`[${SCOPE}] cannot save settings: ${userError(error)}`))
+  if (stored === null || settingsFingerprint(loaded) !== settingsFingerprint(stored)) {
+    await persistSettings().catch((error) => runtime.logger.warn(`[${SCOPE}] cannot save settings: ${userError(error)}`))
+  }
+  if (instance.disposed) return
 
   applyManagedProvider(readManagedProvider(ctx, runtime.settings).provider)
   const api = createApi(ctx)
@@ -2090,13 +2127,13 @@ export async function apply(ctx) {
   // its own, so a congested link only delays the provider, not the plugin.
   const startupSync = async () => {
     if (runtime !== instance || instance.disposed) return
+    const before = settingsFingerprint()
     try {
-      await refreshManagedModels(ctx, true)
       await syncProvider(ctx, 4)
       if (runtime !== instance || instance.disposed) return
       runtime.settings.lastError = null
       invalidateState()
-      await persistSettings()
+      if (settingsFingerprint() !== before) await persistSettings()
     } catch (error) {
       if (runtime !== instance || instance.disposed) return
       runtime.settings.lastError = userError(error)

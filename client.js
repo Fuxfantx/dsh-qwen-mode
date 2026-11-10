@@ -1,8 +1,6 @@
 /**
- * Browser half of the Qwen mode bundle: one compact Settings section.
- *
- * The Host owns the provider entry (`From GenieX` / `From QwenCloud`), so this
- * page exposes the source, model limits, inference backend, and sampling defaults.
+ * Browser half of the Qwen mode bundle: settings, model labels and warmup,
+ * token usage, the reply-only icon, and per-turn statistics.
  *
  * @module dsh-qwen-mode/client
  */
@@ -11,18 +9,8 @@ window.__ModuleLoader__.load({
   id: 'dsh-qwen-mode',
   factory: (require) => {
     const React = require('react')
-    let ReactDOM = null
-    try {
-      ReactDOM = require('react-dom')
-    } catch {
-      // The fixed panel still renders inline when react-dom is unavailable.
-    }
-    let primitives = null
-    try {
-      primitives = require('@deepseek-ai/dsh-client-ui-primitives')
-    } catch {
-      primitives = null
-    }
+    const ReactDOM = require('react-dom')
+    const primitives = require('@deepseek-ai/dsh-client-ui-primitives')
     const h = React.createElement
     const NS = 'qwenMode'
     const API = '/qwen-mode/api'
@@ -31,6 +19,7 @@ window.__ModuleLoader__.load({
     const DEFAULT_MAX_OUTPUT = 16384
     const CREDENTIAL_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u
     const COMPACTION_HEADROOM = 65536
+    const WARMUP_CALL_TIMEOUT_MS = 11 * 60 * 1000
 
     const zh = {
       'section.title': 'Qwen 模式',
@@ -44,7 +33,7 @@ window.__ModuleLoader__.load({
       'upstream.label': '上游地址',
       'apiKeyEnv.label': 'API Key 变量名（可选）',
       'apiKeyEnv.placeholder': 'DASHSCOPE_API_KEY',
-      'apiKeyEnv.hint': '填写保存 Key 的环境变量名或 DSH 凭据名，而不是 Key 本身。',
+      'apiKeyEnv.hint': '填写保存 Key 的环境变量名，而不是 Key 本身。',
       'apiKeyEnv.invalid': 'Key 变量名只能包含字母、数字和下划线，且不能以数字开头。',
       'warm.label': '选择 From GenieX 模型时自动预热',
       'warm.hint': '切换到 From GenieX 模型后，让 GenieX 提前将模型加载到内存中；预热期间发送按钮显示转圈。',
@@ -108,9 +97,6 @@ window.__ModuleLoader__.load({
       'stats.tps': '{value} tok/s',
       'stats.ms': '{value} ms',
       'stats.sec': '{value} s',
-      'usage.input': '输入',
-      'usage.output': '输出',
-      'usage.title': 'Token 用量',
       'compaction.dsh': 'DSH 压缩阈值',
       'compaction.gate': '推荐 bigGate',
       'compaction.unavailable': '上下文不足以容纳 64K 压缩预留，DSH 压缩不可用；请增大上下文窗口或减小最大输出长度。',
@@ -128,7 +114,7 @@ window.__ModuleLoader__.load({
       'upstream.label': 'Upstream URL',
       'apiKeyEnv.label': 'API key reference (optional)',
       'apiKeyEnv.placeholder': 'DASHSCOPE_API_KEY',
-      'apiKeyEnv.hint': 'Name of the environment variable or DSH credential that holds the key, not the key itself.',
+      'apiKeyEnv.hint': 'Name of the environment variable that holds the key, not the key itself.',
       'apiKeyEnv.invalid': 'The reference may contain only letters, digits, and underscores, and cannot start with a digit.',
       'warm.label': 'Warm up when selecting a From GenieX model',
       'warm.hint': 'After switching to a From GenieX model, GenieX loads the model into memory ahead of time; the send button shows a spinner while warming.',
@@ -192,9 +178,6 @@ window.__ModuleLoader__.load({
       'stats.tps': '{value} tok/s',
       'stats.ms': '{value} ms',
       'stats.sec': '{value} s',
-      'usage.input': 'Input',
-      'usage.output': 'Output',
-      'usage.title': 'Token usage',
       'compaction.dsh': 'DSH compaction threshold',
       'compaction.gate': 'Recommended bigGate',
       'compaction.unavailable': 'The context cannot hold the 64K compaction reserve, so DSH compaction is unavailable; raise the context window or lower the output limit.',
@@ -263,7 +246,7 @@ window.__ModuleLoader__.load({
         warmState.timer = null
       },
       startPolling() {
-        if (warmState.timer !== null) return
+        if (warmState.timer !== null || warmState.subscribers === 0) return
         warmState.timer = window.setInterval(() => {
           if (typeof document === 'undefined' || !document.hidden) void warmState.refresh()
         }, 4000)
@@ -286,6 +269,7 @@ window.__ModuleLoader__.load({
           warmState.failures += 1
           if (warmState.failures >= 3) {
             warmState.states = new Map()
+            warmState.revisions = new Map()
             warmState.remoteWarming = new Set()
             warmState.enabled = false
           }
@@ -502,7 +486,7 @@ window.__ModuleLoader__.load({
           try {
             for (let attempt = 0; attempt < 2; attempt += 1) {
               try {
-                await call('warm', { model: modelId })
+                await call('warm', { model: modelId }, { signal: AbortSignal.timeout(WARMUP_CALL_TIMEOUT_MS) })
                 failure = null
                 break
               } catch (error) {
@@ -652,7 +636,7 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         if (!Number.isInteger(turnNumber)) return
         let alive = true
-        void call('turnStats', { sessionId, turn: turnNumber }).then((value) => {
+        void call('turnStats', { sessionId, turn: turnNumber }, { signal: AbortSignal.timeout(5000) }).then((value) => {
           if (alive) setStats(value)
         }).catch(() => {})
         return () => {
@@ -669,7 +653,6 @@ window.__ModuleLoader__.load({
           ? t('stats.ms', { value: ttftMs })
           : t('stats.sec', { value: (ttftMs / 1000).toFixed(1) })
         const span = document.createElement('span')
-        span.setAttribute('data-qwen-turn-stats', '')
         span.style.cssText = 'display:inline-flex;align-items:center;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1.5;white-space:nowrap;'
         const appendPart = (text, color) => {
           const part = document.createElement('span')
@@ -682,6 +665,7 @@ window.__ModuleLoader__.load({
           separator.textContent = '·'
           separator.style.cssText = 'margin:0 6px;color:var(--dsw-alias-label-tertiary);'
           span.appendChild(separator)
+          return separator
         }
         appendPart(model, 'var(--dsw-alias-label-primary)')
         appendSeparator()
@@ -692,6 +676,7 @@ window.__ModuleLoader__.load({
         }
         let hiddenClock = null
         let timePart = null
+        let timeSeparator = null
         const findEndInfo = () => {
           const row = [...document.querySelectorAll('[data-turn-tail]')]
             .find((element) => element.getAttribute('data-turn-tail') === String(turnNumber))
@@ -704,11 +689,16 @@ window.__ModuleLoader__.load({
           const timeText = clock?.textContent?.trim() ?? ''
           if (timeText !== '') {
             if (timePart === null) {
-              appendSeparator()
+              timeSeparator = appendSeparator()
               timePart = document.createElement('span')
               span.appendChild(timePart)
             }
             timePart.textContent = timeText
+          } else if (timePart !== null) {
+            timePart.remove()
+            timePart = null
+            timeSeparator?.remove()
+            timeSeparator = null
           }
           if (clock !== null && clock !== timePart) {
             hiddenClock = clock
@@ -747,44 +737,7 @@ window.__ModuleLoader__.load({
       return String(value)
     }
     const MEASURE_STYLE = { visibility: 'hidden', left: 0, top: 0 }
-    /**
-     * Stand-in for the primitive anchor hook when an older DSH does not export
-     * it. It uses the same top/start geometry as DSH's usage dialog.
-     */
-    function useFallbackAnchoredPosition({ open, anchorRef, panelRef, gap, margin }) {
-      const [pos, setPos] = React.useState(null)
-      React.useLayoutEffect(() => {
-        if (!open) {
-          setPos(null)
-          return undefined
-        }
-        const place = () => {
-          const anchor = anchorRef.current?.getBoundingClientRect()
-          const panel = panelRef.current
-          if (anchor === undefined || panel === null) return
-          const width = panel.offsetWidth
-          const height = panel.offsetHeight
-          const left = Math.max(margin, Math.min(anchor.left, window.innerWidth - margin - width))
-          const top = Math.max(margin, Math.min(anchor.top - gap - height, window.innerHeight - margin - height))
-          setPos((current) => current?.left === left && current?.top === top ? current : { left, top })
-        }
-        place()
-        window.addEventListener('resize', place)
-        window.addEventListener('scroll', place, true)
-        const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(place) : null
-        if (anchorRef.current !== null) resizeObserver?.observe(anchorRef.current)
-        if (panelRef.current !== null) resizeObserver?.observe(panelRef.current)
-        return () => {
-          window.removeEventListener('resize', place)
-          window.removeEventListener('scroll', place, true)
-          resizeObserver?.disconnect()
-        }
-      }, [open, gap, margin])
-      return pos
-    }
-    const useAnchoredPosition = typeof primitives?.useAnchoredPosition === 'function'
-      ? primitives.useAnchoredPosition
-      : useFallbackAnchoredPosition
+    const useAnchoredPosition = primitives.useAnchoredPosition
     const QwenUsagePill = React.memo(function QwenUsagePill({ sessionId, useProjection, getLocale }) {
       const usage = useProjection('tokenUsage')
       const [providerState, setProviderState] = React.useState(() => ({
@@ -808,11 +761,12 @@ window.__ModuleLoader__.load({
         : (usage.uncachedInputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
       const output = usage?.outputTokens ?? 0
       const total = input + output
+      const hasUsage = total > 0
       const totalRef = React.useRef(total)
       totalRef.current = total
 
       React.useEffect(() => {
-        if (typeof sessionId !== 'string' || sessionId === '') return undefined
+        if (!hasUsage || typeof sessionId !== 'string' || sessionId === '') return undefined
         if (sessionProviderCache.get(sessionId) === true) {
           setProviderState((current) => current.sessionId === sessionId && current.geniex
             ? current
@@ -825,7 +779,12 @@ window.__ModuleLoader__.load({
         // A session may not contain a From GenieX reply until a turn finishes,
         // so poll briefly instead of re-probing on every streamed token.
         const tick = async () => {
-          if (cancelled || checks >= 12 || totalRef.current <= 0) return
+          if (cancelled || checks >= 12) return
+          if (totalRef.current <= 0) {
+            if (timer !== null) clearInterval(timer)
+            timer = null
+            return
+          }
           checks += 1
           try {
             const value = await call('sessionProvider', { sessionId }, { signal: AbortSignal.timeout(3000) })
@@ -853,7 +812,7 @@ window.__ModuleLoader__.load({
           cancelled = true
           if (timer !== null) clearInterval(timer)
         }
-      }, [sessionId])
+      }, [hasUsage, sessionId])
 
       React.useEffect(() => {
         if (!open) return undefined
@@ -877,23 +836,7 @@ window.__ModuleLoader__.load({
       const exact = exactFormatter(locale)
       const titleText = locale.startsWith('zh') ? 'Token 用量' : 'Token usage'
       const toggle = () => setOpen((current) => !current)
-      const Icon = primitives?.IconDatabaseOutlineRegular
-      const icon = typeof Icon === 'function'
-        ? h(Icon, { key: 'icon' })
-        : h('svg', {
-            key: 'icon',
-            viewBox: '0 0 16 16',
-            width: 14,
-            height: 14,
-            fill: 'none',
-            stroke: 'currentColor',
-            strokeWidth: 1.2,
-            'aria-hidden': true,
-          }, [
-            h('ellipse', { key: 'top', cx: 8, cy: 4, rx: 4.5, ry: 1.8 }),
-            h('path', { key: 'sides', d: 'M3.5 4v8c0 1 2 1.8 4.5 1.8s4.5-.8 4.5-1.8V4' }),
-            h('path', { key: 'middle', d: 'M3.5 8c0 1 2 1.8 4.5 1.8s4.5-.8 4.5-1.8' }),
-          ])
+      const icon = h(primitives.IconDatabaseOutlineRegular, { key: 'icon' })
       const details = h('dl', {
         key: 'details',
         className: 'qwen-usage-details',
@@ -936,7 +879,7 @@ window.__ModuleLoader__.load({
           icon,
           h('span', { key: 'label', className: 'qwen-usage-label' }, `${formatCompactTokens(total)} tok`),
         ]),
-        panel === null ? null : ReactDOM?.createPortal !== undefined ? ReactDOM.createPortal(panel, document.body) : panel,
+        panel === null ? null : ReactDOM.createPortal(panel, document.body),
       ])
     })
 
@@ -978,7 +921,6 @@ window.__ModuleLoader__.load({
         'button:has([data-qwen-reply-icon])>[class*="triggerLabel"]{display:inline-flex;align-items:center}',
         'button:has([data-qwen-reply-icon])>[class*="triggerIcon"]{display:inline-flex;align-items:center;justify-content:center}',
         'button:has([data-provider-id])>[class*="triggerLabel"]{display:inline-flex;align-items:center}',
-        'button:has([data-provider-id])>[class*="triggerIcon"]{display:none!important}',
         'button:has([data-provider-id])>[class*="triggerLabel"],button:has([data-provider-id])>[class*="triggerEffort"]{display:inline-flex!important;align-items:center!important;height:20px!important;line-height:20px!important}',
         'button:has([data-provider-id])>[class*="triggerLabel"]>span[data-provider-id]{display:inline-flex!important;align-items:center!important;height:20px!important;line-height:20px!important}',
       ].join('')
@@ -1009,13 +951,16 @@ window.__ModuleLoader__.load({
       }
       const hasReplyLabel = (host) => [...host.childNodes].some((node) =>
         node.nodeType === Node.TEXT_NODE && REPLY_LABELS.has(node.nodeValue?.trim() ?? ''))
+      const guards = new Set()
       const guardIcon = (host, icon) => {
         const guard = new MutationObserver(() => {
           if (!host.isConnected || !hasReplyLabel(host)) {
             icon.remove()
             guard.disconnect()
+            guards.delete(guard)
           }
         })
+        guards.add(guard)
         guard.observe(host, { childList: true, characterData: true, subtree: true })
       }
       const scan = () => {
@@ -1074,14 +1019,15 @@ window.__ModuleLoader__.load({
         }
         schedule()
       })
-      if (document.body === null) return () => observer.disconnect()
       observer.observe(document.body, { childList: true, subtree: true })
       scan()
       return () => {
         observer.disconnect()
         if (frame !== null) window.cancelAnimationFrame(frame)
+        for (const guard of guards) guard.disconnect()
+        guards.clear()
         for (const icon of document.querySelectorAll('[data-qwen-reply-icon]')) icon.remove()
-        alignStyle?.remove()
+        alignStyle.remove()
       }
     }
 
@@ -1125,7 +1071,7 @@ window.__ModuleLoader__.load({
       footerHint: { color: 'var(--dsw-alias-label-secondary)', fontSize: '11px', lineHeight: 1.45 },
     }
 
-    /** Per-session warm-bookkeeping maps; model-keyed entries carry the revision. */
+    /** Per-session warm bookkeeping and serialization. */
     const lastProvider = new Map()
     const lastWarmAt = new Map()
     const lastWarmRevision = new Map()
@@ -1185,7 +1131,6 @@ window.__ModuleLoader__.load({
     function installMtpSendGuard(t) {
       if (typeof document === 'undefined') return () => {}
       const panel = { node: null, busy: false, openedAt: 0 }
-      const imageSelectors = ['[data-attachment-kind="image"]', '[class*="rail"] img', '[class*="attachment"] img', '[class*="imagePreview"]', '[class*="image-preview"]']
       const composerHasImages = (button) => {
         let node = button.parentElement
         let root = null
@@ -1198,10 +1143,7 @@ window.__ModuleLoader__.load({
         }
         root ??= button.parentElement?.parentElement ?? null
         if (root === null) return false
-        if (root.querySelector('img') !== null) return true
-        const outer = root.parentElement
-        if (outer !== null && outer.querySelector('[class*="rail"] img, [class*="attachment"] img') !== null) return true
-        return imageSelectors.some((selector) => root.querySelector(selector) !== null)
+        return root.querySelector('img, [class*="imagePreview"], [class*="rail"] img') !== null
       }
       const close = () => {
         if (panel.node !== null) panel.node.remove()
@@ -1322,10 +1264,13 @@ window.__ModuleLoader__.load({
     function showSendWarm() {
       if (sendWarm.spinner !== null) return
       if (sendWarm.style === null && typeof document !== 'undefined') {
-        sendWarm.style = document.createElement('style')
-        sendWarm.style.id = 'qwen-send-warm-style'
-        sendWarm.style.textContent = '@keyframes qwen-send-spin{to{transform:rotate(360deg)}}'
-        document.head.appendChild(sendWarm.style)
+        sendWarm.style = document.getElementById('qwen-send-warm-style')
+        if (sendWarm.style === null) {
+          sendWarm.style = document.createElement('style')
+          sendWarm.style.id = 'qwen-send-warm-style'
+          sendWarm.style.textContent = '@keyframes qwen-send-spin{to{transform:rotate(360deg)}}'
+          document.head.appendChild(sendWarm.style)
+        }
       }
       const button = findSendButton()
       if (button === null) {
@@ -1398,9 +1343,13 @@ window.__ModuleLoader__.load({
       listeners: new Set(),
       subscribe(listener) {
         preheat.listeners.add(listener)
-        return () => preheat.listeners.delete(listener)
+        return () => {
+          preheat.listeners.delete(listener)
+        }
       },
       setSelected(sessionId, modelId) {
+        const current = preheat.selected.get(sessionId)
+        if (modelId === null ? current === undefined : current === modelId) return
         if (modelId === null) preheat.selected.delete(sessionId)
         else preheat.selected.set(sessionId, modelId)
         while (preheat.selected.size > WARM_TRACKING_LIMIT) {
@@ -1459,7 +1408,7 @@ window.__ModuleLoader__.load({
             warmState.warming.set(modelId, count)
           } else {
             warmState.warming.delete(modelId)
-            // The model is resident now; fold the server state back in once.
+            // Refresh so the residency dot reflects the finished load.
             void warmState.refresh()
           }
           for (const listener of warmState.listeners) {
@@ -1507,7 +1456,7 @@ window.__ModuleLoader__.load({
         void call('clientError', {
           message: String(error?.message ?? error),
           stack: String(error?.stack ?? info?.componentStack ?? ''),
-        }).catch(() => {})
+        }, { signal: AbortSignal.timeout(3000) }).catch(() => {})
       }
 
       render() {
@@ -1657,8 +1606,8 @@ window.__ModuleLoader__.load({
         }
         return largest
       })()
-      // Mirrors the host's effectiveContext so the shown estimate matches the
-      // context window the provider entry and nctx actually use.
+      // This preview has no selected-model context; the host applies the real
+      // per-model context and QAIRT defaults.
       const effectiveContext = (configured) => {
         const explicit = Number.isFinite(configured) && configured > 0 ? configured : null
         if (inferredContext !== null && settings?.autoNctx === true) return inferredContext
@@ -2088,7 +2037,7 @@ window.__ModuleLoader__.load({
           const report = (message, stack) => {
             const text = `${message}\n${stack}`
             if (!/qwen|QwenMode|qwen-usage/i.test(text)) return
-            void call('clientError', { message: String(message), stack: String(stack) }).catch(() => {})
+            void call('clientError', { message: String(message), stack: String(stack) }, { signal: AbortSignal.timeout(3000) }).catch(() => {})
           }
           const onError = (event) => report(event.message, event.error?.stack ?? '')
           const onRejection = (event) => report(String(event.reason?.message ?? event.reason ?? ''), event.reason?.stack ?? '')
@@ -2101,10 +2050,10 @@ window.__ModuleLoader__.load({
         }, 'qwen-mode: client error diagnostics')
         if (typeof document !== 'undefined') {
           const style = document.createElement('style')
-          style.id = 'qwen-model-option-warm'
+          style.id = 'qwen-model-labels'
           style.textContent = 'button[role="option"] [data-provider-id]{display:flex!important;align-items:center!important;width:100%!important;min-width:0!important}@keyframes qwen-model-name-marquee{from{transform:translateX(0)}to{transform:translateX(calc(-1 * var(--qwen-model-name-distance,0px)))}}body:has([data-qwen-usage]) [data-composer-stat="usage"]{display:none!important}'
           document.head.appendChild(style)
-          ctx.effect(() => () => style.remove(), 'qwen-mode: model option warm style')
+          ctx.effect(() => () => style.remove(), 'qwen-mode: model label styles')
           const usageStyle = document.createElement('style')
           usageStyle.id = 'qwen-usage-style'
           usageStyle.textContent = [
@@ -2131,7 +2080,7 @@ window.__ModuleLoader__.load({
               const target = event.target
               if (!(target instanceof Element)) return
               const button = target.closest('button[role="menuitemradio"][title]')
-              if (button !== null) button.removeAttribute('title')
+              if (button !== null && button.querySelector('[data-provider-id]') !== null) button.removeAttribute('title')
             }
             document.addEventListener('pointerover', suppress, true)
             document.addEventListener('focusin', suppress, true)
@@ -2140,6 +2089,11 @@ window.__ModuleLoader__.load({
               document.removeEventListener('focusin', suppress, true)
             }
           }, 'qwen-mode: model option title')
+          ctx.effect(() => () => {
+            clearSendWarm()
+            sendWarm.style?.remove()
+            sendWarm.style = null
+          }, 'qwen-mode: send spinner')
         }
         let bound
         try {
