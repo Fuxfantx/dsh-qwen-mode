@@ -710,6 +710,45 @@ window.__ModuleLoader__.load({
       if (value >= 1000) return `${(value / 1000).toFixed(1).replace(/\.0$/u, '')}K`
       return String(value)
     }
+    const MEASURE_STYLE = { visibility: 'hidden', left: 0, top: 0 }
+    /**
+     * Stand-in for the primitive anchor hook when an older DSH does not export
+     * it. It uses the same top/start geometry as DSH's usage dialog.
+     */
+    function useFallbackAnchoredPosition({ open, anchorRef, panelRef, gap, margin }) {
+      const [pos, setPos] = React.useState(null)
+      React.useLayoutEffect(() => {
+        if (!open) {
+          setPos(null)
+          return undefined
+        }
+        const place = () => {
+          const anchor = anchorRef.current?.getBoundingClientRect()
+          const panel = panelRef.current
+          if (anchor === undefined || panel === null) return
+          const width = panel.offsetWidth
+          const height = panel.offsetHeight
+          const left = Math.max(margin, Math.min(anchor.left, window.innerWidth - margin - width))
+          const top = Math.max(margin, Math.min(anchor.top - gap - height, window.innerHeight - margin - height))
+          setPos((current) => current?.left === left && current?.top === top ? current : { left, top })
+        }
+        place()
+        window.addEventListener('resize', place)
+        window.addEventListener('scroll', place, true)
+        const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(place) : null
+        if (anchorRef.current !== null) resizeObserver?.observe(anchorRef.current)
+        if (panelRef.current !== null) resizeObserver?.observe(panelRef.current)
+        return () => {
+          window.removeEventListener('resize', place)
+          window.removeEventListener('scroll', place, true)
+          resizeObserver?.disconnect()
+        }
+      }, [open, gap, margin])
+      return pos
+    }
+    const useAnchoredPosition = typeof primitives?.useAnchoredPosition === 'function'
+      ? primitives.useAnchoredPosition
+      : useFallbackAnchoredPosition
     const QwenUsagePill = React.memo(function QwenUsagePill({ sessionId, useProjection, getLocale }) {
       const usage = useProjection('tokenUsage')
       const [providerState, setProviderState] = React.useState(() => ({
@@ -717,9 +756,17 @@ window.__ModuleLoader__.load({
         geniex: sessionProviderCache.get(sessionId) === true,
       }))
       const [open, setOpen] = React.useState(false)
-      const [position, setPosition] = React.useState(null)
       const buttonRef = React.useRef(null)
       const panelRef = React.useRef(null)
+      const anchored = useAnchoredPosition({
+        open,
+        anchorRef: buttonRef,
+        panelRef,
+        side: 'top',
+        align: 'start',
+        gap: 8,
+        margin: 12,
+      })
       const input = usage === undefined
         ? 0
         : (usage.uncachedInputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
@@ -793,19 +840,7 @@ window.__ModuleLoader__.load({
       const locale = String(getLocale?.() ?? 'zh')
       const exact = exactFormatter(locale)
       const titleText = locale.startsWith('zh') ? 'Token 用量' : 'Token usage'
-      const toggle = () => {
-        if (open) {
-          setOpen(false)
-          return
-        }
-        const rect = buttonRef.current?.getBoundingClientRect()
-        if (rect === undefined) return
-        setPosition({
-          right: Math.max(8, window.innerWidth - rect.right),
-          bottom: Math.max(8, window.innerHeight - rect.top + 8),
-        })
-        setOpen(true)
-      }
+      const toggle = () => setOpen((current) => !current)
       const Icon = primitives?.IconDatabaseOutlineRegular
       const icon = typeof Icon === 'function'
         ? h(Icon, { key: 'icon' })
@@ -832,16 +867,13 @@ window.__ModuleLoader__.load({
         h('dt', { key: 'output-label' }, locale.startsWith('zh') ? '输出' : 'Output'),
         h('dd', { key: 'output-value' }, exact.format(output)),
       ])
-      const panel = open && position !== null ? h('div', {
+      const panel = open ? h('div', {
         ref: panelRef,
         role: 'dialog',
         'aria-label': titleText,
         'data-qwen-usage-panel': '',
         className: 'qwen-usage-panel',
-        style: {
-          right: `${position.right}px`,
-          bottom: `${position.bottom}px`,
-        },
+        style: anchored ?? MEASURE_STYLE,
       }, [
         h('div', { key: 'title', className: 'qwen-usage-title' }, [
           h('span', { key: 'label', className: 'qwen-usage-title-label' }, [icon, titleText]),
