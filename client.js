@@ -246,6 +246,7 @@ window.__ModuleLoader__.load({
 
     const warmState = {
       states: new Map(),
+      revisions: new Map(),
       warming: new Map(),
       remoteWarming: new Set(),
       enabled: false,
@@ -272,6 +273,7 @@ window.__ModuleLoader__.load({
         try {
           const status = await call('modelStatus', undefined, { signal: AbortSignal.timeout(3000) })
           warmState.states = new Map(Object.entries(status?.states ?? {}))
+          warmState.revisions = new Map(Object.entries(status?.revisions ?? {}))
           warmState.remoteWarming = new Set(Array.isArray(status?.warming) ? status.warming : [])
           warmState.enabled = status?.active === true
           warmState.failures = 0
@@ -424,7 +426,9 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         const update = () => {
           setWarmEnabled((current) => current === warmState.enabled ? current : warmState.enabled)
-          setWarmRevision((current) => current === warmState.revision ? current : warmState.revision)
+          const modelRevision = typeof model?.id === 'string' ? warmState.revisions.get(model.id) : undefined
+          const nextRevision = modelRevision ?? warmState.revision
+          setWarmRevision((current) => current === nextRevision ? current : nextRevision)
           if (placement === 'option' && provider?.id === 'from-geniex' && typeof model?.id === 'string') {
             const next = warmState.warming.has(model.id) || warmState.remoteWarming.has(model.id)
               ? 'loading'
@@ -469,9 +473,22 @@ window.__ModuleLoader__.load({
           if (!preheat.enabled) return
           const loaded = warmState.states.has(modelId)
           const modelKey = `${key}\u0000${modelId}`
-          if (loaded && lastWarm.get(key) === modelId && lastWarmRevision.get(modelKey) === warmRevision) return
-          if (loaded && lastWarmRevision.get(modelKey) === warmRevision && Date.now() - (lastWarmAt.get(modelKey) ?? 0) < 15000) return
-          lastWarm.set(key, modelId)
+          const warmedRevision = lastWarmRevision.get(modelKey)
+          if (loaded) {
+            if (warmedRevision === undefined) {
+              // The model is already resident (loaded by another session or
+              // before this mount). Adopt that observation instead of
+              // re-warming; a later settings revision still falls through.
+              lastWarmRevision.set(modelKey, warmRevision)
+              lastWarmAt.set(modelKey, Date.now())
+              return
+            }
+            if (warmedRevision === warmRevision) return
+          } else if (warmedRevision === warmRevision && Date.now() - (lastWarmAt.get(modelKey) ?? 0) < 15000) {
+            // A warm request for this revision may still be settling; do not
+            // repeat it while the status snapshot catches up.
+            return
+          }
           lastWarmRevision.set(modelKey, warmRevision)
           lastWarmAt.set(modelKey, Date.now())
           trimWarmTracking()
@@ -479,7 +496,8 @@ window.__ModuleLoader__.load({
           try {
             await call('warm', { model: modelId })
           } catch {
-            lastWarm.delete(key)
+            lastWarmRevision.delete(modelKey)
+            lastWarmAt.delete(modelKey)
           } finally {
             preheat.end(modelKey, modelId)
           }
@@ -1039,8 +1057,7 @@ window.__ModuleLoader__.load({
       footerHint: { color: 'var(--dsw-alias-label-secondary)', fontSize: '11px', lineHeight: 1.45 },
     }
 
-    /** Per-session model already warmed; re-selecting the same model is a no-op. */
-    const lastWarm = new Map()
+    /** Per-session warm-bookkeeping maps; model-keyed entries carry the revision. */
     const lastProvider = new Map()
     const lastWarmAt = new Map()
     const lastWarmRevision = new Map()
@@ -1048,7 +1065,7 @@ window.__ModuleLoader__.load({
     const selectedMtp = { model: '' }
     const WARM_TRACKING_LIMIT = 200
     function trimWarmTracking() {
-      for (const map of [lastWarm, lastProvider, lastWarmAt, lastWarmRevision, warmChain]) {
+      for (const map of [lastProvider, lastWarmAt, lastWarmRevision, warmChain]) {
         while (map.size > WARM_TRACKING_LIMIT) {
           const oldest = map.keys().next().value
           if (oldest === undefined) break

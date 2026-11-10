@@ -439,6 +439,7 @@ function readProviderConfig(ctx) {
 
 /** Merge a change into the provider table through one config edit. */
 async function editProviders(ctx, change) {
+  if (runtime.disposed) return
   const { entry } = readProviderConfig(ctx)
   await runConfigEdit(ctx, entry, (current, inherited) => {
     const config = { ...(inherited ?? {}), ...(current ?? {}) }
@@ -550,7 +551,8 @@ async function discoverModels(ctx, settings, capabilities) {
 /** Whether the settings that produced one provider snapshot are still current. */
 function providerSettingsCurrent(snapshot) {
   const current = runtime.settings
-  return current.mode === 'auto'
+  return !runtime.disposed
+    && current.mode === 'auto'
     && current.protocol === snapshot.protocol
     && current.upstream === snapshot.upstream
     && apiKeyRef(current) === apiKeyRef(snapshot)
@@ -582,7 +584,8 @@ async function upsertProvider(ctx, settings) {
   let changed = true
   try {
     const { providers } = readProviderConfig(ctx)
-    changed = runtime.settings.managedProviderId !== id || !isDeepStrictEqual(providers[id], desired)
+    const staleSibling = Object.values(PROVIDERS).some((provider) => provider.id !== id && providers[provider.id] !== undefined)
+    changed = staleSibling || runtime.settings.managedProviderId !== id || !isDeepStrictEqual(providers[id], desired)
   } catch {
     // The provider table is unreadable; let the edit surface the failure.
   }
@@ -592,6 +595,9 @@ async function upsertProvider(ctx, settings) {
       if (!providerSettingsCurrent(settings)) return
       const previous = runtime.settings.managedProviderId
       if (previous !== null && previous !== id) delete providers[previous]
+      for (const provider of Object.values(PROVIDERS)) {
+        if (provider.id !== id) delete providers[provider.id]
+      }
       providers[id] = desired
       committed = true
     })
@@ -620,13 +626,27 @@ async function upsertProvider(ctx, settings) {
   }
 }
 
-async function deleteProvider(ctx, id) {
-  if (id === null) return
+/** Every provider id this plugin may have written in an earlier install. */
+function managedProviderIds(settings) {
+  return [settings.managedProviderId, PROVIDERS.geniex.id, PROVIDERS.qwen.id]
+}
+
+/** Delete the managed providers that are actually present in the config. */
+async function deleteProviders(ctx, ids) {
+  if (runtime.disposed) return
+  let present
+  try {
+    const { providers } = readProviderConfig(ctx)
+    present = [...new Set(ids)].filter((id) => typeof id === 'string' && id !== '' && providers[id] !== undefined)
+  } catch {
+    return
+  }
+  if (present.length === 0) return
   await editProviders(ctx, (providers) => {
-    delete providers[id]
+    for (const id of present) delete providers[id]
   })
   try {
-    ctx.emit('llm/models-updated', id)
+    for (const id of present) ctx.emit('llm/models-updated', id)
     ctx.emit('llm/adapters-updated')
   } catch {
     // Catalog refresh is best-effort.
@@ -660,6 +680,7 @@ function readManagedProvider(ctx, settings) {
 function createRuntime() {
   return {
     settings: normalizeSettings({}),
+    disposed: false,
     profileDir: '',
     storePath: '',
     logger: null,
@@ -673,6 +694,9 @@ function createRuntime() {
     modelCapabilities: new Map(),
     modelReasoning: new Map(),
     capabilitySignature: '',
+    loadSignatures: new Map(),
+    loadRevisions: new Map(),
+    loadRevision: 0,
     modelRevision: 0,
     capabilityRetryAt: 0,
     managedRefresh: null,
@@ -730,20 +754,30 @@ function applyManagedProvider(provider) {
 
 /** Rebuild the capability-derived sets; returns whether anything changed. */
 function applyCapabilities(capabilities) {
-  const signature = JSON.stringify([...capabilities]
-    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-    .map(([id, capability]) => [
-      id,
-      capability?.contextLength ?? null,
-      capability?.maxOutput ?? null,
-      capability?.vision ?? null,
-      capability?.reasoningEfforts ?? null,
-      capability?.mtpDraft ?? null,
-      capability?.mtpReady ?? null,
-      capability?.hasMtp ?? null,
-      capability?.tags ?? null,
-      capability?.sampling ?? null,
-    ]))
+  const sorted = [...capabilities].sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+  const signature = JSON.stringify(sorted.map(([id, capability]) => [
+    id,
+    capability?.contextLength ?? null,
+    capability?.maxOutput ?? null,
+    capability?.vision ?? null,
+    capability?.reasoningEfforts ?? null,
+    capability?.mtpDraft ?? null,
+    capability?.mtpReady ?? null,
+    capability?.hasMtp ?? null,
+    capability?.tags ?? null,
+    capability?.sampling ?? null,
+  ]))
+  // Warm state must not follow unrelated metadata such as sampling defaults or
+  // tags: only these fields change what GenieX loads into memory. The revision
+  // is per model so a catalog change for another model cannot re-warm the
+  // model the user is looking at.
+  const loadFields = (capability) => JSON.stringify([
+    capability?.contextLength ?? null,
+    capability?.vision ?? null,
+    capability?.runtime ?? null,
+    capability?.mtpDraft ?? null,
+    capability?.mtpReady ?? null,
+  ])
   runtime.mtpModels.clear()
   runtime.mtpDrafts.clear()
   runtime.modelContexts.clear()
@@ -755,6 +789,19 @@ function applyCapabilities(capabilities) {
       runtime.mtpDrafts.set(id, capability.mtpDraft)
     }
     if (positiveIntOrNull(capability?.contextLength) !== null) runtime.modelContexts.set(id, capability.contextLength)
+    if (capability === null || capability === undefined) continue
+    const signature = loadFields(capability)
+    if (runtime.loadSignatures.get(id) !== signature) {
+      runtime.loadSignatures.set(id, signature)
+      runtime.loadRevision += 1
+      runtime.loadRevisions.set(id, runtime.loadRevision)
+    }
+  }
+  for (const id of [...runtime.loadSignatures.keys()]) {
+    if (!capabilities.has(id)) {
+      runtime.loadSignatures.delete(id)
+      runtime.loadRevisions.delete(id)
+    }
   }
   const changed = signature !== runtime.capabilitySignature
   runtime.capabilitySignature = signature
@@ -773,13 +820,14 @@ function runtimeCapabilities(ctx) {
 
 /** Resolve capabilities for every managed model and refresh both catalogs. */
 function refreshManagedModels(ctx, force = false) {
-  const snapshot = { ...runtime.settings }
+  const instance = runtime
+  const snapshot = { ...instance.settings }
   const key = [snapshot.mode, snapshot.protocol, snapshot.upstream, snapshot.managedProviderId].join('|')
-  const currentKey = () => [runtime.settings.mode, runtime.settings.protocol, runtime.settings.upstream, runtime.settings.managedProviderId].join('|')
-  if (!force && runtime.managedRefresh !== null && runtime.managedRefreshKey === key) return runtime.managedRefresh
+  const currentKey = () => [instance.settings.mode, instance.settings.protocol, instance.settings.upstream, instance.settings.managedProviderId].join('|')
+  if (!force && instance.managedRefresh !== null && instance.managedRefreshKey === key) return instance.managedRefresh
   const promise = (async () => {
     if (snapshot.mode !== 'auto') {
-      if (currentKey() !== key) return
+      if (runtime !== instance || instance.disposed || currentKey() !== key) return
       applyManagedProvider(null)
       if (applyCapabilities(new Map())) runtime.modelRevision += 1
       invalidateState()
@@ -793,18 +841,18 @@ function refreshManagedModels(ctx, force = false) {
         capabilities.set(id, await runtimeCapabilities(ctx).resolve(snapshot, id))
       })
     }
-    if (currentKey() !== key) return
+    if (runtime !== instance || instance.disposed || currentKey() !== key) return
     applyManagedProvider(provider)
     if (snapshot.protocol === 'geniex' && applyCapabilities(capabilities)) runtime.modelRevision += 1
     invalidateState()
   })().finally(() => {
-    if (runtime.managedRefresh === promise) {
-      runtime.managedRefresh = null
-      runtime.managedRefreshKey = ''
+    if (runtime === instance && instance.managedRefresh === promise) {
+      instance.managedRefresh = null
+      instance.managedRefreshKey = ''
     }
   })
-  runtime.managedRefresh = promise
-  runtime.managedRefreshKey = key
+  instance.managedRefresh = promise
+  instance.managedRefreshKey = key
   return promise
 }
 
@@ -823,9 +871,12 @@ function providerSettingsKey() {
 
 /** One provider-build attempt for the current settings. */
 async function syncProviderOnce(ctx) {
-  const settings = runtime.settings
+  const instance = runtime
+  if (instance.disposed) return
+  const settings = instance.settings
   if (settings.mode === 'off') {
-    await deleteProvider(ctx, settings.managedProviderId)
+    await deleteProviders(ctx, managedProviderIds(settings))
+    if (runtime !== instance || instance.disposed) return
     settings.managedProviderId = null
     applyManagedProvider(null)
     if (applyCapabilities(new Map())) runtime.modelRevision += 1
@@ -840,7 +891,7 @@ async function syncProviderOnce(ctx) {
   const provider = await upsertProvider(ctx, settings)
   if (provider === null) return
   // The mode, source, or key may have changed while discovery was in flight.
-  if (!providerSettingsCurrent(settings)) return
+  if (runtime !== instance || instance.disposed || !providerSettingsCurrent(settings)) return
   applyManagedProvider(provider)
   if (applyCapabilities(provider.capabilities)) runtime.modelRevision += 1
   runtime.capabilityRetryAt = 0
@@ -857,18 +908,19 @@ async function syncProviderOnce(ctx) {
  */
 function syncProvider(ctx, attempts = 1) {
   const instance = runtime
+  if (instance.disposed) return Promise.resolve()
   const generation = ++runtime.syncGeneration
   const key = providerSettingsKey()
   runtime.pendingSync += 1
   invalidateState()
   const run = (async () => {
     for (let attempt = 0; ; attempt += 1) {
-      if (runtime !== instance || generation !== runtime.syncGeneration) return
+      if (runtime !== instance || instance.disposed || generation !== runtime.syncGeneration) return
       try {
         await providerTask(() => syncProviderOnce(ctx))
         return
       } catch (error) {
-        if (runtime !== instance || generation !== runtime.syncGeneration) return
+        if (runtime !== instance || instance.disposed || generation !== runtime.syncGeneration) return
         const superseded = providerSettingsKey() !== key || runtime.settings.mode === 'off'
         if (superseded || error?.retryable === false || attempt >= attempts - 1) throw error
         await delay(SYNC_RETRY_DELAYS[Math.min(attempt, SYNC_RETRY_DELAYS.length - 1)])
@@ -876,7 +928,7 @@ function syncProvider(ctx, attempts = 1) {
     }
   })()
   return run.finally(() => {
-    if (runtime !== instance) return
+    if (runtime !== instance || instance.disposed) return
     runtime.pendingSync = Math.max(0, runtime.pendingSync - 1)
     invalidateState()
   })
@@ -885,9 +937,10 @@ function syncProvider(ctx, attempts = 1) {
 /** Start a provider sync without making the settings page wait for it. */
 function startBackgroundSync(ctx, attempts) {
   const instance = runtime
+  if (instance.disposed) return
   const key = providerSettingsKey()
   void syncProvider(ctx, attempts).catch((error) => {
-    if (runtime !== instance || providerSettingsKey() !== key) return
+    if (runtime !== instance || instance.disposed || providerSettingsKey() !== key) return
     runtime.settings.lastError = userError(error)
     invalidateState()
     runtime.logger?.warn?.(`[${SCOPE}] cannot refresh managed provider: ${userError(error)}`)
@@ -1420,11 +1473,16 @@ async function warmUpModel(ctx, settings, model, options) {
 async function readModelStatus(ctx) {
   const settings = runtime.settings
   if (!(settings.mode === 'auto' && settings.protocol === 'geniex' && settings.warm === true)) {
-    return { active: false, models: [], warming: [], revision: runtime.modelRevision }
+    return { active: false, models: [], warming: [], revision: runtime.loadRevision, revisions: Object.fromEntries(runtime.loadRevisions) }
   }
   const cached = runtime.statusCache
   if (cached.key === settings.upstream && Date.now() - cached.at < 1500) {
-    return { ...cached.value, warming: [...runtime.warmingModels], revision: runtime.modelRevision }
+    return {
+      ...cached.value,
+      warming: [...runtime.warmingModels],
+      revision: runtime.loadRevision,
+      revisions: Object.fromEntries(runtime.loadRevisions),
+    }
   }
   let value = { active: true, models: [], warming: [] }
   try {
@@ -1448,7 +1506,8 @@ async function readModelStatus(ctx) {
     // A missing status endpoint means the client cannot classify warm models.
   }
   value.warming = [...runtime.warmingModels]
-  value.revision = runtime.modelRevision
+  value.revision = runtime.loadRevision
+  value.revisions = Object.fromEntries(runtime.loadRevisions)
   runtime.statusCache = { key: settings.upstream, at: Date.now(), value }
   return value
 }
@@ -1546,7 +1605,7 @@ function createApi(ctx) {
         // An in-flight discovery sees the new mode at commit time and skips.
         runtime.syncGeneration += 1
         try {
-          await deleteProvider(ctx, runtime.settings.managedProviderId)
+          await deleteProviders(ctx, managedProviderIds(runtime.settings))
           runtime.settings.managedProviderId = null
           applyManagedProvider(null)
           if (applyCapabilities(new Map())) runtime.modelRevision += 1
@@ -1663,16 +1722,17 @@ function createApi(ctx) {
         || providerChanged
         || providerRemoval
         || (next.mode === 'auto' && next.managedProviderId === null)
-      const loadChanged = requiresSync
-        || next.contextWindow !== previous.contextWindow
+      const loadFlagsChanged = next.contextWindow !== previous.contextWindow
         || next.autoNctx !== previous.autoNctx
-        || next.maxOutputTokens !== previous.maxOutputTokens
         || next.mtp !== previous.mtp
         || next.mtpDraftTokens !== previous.mtpDraftTokens
         || next.mtpDraftMin !== previous.mtpDraftMin
         || next.mtpDraftPMin !== previous.mtpDraftPMin
         || next.compute !== previous.compute
         || next.vitCompute !== previous.vitCompute
+      const loadChanged = requiresSync
+        || loadFlagsChanged
+        || next.maxOutputTokens !== previous.maxOutputTokens
       const revisionBefore = runtime.modelRevision
       runtime.settings = next
       invalidateState()
@@ -1686,6 +1746,10 @@ function createApi(ctx) {
       }
       runtime.settings.lastError = null
       if (requiresSync) startBackgroundSync(ctx, 3)
+      if (loadFlagsChanged) {
+        runtime.loadRevision += 1
+        for (const id of runtime.managedModels) runtime.loadRevisions.set(id, runtime.loadRevision)
+      }
       if (loadChanged && runtime.modelRevision === revisionBefore) runtime.modelRevision += 1
       return readState(ctx)
     },
@@ -1702,7 +1766,7 @@ function createApi(ctx) {
       invalidateState()
       try {
         await providerTask(async () => {
-          await deleteProvider(ctx, runtime.settings.managedProviderId)
+          await deleteProviders(ctx, managedProviderIds(runtime.settings))
           runtime.settings.managedProviderId = null
         })
         applyManagedProvider(null)
@@ -1722,12 +1786,21 @@ function createApi(ctx) {
 function persistSettings() {
   const instance = runtime
   const run = async () => {
+    if (instance.disposed) return
     await mkdir(instance.profileDir, { recursive: true })
     const payload = { ...instance.settings }
     delete payload.lastError
     const body = `${JSON.stringify(payload, null, 2)}\n`
     const temporary = `${instance.storePath}.${process.pid}.${Date.now()}.tmp`
     await writeFile(temporary, body, 'utf8')
+    if (instance.disposed) {
+      try {
+        await unlink(temporary)
+      } catch {
+        // The disposed instance leaves no settings behind.
+      }
+      return
+    }
     try {
       await rename(temporary, instance.storePath)
     } catch {
@@ -1746,8 +1819,10 @@ function persistSettings() {
 
 /** Bind the loopback proxy, sliding to the next port when one is taken. */
 async function startProxy() {
+  const instance = runtime
+  if (instance.disposed) return null
   const server = http.createServer((req, res) => handleProxyRequest(req, res))
-  const preferred = runtime.settings.proxyPort
+  const preferred = instance.settings.proxyPort
   let bound = null
   for (let offset = 0; offset < PROXY_PORT_TRIES; offset += 1) {
     const port = preferred + offset
@@ -1770,22 +1845,26 @@ async function startProxy() {
       break
     } catch (error) {
       if (error?.code !== 'EADDRINUSE' && error?.code !== 'EACCES') {
-        runtime.logger.warn(`[${SCOPE}] cannot bind proxy on ${port}: ${userError(error)}`)
+        instance.logger.warn(`[${SCOPE}] cannot bind proxy on ${port}: ${userError(error)}`)
         break
       }
     }
   }
   if (bound === null) {
-    runtime.bindError = `Cannot bind the Qwen mode proxy near port ${preferred}`
+    instance.bindError = `Cannot bind the Qwen mode proxy near port ${preferred}`
     invalidateState()
     return null
   }
-  runtime.bindError = null
+  if (runtime !== instance || instance.disposed) {
+    await new Promise((resolve) => server.close(() => resolve()))
+    return null
+  }
+  instance.bindError = null
   server.on('error', (error) => {
-    runtime.logger?.warn?.(`[${SCOPE}] proxy server error: ${userError(error)}`)
+    instance.logger?.warn?.(`[${SCOPE}] proxy server error: ${userError(error)}`)
   })
-  if (runtime.settings.proxyPort !== bound) {
-    runtime.settings.proxyPort = bound
+  if (instance.settings.proxyPort !== bound) {
+    instance.settings.proxyPort = bound
     invalidateState()
     await persistSettings().catch(() => {})
   }
@@ -1871,6 +1950,10 @@ export async function apply(ctx) {
   const instance = runtime
   providerChain = Promise.resolve()
   persistChain = Promise.resolve()
+  // A reinstall can start before every async task of the previous instance has
+  // settled. The flag lets those tasks stop instead of writing settings or
+  // config after their plugin has been disposed.
+  ctx.effect(() => () => { instance.disposed = true }, `${SCOPE}: lifecycle`)
   runtime.logger = loggerFor(ctx, SCOPE)
   runtime.profileDir = text(process.env.DSH_PROFILE_DIR) || process.cwd()
   runtime.storePath = join(runtime.profileDir, STORE_FILE)
@@ -1946,11 +2029,23 @@ export async function apply(ctx) {
   for (const agent of ctx.agents.list()) applyReplyOnly(ctx, agent)
 
   const server = await startProxy()
+  if (instance.disposed) {
+    if (server !== null) {
+      await new Promise((resolve) => {
+        server.close(() => resolve())
+        server.closeAllConnections?.()
+      })
+    }
+    return
+  }
   if (server !== null) {
-    ctx.effect(() => () => new Promise((resolve) => {
-      server.close(() => resolve())
-      server.closeAllConnections?.()
-    }), `${SCOPE}: proxy server`)
+    ctx.effect(() => () => {
+      instance.disposed = true
+      return new Promise((resolve) => {
+        server.close(() => resolve())
+        server.closeAllConnections?.()
+      })
+    }, `${SCOPE}: proxy server`)
   }
 
   // Provider discovery talks to the upstream, so it must never delay
@@ -1958,16 +2053,16 @@ export async function apply(ctx) {
   // settings page) for the full discovery timeout. The sync below retries on
   // its own, so a congested link only delays the provider, not the plugin.
   const startupSync = async () => {
-    if (runtime !== instance) return
+    if (runtime !== instance || instance.disposed) return
     try {
       await refreshManagedModels(ctx, true)
       await syncProvider(ctx, 4)
-      if (runtime !== instance) return
+      if (runtime !== instance || instance.disposed) return
       runtime.settings.lastError = null
       invalidateState()
       await persistSettings()
     } catch (error) {
-      if (runtime !== instance) return
+      if (runtime !== instance || instance.disposed) return
       runtime.settings.lastError = userError(error)
       invalidateState()
       runtime.logger.warn(`[${SCOPE}] cannot refresh managed provider: ${userError(error)}`)
