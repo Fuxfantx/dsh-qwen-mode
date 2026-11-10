@@ -39,7 +39,7 @@
 2. 选择来源：
    - **GenieX**：填写本机地址，默认为 `http://127.0.0.1:18181`。
    - **QwenCloud**：填写完整的兼容端点，例如 `https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`。
-3. 使用 QwenCloud 时，在「高级选项」中填写保存 API Key 的环境变量名或 DSH 凭据名（例如 `DASHSCOPE_API_KEY`）。GenieX 不校验 Key，可以留空。
+3. 使用 QwenCloud 时，填写保存 API Key 的环境变量名或 DSH 凭据名（例如 `DASHSCOPE_API_KEY`）。GenieX 不校验 Key，可以留空。
 4. 按需设置上下文、最大输出、思考、采样、预热、MTP 与推理后端。
 5. 点击 **保存并应用**。
 6. 在模型选择器中选择 **From GenieX** 或 **From QwenCloud** 下的模型。
@@ -100,7 +100,7 @@ Connect DSH to Qwen: use models running on a local GenieX server, or QwenCloud o
 2. Choose a source:
    - **GenieX**: enter the local address, `http://127.0.0.1:18181` by default.
    - **QwenCloud**: enter the full compatible endpoint, for example `https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`.
-3. With QwenCloud, enter the environment variable or DSH credential name that stores the API key under **Advanced** (for example `DASHSCOPE_API_KEY`). GenieX does not check the key, so it can stay empty.
+3. With QwenCloud, enter the environment variable or DSH credential name that stores the API key (for example `DASHSCOPE_API_KEY`). GenieX does not check the key, so it can stay empty.
 4. Adjust context, output limit, thinking, sampling, warmup, MTP, and inference backend as needed.
 5. Click **Save and apply**.
 6. Select a model under **From GenieX** or **From QwenCloud** in the model picker.

@@ -48,7 +48,6 @@ window.__ModuleLoader__.load({
       'apiKeyEnv.invalid': 'Key 变量名只能包含字母、数字和下划线，且不能以数字开头。',
       'warm.label': '选择 From GenieX 模型时自动预热',
       'warm.hint': '切换到 From GenieX 模型后，让 GenieX 提前将模型加载到内存中；预热期间发送按钮显示转圈。',
-      'advanced': '高级选项',
       'provider.title': '自动维护的 Provider',
       'provider.name': 'Provider',
       'provider.baseURL': 'baseURL',
@@ -98,6 +97,7 @@ window.__ModuleLoader__.load({
       'presencePenalty.label': 'presence_penalty',
       'frequencyPenalty.label': 'frequency_penalty',
       'seed.label': 'seed',
+      'seed.placeholder': '不指定',
       'save': '保存并应用',
       'saving': '保存中…',
       'loadFailed': '读取设置失败：{message}',
@@ -132,7 +132,6 @@ window.__ModuleLoader__.load({
       'apiKeyEnv.invalid': 'The reference may contain only letters, digits, and underscores, and cannot start with a digit.',
       'warm.label': 'Warm up when selecting a From GenieX model',
       'warm.hint': 'After switching to a From GenieX model, GenieX loads the model into memory ahead of time; the send button shows a spinner while warming.',
-      'advanced': 'Advanced',
       'provider.title': 'Managed provider',
       'provider.name': 'Provider',
       'provider.baseURL': 'baseURL',
@@ -182,6 +181,7 @@ window.__ModuleLoader__.load({
       'presencePenalty.label': 'presence_penalty',
       'frequencyPenalty.label': 'frequency_penalty',
       'seed.label': 'seed',
+      'seed.placeholder': 'Not specified',
       'save': 'Save and apply',
       'saving': 'Saving…',
       'loadFailed': 'Cannot read settings: {message}',
@@ -1037,8 +1037,6 @@ window.__ModuleLoader__.load({
       badgeOn: { display: 'inline-flex', alignItems: 'center', padding: '2px 7px', borderRadius: '999px', fontSize: '10px', border: '1px solid var(--dsw-alias-state-success-primary)', color: 'var(--dsw-alias-state-success-primary)', whiteSpace: 'nowrap' },
       footer: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', paddingTop: '2px' },
       footerHint: { color: 'var(--dsw-alias-label-secondary)', fontSize: '11px', lineHeight: 1.45 },
-      details: { borderTop: '1px solid var(--dsw-alias-border-l1)', paddingTop: '8px' },
-      summary: { cursor: 'pointer', color: 'var(--dsw-alias-label-secondary)', fontSize: '11px' },
     }
 
     /** Per-session model already warmed; re-selecting the same model is a no-op. */
@@ -1772,31 +1770,26 @@ window.__ModuleLoader__.load({
               onChange: (event) => update('upstream', event.target.value),
             })),
           ]),
-          h('details', { key: 'advanced', style: S.details }, [
-            h('summary', { key: 'summary', style: S.summary }, t('advanced')),
-            h('div', { key: 'body', style: { paddingTop: '8px', display: 'flex', flexDirection: 'column', gap: '10px' } }, [
-              h(Field, {
-                key: 'apiKeyEnv',
-                label: t('apiKeyEnv.label'),
-                hint: t('apiKeyEnv.hint'),
-              }, h('input', {
-                style: S.input,
-                value: settings.apiKeyEnv,
-                placeholder: settings.protocol === 'qwen' ? t('apiKeyEnv.placeholder') : 'local',
-                onChange: (event) => update('apiKeyEnv', event.target.value),
-              })),
-              settings.protocol === 'geniex' ? h('label', { key: 'warm', style: S.checkRow }, [
-                h('input', {
-                  key: 'checkbox',
-                  type: 'checkbox',
-                  checked: settings.warm === true,
-                  onChange: (event) => update('warm', event.target.checked),
-                }),
-                h('span', { key: 'label' }, t('warm.label')),
-              ]) : null,
-              settings.protocol === 'geniex' ? h('div', { key: 'warm-hint', style: S.hint }, t('warm.hint')) : null,
-            ]),
-          ]),
+          h(Field, {
+            key: 'apiKeyEnv',
+            label: t('apiKeyEnv.label'),
+            hint: t('apiKeyEnv.hint'),
+          }, h('input', {
+            style: S.input,
+            value: settings.apiKeyEnv,
+            placeholder: settings.protocol === 'qwen' ? t('apiKeyEnv.placeholder') : 'local',
+            onChange: (event) => update('apiKeyEnv', event.target.value),
+          })),
+          settings.protocol === 'geniex' ? h('label', { key: 'warm', style: S.checkRow }, [
+            h('input', {
+              key: 'checkbox',
+              type: 'checkbox',
+              checked: settings.warm === true,
+              onChange: (event) => update('warm', event.target.checked),
+            }),
+            h('span', { key: 'label' }, t('warm.label')),
+          ]) : null,
+          settings.protocol === 'geniex' ? h('div', { key: 'warm-hint', style: S.hint }, t('warm.hint')) : null,
         ]),
         h('div', { key: 'model-config', style: S.card }, [
           h('div', { key: 'title', style: S.cardTitle }, t('modelConfig.title')),
@@ -1899,7 +1892,7 @@ window.__ModuleLoader__.load({
                 style: S.input,
                 inputMode: key === 'seed' ? 'numeric' : 'decimal',
                 value: numberValue(key),
-                placeholder: t('sampling.placeholder'),
+                placeholder: t(key === 'seed' ? 'seed.placeholder' : 'sampling.placeholder'),
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
             ]),
