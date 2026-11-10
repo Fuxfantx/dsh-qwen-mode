@@ -97,6 +97,8 @@ window.__ModuleLoader__.load({
       'stats.tps': '{value} tok/s',
       'stats.ms': '{value} ms',
       'stats.sec': '{value} s',
+      'stats.avgTtft': '平均 TTFT: {value}',
+      'stats.avgTps': '平均 {value} tok/s',
       'compaction.dsh': 'DSH 压缩阈值',
       'compaction.gate': '推荐 bigGate',
       'compaction.unavailable': '上下文不足以容纳 64K 压缩预留，DSH 压缩不可用；请增大上下文窗口或减小最大输出长度。',
@@ -178,6 +180,8 @@ window.__ModuleLoader__.load({
       'stats.tps': '{value} tok/s',
       'stats.ms': '{value} ms',
       'stats.sec': '{value} s',
+      'stats.avgTtft': 'Avg TTFT: {value}',
+      'stats.avgTps': 'Avg {value} tok/s',
       'compaction.dsh': 'DSH compaction threshold',
       'compaction.gate': 'Recommended bigGate',
       'compaction.unavailable': 'The context cannot hold the 64K compaction reserve, so DSH compaction is unavailable; raise the context window or lower the output limit.',
@@ -655,8 +659,9 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         if (stats === null || stats === undefined || typeof document === 'undefined') return
         const model = String(stats.model ?? '').split('/').pop().replace(/:[^:]+$/u, '')
-        const ttftMs = Number(stats.ttftMs)
+        const ttftMs = Number(stats.netTtftMs ?? stats.ttftMs)
         if (!Number.isFinite(ttftMs)) return
+        const average = stats.average === true
         const ttft = ttftMs < 1000
           ? t('stats.ms', { value: ttftMs })
           : t('stats.sec', { value: (ttftMs / 1000).toFixed(1) })
@@ -677,10 +682,10 @@ window.__ModuleLoader__.load({
         }
         appendPart(model, 'var(--dsw-alias-label-primary)')
         appendSeparator()
-        appendPart(t('stats.ttft', { value: ttft }))
-        if (stats.tps !== null) {
+        appendPart(t(average ? 'stats.avgTtft' : 'stats.ttft', { value: ttft }))
+        if (stats.tps !== null && stats.tps !== undefined) {
           appendSeparator()
-          appendPart(t('stats.tps', { value: stats.tps }))
+          appendPart(t(average ? 'stats.avgTps' : 'stats.tps', { value: stats.tps }))
         }
         let hiddenClock = null
         let timePart = null

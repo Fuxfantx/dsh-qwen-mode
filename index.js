@@ -379,8 +379,15 @@ function bodyHasMedia(body) {
 
 /** The first streamed token's timestamp, whichever record carries it. */
 function streamFirstTokenTime(stream) {
-  if (!Array.isArray(stream)) return undefined
-  for (const record of stream) {
+  const records = Array.isArray(stream)
+    ? stream
+    : stream instanceof Map
+      ? [...stream.values()]
+      : stream !== null && typeof stream === 'object'
+        ? Object.values(stream)
+        : null
+  if (records === null) return undefined
+  for (const record of records) {
     if (record?.type === 'chunk') {
       const type = record.chunk?.type
       if (type === 'text-delta' || type === 'reasoning-delta' || type === 'tool-call-delta') return record.time
@@ -396,18 +403,28 @@ function streamFirstTokenTime(stream) {
 }
 
 /** Build the compact UI metric for one settled assistant message. */
-function buildTurnMetric(event, firstTokenAt, startedAt) {
+function buildTurnMetric(event, firstTokenAt, startedAt, step) {
   const source = event.data?.message?.source
   if (typeof source?.provider !== 'string' || typeof source?.model !== 'string') return null
   const outputTokens = event.data?.usage?.outputTokens ?? null
   const ttftMs = Math.max(0, Math.round(firstTokenAt - startedAt))
   const decodeMs = Math.max(1, event.time - firstTokenAt)
+  const content = event.data?.message?.content
+  const toolCall = Array.isArray(content) && content.some((block) => block?.type === 'tool-call')
   return {
+    id: `${step ?? ''}:${event.time}`,
+    step: Number.isInteger(step) ? step : null,
+    time: event.time,
+    firstTokenAt,
     provider: source.provider,
     model: source.model,
     ttftMs,
+    loadMs: 0,
+    netTtftMs: ttftMs,
+    decodeMs,
     tps: outputTokens === null ? null : Math.round(outputTokens / (decodeMs / 1000) * 10) / 10,
     outputTokens,
+    toolCall,
   }
 }
 
@@ -717,6 +734,9 @@ function createRuntime() {
     stateCache: null,
     statusCache: { key: '', at: 0, value: null },
     turnMetrics: new Map(),
+    turnReady: new Map(),
+    requestStarts: new Map(),
+    currentSteps: new Map(),
     sessionProviders: new Set(),
     stepStarts: new Map(),
     firstTokens: new Map(),
@@ -1026,17 +1046,93 @@ function modelReasoning(model) {
   return runtime.modelReasoning.get(model)
 }
 
-/** Store one turn's timing and token counts. */
-function recordTurn(sessionId, turn, metric) {
-  runtime.turnMetrics.set(`${sessionId}:${turn}`, metric)
-  trimMap(runtime.turnMetrics, 2000)
-  if (metric.provider !== PROVIDERS.geniex.id) return
-  runtime.sessionProviders.add(sessionId)
-  while (runtime.sessionProviders.size > 2000) {
-    const oldest = runtime.sessionProviders.values().next().value
-    if (oldest === undefined) break
-    runtime.sessionProviders.delete(oldest)
+/** The model's `loaded_at` from a GenieX status snapshot, in epoch ms. */
+function loadedAtFor(models, model) {
+  const row = Array.isArray(models) ? models.find((entry) => entry?.id === model) : undefined
+  const loadedAt = Date.parse(row?.loaded_at ?? '')
+  return Number.isFinite(loadedAt) ? loadedAt : 0
+}
+
+/** Attribute part of one call's TTFT to a weight-load/queue wait. */
+async function applyLoadTiming(ctx, call, requestStart) {
+  if (ctx === null || requestStart === null || requestStart.model !== call.model) return
+  if (requestStart.upstream !== runtime.settings.upstream) return
+  const models = await fetchGeniexStatus(ctx)
+  const loadedAt = loadedAtFor(models, call.model)
+  if (loadedAt <= 0 || loadedAt < requestStart.at || loadedAt > call.firstTokenAt) return
+  const loadMs = Math.min(call.ttftMs, Math.max(0, Math.round(loadedAt - requestStart.at)))
+  call.loadMs = loadMs
+  call.netTtftMs = Math.max(0, call.ttftMs - loadMs)
+}
+
+/** Project one turn's calls into the single metric the UI renders. */
+function aggregateTurnMetric(metric) {
+  const calls = metric.calls
+  if (calls.length === 0) return null
+  const last = calls[calls.length - 1]
+  if (metric.hasToolCalls !== true) {
+    return {
+      provider: last.provider,
+      model: last.model,
+      ttftMs: last.netTtftMs,
+      netTtftMs: last.netTtftMs,
+      tps: last.tps,
+      outputTokens: last.outputTokens,
+      average: false,
+      toolCalls: false,
+    }
   }
+  // Tool-call generations are excluded so the average reflects text/reasoning
+  // prefill and decode, not tool-token formatting or tool execution.
+  const usable = calls.filter((call) => call.toolCall !== true)
+  const selected = usable.length > 0 ? usable : calls
+  const avgTtft = Math.round(selected.reduce((sum, call) => sum + call.netTtftMs, 0) / selected.length)
+  let tokens = 0
+  let decodeMs = 0
+  for (const call of selected) {
+    if (call.outputTokens === null || call.decodeMs <= 0) continue
+    tokens += call.outputTokens
+    decodeMs += call.decodeMs
+  }
+  const avgTps = decodeMs > 0 ? Math.round(tokens / (decodeMs / 1000) * 10) / 10 : null
+  return {
+    provider: last.provider,
+    model: last.model,
+    ttftMs: avgTtft,
+    netTtftMs: avgTtft,
+    tps: avgTps,
+    outputTokens: tokens,
+    average: true,
+    toolCalls: true,
+    callCount: selected.length,
+  }
+}
+
+/** Store one call's timing and token counts on its turn. */
+function recordTurn(ctx, sessionId, turn, call, requestStart = null) {
+  const key = `${sessionId}:${turn}`
+  let metric = runtime.turnMetrics.get(key)
+  if (metric === undefined) {
+    metric = { provider: call.provider, model: call.model, calls: [], hasToolCalls: false }
+    runtime.turnMetrics.set(key, metric)
+    trimMap(runtime.turnMetrics, 2000)
+  }
+  if (!metric.calls.some((existing) => existing.id === call.id)) {
+    metric.calls.push(call)
+    metric.calls.sort((left, right) => left.time - right.time)
+    metric.provider = call.provider
+    metric.model = call.model
+    metric.hasToolCalls = metric.hasToolCalls === true || call.toolCall === true
+  }
+  if (requestStart !== null && ctx !== null && call.toolCall !== true) {
+    const ready = applyLoadTiming(ctx, call, requestStart).catch(() => {})
+    const previous = runtime.turnReady.get(key) ?? Promise.resolve()
+    runtime.turnReady.set(key, Promise.all([previous, ready]).then(() => undefined, () => undefined))
+    trimMap(runtime.turnReady, 2000)
+  }
+  if (call.provider !== PROVIDERS.geniex.id) return
+  runtime.sessionProviders.add(sessionId)
+  trimMap(runtime.sessionProviders, 2000)
 }
 
 /** Replay one restored session's stream records into turn metrics. */
@@ -1066,8 +1162,8 @@ function deriveSessionMetrics(session) {
           if (first !== undefined) firsts.set(key, first)
         } else if (event.type === 'assistant/message') {
           const first = firsts.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
-          const metric = buildTurnMetric(event, first, starts.get(key) ?? first)
-          if (metric !== null) recordTurn(session.id, turn, metric)
+          const metric = buildTurnMetric(event, first, starts.get(key) ?? first, step)
+          if (metric !== null) recordTurn(null, session.id, turn, metric)
         }
       }
       if (index % 400 === 399) await new Promise((resolve) => setImmediate(resolve))
@@ -1501,6 +1597,26 @@ async function warmUpModel(ctx, settings, model, options) {
   return { elapsedMs: Date.now() - startedAt, usage }
 }
 
+/** Read GenieX's model status independently of the warmup setting. */
+async function fetchGeniexStatus(ctx) {
+  const settings = runtime.settings
+  if (settings.protocol !== 'geniex') return null
+  try {
+    const url = new URL(settings.upstream)
+    url.pathname = '/status'
+    url.search = ''
+    const response = await fetch(url, {
+      headers: { accept: 'application/json', ...await credentialHeader(ctx, settings) },
+      signal: AbortSignal.timeout(1500),
+    })
+    if (!response.ok) return null
+    const body = await response.json()
+    return Array.isArray(body?.models) ? body.models : null
+  } catch {
+    return null
+  }
+}
+
 /** Read the loaded-model state from GenieX's `/status`. */
 async function readModelStatus(ctx) {
   const settings = runtime.settings
@@ -1662,12 +1778,15 @@ function createApi(ctx) {
       const turn = Number(payload?.turn)
       if (sessionId === '' || !Number.isInteger(turn)) return null
       const key = `${sessionId}:${turn}`
-      const cached = runtime.turnMetrics.get(key)
-      if (cached !== undefined) return cached
-      const session = ctx.sessions.get(sessionId)
-      if (session === undefined) return null
-      await deriveSessionMetrics(session)
-      return runtime.turnMetrics.get(key) ?? null
+      if (runtime.turnMetrics.get(key) === undefined) {
+        const session = ctx.sessions.get(sessionId)
+        if (session === undefined) return null
+        await deriveSessionMetrics(session)
+      }
+      const ready = runtime.turnReady.get(key)
+      if (ready !== undefined) await ready
+      const metric = runtime.turnMetrics.get(key)
+      return metric === undefined ? null : aggregateTurnMetric(metric)
     },
     sessionProvider: (payload) => {
       const sessionId = text(payload?.sessionId)
@@ -2048,11 +2167,29 @@ export async function apply(ctx) {
   ctx.effect(() => registerWebApi(ctx, api), `${SCOPE}: settings API`)
 
   ctx.effect(() => ctx.on('session/event', (session, event) => {
+    if (event.type === 'request/header') {
+      const current = runtime.currentSteps.get(session.id)
+      const model = event.data?.header?.config?.model
+      if (current !== undefined && typeof model === 'string') {
+        runtime.requestStarts.set(`${session.id}:${current.turn}:${current.step}`, {
+          at: event.time,
+          model,
+          upstream: runtime.settings.upstream,
+        })
+        trimMap(runtime.requestStarts, 2000)
+      }
+      return
+    }
+    if (event.type === 'turn/end') {
+      runtime.currentSteps.delete(session.id)
+      return
+    }
     const turn = event.data?.turn
     const step = event.data?.step
     if (!Number.isInteger(turn) || !Number.isInteger(step)) return
     const key = `${session.id}:${turn}:${step}`
     if (event.type === 'step/start') {
+      runtime.currentSteps.set(session.id, { turn, step })
       runtime.stepStarts.set(key, event.time)
       trimMap(runtime.stepStarts, 2000)
       return
@@ -2066,11 +2203,13 @@ export async function apply(ctx) {
     if (event.type !== 'assistant/message') return
     const first = runtime.firstTokens.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
     const start = runtime.stepStarts.get(key) ?? first
+    const requestStart = runtime.requestStarts.get(key) ?? null
     runtime.stepStarts.delete(key)
     runtime.firstTokens.delete(key)
-    const metric = buildTurnMetric(event, first, start)
+    runtime.requestStarts.delete(key)
+    const metric = buildTurnMetric(event, first, start, step)
     if (metric === null) return
-    recordTurn(session.id, turn, metric)
+    recordTurn(ctx, session.id, turn, metric, requestStart)
   }), `${SCOPE}: turn metrics`)
 
   ctx.effect(() => ctx.tools.guard((execution) => {

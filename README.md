@@ -13,7 +13,7 @@
 - 自动维护 **From GenieX** / **From QwenCloud** 模型列表，来源变化后自动更新。
 - 自动识别模型的上下文、输出上限、图片输入、思考与 MTP 能力。
 - 思考模式：按模型支持的等级选择；QwenCloud 只发送模型支持的等级，GenieX 只在模型支持时开启思考。
-- 每轮显示模型名、首字延迟、解码速度与耗时。
+- 每轮显示模型名、首字延迟、解码速度与耗时；有工具调用的轮次显示非工具调用的平均 TTFT / TPS，TTFT 不含权重加载等待。
 - 可选预热：开始输入消息后，将选中的 From GenieX 模型预加载到内存，模型列表用圆点显示驻留状态。
 - 采样参数可手动填写，也可读取模型推荐值，并支持指定随机种子（seed）。
 - 可选 MTP 加速，仅适用于支持的 From GenieX 本地模型。
@@ -73,7 +73,7 @@ Use Qwen in DSH: connect to models running on a local GenieX server, or to QwenC
 - Maintains the **From GenieX** / **From QwenCloud** model lists automatically and refreshes them when a source changes.
 - Recognizes each model's context, output limit, image input, thinking, and MTP support.
 - Thinking mode: choose a level the model supports. QwenCloud receives only supported levels, and GenieX enables thinking only on models that support it.
-- Shows the model name, time to first token, decode speed, and elapsed time per turn.
+- Shows the model name, TTFT, decode speed, and elapsed time per turn; turns with tool calls show the average TTFT / TPS of non-tool calls, with TTFT excluding model-load wait.
 - Optional warmup: once you start typing, preload the selected From GenieX model ahead of time, with residency dots in the model list.
 - Sampling parameters can be entered manually or read from the model's recommended values, including a random seed.
 - Optional MTP acceleration for supported local From GenieX models.
