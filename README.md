@@ -14,7 +14,7 @@
 - 自动识别模型的上下文、输出上限、图片输入、思考与 MTP 能力。
 - 思考模式：按模型支持的等级选择；QwenCloud 只发送模型支持的等级，GenieX 只在模型支持时开启思考。
 - 每轮显示模型名、首字延迟、解码速度与耗时。
-- 可选预热：开始输入消息后，为当前 From GenieX 模型提前加载，模型列表用圆点显示驻留状态。
+- 可选预热：开始输入消息后，将选中的 From GenieX 模型预加载到内存，模型列表用圆点显示驻留状态。
 - 采样参数可手动填写，也可读取模型推荐值，并支持指定随机种子（seed）。
 - 可选 MTP 加速，仅适用于支持的 From GenieX 本地模型。
 - 破限 / 无审查模型名称高亮。
@@ -49,7 +49,7 @@
 - **最大输出**：默认 16384，不会超过上下文窗口或模型声明的上限。
 - **压缩提示**：设置页会提示当前上下文是否足够，以及压缩是否可用。
 - **采样参数**：只补充请求中缺失的字段；留空表示不注入。`min_p` 仅对 GenieX 生效；可使用「读取推荐值」填入模型推荐参数；`seed` 可指定随机种子。
-- **预热**：启用后，开始输入消息时提前加载当前 From GenieX 模型。圆点状态：黄色预热中、绿色已驻留、红色未驻留、蓝色其它来源。
+- **预热**：启用后，开始输入消息时会将选中的 From GenieX 模型预加载到内存。圆点状态：黄色预热中、绿色已驻留、红色未驻留、蓝色其它来源。
 - **MTP**：仅适用于支持的 From GenieX 本地模型。启用后发送图片时，会要求选择「直接发送」或「本次关闭 MTP」。
 - **推理后端**：Compute 与 Vision Encoder 可留空，由 GenieX 决定；Vision Encoder 仅对图片模型生效。
 
@@ -74,7 +74,7 @@ Use Qwen in DSH: connect to models running on a local GenieX server, or to QwenC
 - Recognizes each model's context, output limit, image input, thinking, and MTP support.
 - Thinking mode: choose a level the model supports. QwenCloud receives only supported levels, and GenieX enables thinking only on models that support it.
 - Shows the model name, time to first token, decode speed, and elapsed time per turn.
-- Optional warmup: once you start typing, loads the current From GenieX model ahead of time, with residency dots in the model list.
+- Optional warmup: once you start typing, preload the selected From GenieX model ahead of time, with residency dots in the model list.
 - Sampling parameters can be entered manually or read from the model's recommended values, including a random seed.
 - Optional MTP acceleration for supported local From GenieX models.
 - Highlights abliterated / uncensored model names.
@@ -109,7 +109,7 @@ Use Qwen in DSH: connect to models running on a local GenieX server, or to QwenC
 - **Max output**: defaults to 16384 and never exceeds the context window or the model's declared limit.
 - **Compaction hints**: the settings page indicates whether the current context is sufficient and whether compaction is available.
 - **Sampling parameters**: only fields missing from the request are filled; empty means not injected. `min_p` applies to GenieX only; **Read recommended** fills the model's values; `seed` sets a random seed.
-- **Warmup**: when enabled, start typing to load the current From GenieX model ahead of time. Dots: yellow warming, green resident, red not resident, blue another source.
+- **Warmup**: when enabled, start typing to preload the selected From GenieX model. Dots: yellow warming, green resident, red not resident, blue another source.
 - **MTP**: for supported local From GenieX models only. While enabled, sending an image asks whether to send directly or disable MTP for that send.
 - **Inference backend**: empty Compute and Vision Encoder values are decided by GenieX; Vision Encoder applies to image models only.
 
