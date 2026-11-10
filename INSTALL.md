@@ -18,7 +18,7 @@ Version / 版本: **1.8.0**
 4. 选择 GenieX 或 QwenCloud，填写上游地址：
    - GenieX 可填 `http://127.0.0.1:18181`；
    - QwenCloud 填写完整兼容端点（例如 `https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`）。
-5. 使用 QwenCloud 时，在「高级选项 → API Key 变量名」填写保存 Key 的环境变量名（例如 `DASHSCOPE_API_KEY`），并在启动 DSH 的环境中导出该变量；该字段接收变量名，不是 Key 本身。
+5. 使用 QwenCloud 时，在「API Key 变量名」填写保存 Key 的环境变量名（例如 `DASHSCOPE_API_KEY`），并在启动 DSH 的环境中导出该变量；该字段接收变量名，不是 Key 本身。
 6. 点击「保存并应用」，插件会自动创建 **From GenieX** / **From QwenCloud** Provider。
 7. 在模型选择器中选择该 Provider 下的模型。
 
@@ -40,7 +40,7 @@ Install:
 4. Choose GenieX or QwenCloud and enter the upstream URL:
    - For GenieX, `http://127.0.0.1:18181` is enough.
    - For QwenCloud, enter the full compatible endpoint (for example `https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`).
-5. With QwenCloud, put the name of the environment variable that stores the key in **Advanced → API key reference** (for example `DASHSCOPE_API_KEY`) and export it where DSH starts; the field takes a reference, not the key.
+5. With QwenCloud, put the name of the environment variable that stores the key in **API key reference** (for example `DASHSCOPE_API_KEY`) and export it where DSH starts; the field takes a reference, not the key.
 6. Click **Save and apply**; the plugin creates **From GenieX** / **From QwenCloud** automatically.
 7. Select a model under that provider in the model picker.
 

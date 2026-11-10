@@ -192,7 +192,9 @@ function providerNameFor(protocol) {
 }
 
 function apiKeyRef(settings) {
-  return text(settings.apiKeyEnv) || 'local'
+  // Only QwenCloud authenticates. A key reference remembered from a previous
+  // QwenCloud selection must not follow the user back to GenieX.
+  return settings.protocol === 'qwen' ? text(settings.apiKeyEnv) || 'local' : 'local'
 }
 
 function proxyBaseURL(port) {
@@ -551,7 +553,7 @@ function providerSettingsCurrent(snapshot) {
   return current.mode === 'auto'
     && current.protocol === snapshot.protocol
     && current.upstream === snapshot.upstream
-    && current.apiKeyEnv === snapshot.apiKeyEnv
+    && apiKeyRef(current) === apiKeyRef(snapshot)
 }
 
 async function upsertProvider(ctx, settings) {
@@ -816,7 +818,7 @@ function providerTask(operation) {
 /** The settings that make one provider build obsolete when they change. */
 function providerSettingsKey() {
   const settings = runtime.settings
-  return [settings.mode, settings.protocol, settings.upstream, settings.apiKeyEnv, settings.contextWindow, settings.maxOutputTokens, settings.autoNctx].join('|')
+  return [settings.mode, settings.protocol, settings.upstream, apiKeyRef(settings), settings.contextWindow, settings.maxOutputTokens, settings.autoNctx].join('|')
 }
 
 /** One provider-build attempt for the current settings. */
@@ -1650,8 +1652,12 @@ function createApi(ctx) {
         ...patch,
         proxyPort: previous.proxyPort,
       })
-      const providerChanged = ['protocol', 'upstream', 'apiKeyEnv', 'contextWindow', 'maxOutputTokens', 'autoNctx']
-        .some((key) => next[key] !== previous[key])
+      const providerChanged = next.protocol !== previous.protocol
+        || next.upstream !== previous.upstream
+        || apiKeyRef(next) !== apiKeyRef(previous)
+        || next.contextWindow !== previous.contextWindow
+        || next.maxOutputTokens !== previous.maxOutputTokens
+        || next.autoNctx !== previous.autoNctx
       const providerRemoval = next.mode === 'off' && next.managedProviderId !== null
       const requiresSync = next.mode !== previous.mode
         || providerChanged

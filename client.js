@@ -44,7 +44,7 @@ window.__ModuleLoader__.load({
       'upstream.label': '上游地址',
       'apiKeyEnv.label': 'API Key 变量名（可选）',
       'apiKeyEnv.placeholder': 'DASHSCOPE_API_KEY',
-      'apiKeyEnv.hint': '填写保存 Key 的环境变量名或 DSH 凭据名，而不是 Key 本身；GenieX 不校验 Key，留空即可。',
+      'apiKeyEnv.hint': '填写保存 Key 的环境变量名或 DSH 凭据名，而不是 Key 本身。',
       'apiKeyEnv.invalid': 'Key 变量名只能包含字母、数字和下划线，且不能以数字开头。',
       'warm.label': '选择 From GenieX 模型时自动预热',
       'warm.hint': '切换到 From GenieX 模型后，让 GenieX 提前将模型加载到内存中；预热期间发送按钮显示转圈。',
@@ -128,7 +128,7 @@ window.__ModuleLoader__.load({
       'upstream.label': 'Upstream URL',
       'apiKeyEnv.label': 'API key reference (optional)',
       'apiKeyEnv.placeholder': 'DASHSCOPE_API_KEY',
-      'apiKeyEnv.hint': 'Name of the environment variable or DSH credential that holds the key, not the key itself; GenieX ignores it.',
+      'apiKeyEnv.hint': 'Name of the environment variable or DSH credential that holds the key, not the key itself.',
       'apiKeyEnv.invalid': 'The reference may contain only letters, digits, and underscores, and cannot start with a digit.',
       'warm.label': 'Warm up when selecting a From GenieX model',
       'warm.hint': 'After switching to a From GenieX model, GenieX loads the model into memory ahead of time; the send button shows a spinner while warming.',
@@ -1770,16 +1770,16 @@ window.__ModuleLoader__.load({
               onChange: (event) => update('upstream', event.target.value),
             })),
           ]),
-          h(Field, {
+          settings.protocol === 'qwen' ? h(Field, {
             key: 'apiKeyEnv',
             label: t('apiKeyEnv.label'),
             hint: t('apiKeyEnv.hint'),
           }, h('input', {
             style: S.input,
             value: settings.apiKeyEnv,
-            placeholder: settings.protocol === 'qwen' ? t('apiKeyEnv.placeholder') : 'local',
+            placeholder: t('apiKeyEnv.placeholder'),
             onChange: (event) => update('apiKeyEnv', event.target.value),
-          })),
+          })) : null,
           settings.protocol === 'geniex' ? h('label', { key: 'warm', style: S.checkRow }, [
             h('input', {
               key: 'checkbox',
