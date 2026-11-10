@@ -6,25 +6,26 @@
 
 ## 中文
 
-在 DSH 中接入 Qwen、GenieX 与 QwenCloud：自动管理模型 Provider，支持预热、采样推荐、MTP、图片模型和每轮性能统计。
+在 DSH 中接入 Qwen、GenieX 与 QwenCloud，自动维护模型 Provider，并提供预热、采样、MTP、图片模型和会话用量统计。
 
 ### 功能
 
 - **关闭 / 自动** 两种模式；自动模式只管理 `From GenieX` / `From QwenCloud` 下的模型。
-- 自动发现模型并创建 Provider，识别文本、图片与推理模型。
-- 兼容上游已分离和未分离的思考内容，统一显示推理过程。
-- 显示每轮模型名、TTFT、Decode TPS 与总耗时。
-- 可选的模型预热与驻留状态圆点。
-- 从模型元数据读取推荐采样值，一键填入设置。
+- 自动发现模型并创建 Provider，识别文本、图片和推理模型。
+- 统一处理上游的思考参数与推理内容。
+- 显示每轮模型名、TTFT、Decode TPS 与耗时。
+- 可选模型预热，并用圆点显示驻留状态。
+- 从模型元数据读取推荐采样值。
 - 可选 MTP 投机解码；生效时显示接受率。
-- 破限 / 无审查模型在模型列表中高亮显示。
-- 可选「仅回复」权限，适合纯聊天。
+- 破限 / 无审查模型名称高亮。
+- 可选「仅回复」权限。
+- 为 From GenieX 会话提供精简的累计 token 用量视图。
 
-### 安装
+### 系统要求与安装
 
 - DSH 需支持 Cordis bundle 与 Plugin Manager。
 - 通过 Plugin Manager 安装离线 zip 或插件目录，然后刷新页面。
-- 详见 [INSTALL.md](INSTALL.md)；本包没有 npm 依赖。
+- 本包没有 npm 依赖。
 
 ### 使用
 
@@ -37,51 +38,50 @@
 5. 点击「保存并应用」。
 6. 在模型选择器中选择对应 Provider 下的模型。
 
-### 设置说明
+### 设置与行为
 
-- **上下文**：留空时使用服务端默认值；启用「优先使用模型上下文阈限」后优先采用模型自身的上下文长度。
-- **预热**：开启后，选中 GenieX 模型时提前加载权重。模型列表圆点表示状态：
-  - 黄色：正在预热
-  - 绿色：已驻留
-  - 红色：未驻留
-  - 蓝色：其它 Provider
-- **采样默认值**：可手动填写，也可从「读取推荐值」选择模型并填入推荐参数；填入后仍需保存。
-- **MTP 投机解码**：仅对支持的模型生效。开启后可设置投机参数；图片模型在启用 MTP 时发送图片会先询问处理方式。
-- **推理后端**（GenieX）：可设置 Compute 与 Vision Encoder；留空使用 GenieX 默认值。
-- **模型名高亮**：破限 / 无审查模型使用明亮橙黄色显示。
+- **上下文**：留空时使用上游默认值；启用「优先使用模型上下文阈限」后优先采用模型自身的上下文长度。
+- **压缩预算**：根据上下文和最大输出实时显示 DSH 压缩阈值与推荐 `bigGate`。
+- **预热**：选中 GenieX 模型时提前加载权重。圆点状态：黄色预热中、绿色已驻留、红色未驻留、蓝色其它 Provider。
+- **采样默认值**：可手动填写，也可用「读取推荐值」填入模型推荐参数；之后仍需保存。
+- **MTP**：仅对支持的 GenieX 模型生效。图片模型启用 MTP 时，发送图片会要求选择直接发送或关闭本次 MTP。
+- **推理后端**：GenieX 可设置 Compute 与 Vision Encoder；留空使用上游默认值。
+- **模型高亮**：破限 / 无审查模型使用明亮橙黄色名称。
+- **会话用量**：含 From GenieX 回复的会话只显示累计 token；点击后显示输入与输出。
 - **仅回复**：隐藏并拒绝工具调用。
-- **推理内容**：历史思考内容是否保留由模型模板决定，插件不提供虚假开关。
 
 ### 限制
 
-- 预热只减少模型加载时间，不减少长提示词的 prefill；因此“预热后首次 TTFT 仍较长”可能来自提示词本身。
-- GenieX 同一时刻只驻留一个模型。不同会话选择不同模型时，前一个模型会被卸载。
-- 图片与 MTP 同时使用时，图片可能不被上游处理；发送前会要求选择。
+- 预热只减少模型加载时间，不减少长提示词的处理时间。
+- GenieX 同一时刻只驻留一个模型；不同会话选择不同模型时会卸载前一个。
+- MTP 与图片同时使用时，图片可能不被上游处理，发送前会要求选择。
 - 模型目录来自上游模型列表；上游不可用时不会创建模型。
+- 预热、MTP、GGUF 元数据和推理后端仅适用于 GenieX 来源；QwenCloud 来源保留 Provider 管理、采样、思考参数、统计和仅回复。
 
 ---
 
 ## English
 
-Connect DSH to Qwen, GenieX, and QwenCloud endpoints. Qwen Mode manages the model provider automatically and adds warmup, sampling recommendations, MTP, vision models, and per-turn performance stats.
+Connect DSH to Qwen, GenieX, and QwenCloud. Qwen Mode maintains the provider automatically and adds warmup, sampling, MTP, vision-model handling, and session usage views.
 
 ### Features
 
 - **Off / Auto** modes; Auto manages only models under `From GenieX` / `From QwenCloud`.
 - Discovers models, creates the provider, and recognizes text, image, and reasoning models.
-- Handles separated and inline reasoning content consistently.
-- Shows model name, TTFT, Decode TPS, and elapsed time for each turn.
-- Optional model warmup with colored residency dots.
+- Normalizes upstream thinking parameters and reasoning content.
+- Shows model name, TTFT, Decode TPS, and elapsed time per turn.
+- Optional model warmup with residency dots.
 - Reads recommended sampling values from model metadata.
 - Optional MTP speculative decoding with acceptance rate.
-- Highlights abliterated / uncensored models in the picker.
-- Optional **Reply Only** permission for pure chat.
+- Highlights abliterated / uncensored model names.
+- Optional **Reply Only** permission.
+- Provides a compact cumulative token view for sessions containing From GenieX replies.
 
-### Install
+### System requirements and install
 
 - DSH with Cordis bundle and Plugin Manager support.
 - Install the offline zip or plugin directory through Plugin Manager, then refresh the page.
-- See [INSTALL.md](INSTALL.md). The package has no npm dependencies.
+- The package has no npm dependencies.
 
 ### Usage
 
@@ -94,27 +94,25 @@ Connect DSH to Qwen, GenieX, and QwenCloud endpoints. Qwen Mode manages the mode
 5. Click **Save and Apply**.
 6. Select a model under that provider in the model picker.
 
-### Settings
+### Settings and behavior
 
-- **Context**: empty uses the server default; **Prefer model context limit** uses the model's own context length when available.
-- **Warmup**: loads GenieX model weights ahead of the first request. Dots show:
-  - Yellow: warming
-  - Green: resident
-  - Red: not resident
-  - Blue: another provider
-- **Sampling defaults**: enter values manually, or pick a model and use **Read recommended**, then save.
-- **MTP speculative decoding**: available only on supported models. Draft parameters are configurable; image models ask how to handle an image send while MTP is enabled.
-- **Inference backend** (GenieX): Compute and Vision Encoder; empty uses GenieX defaults.
+- **Context**: empty uses the upstream default; **Prefer model context limit** uses the model's own context length when available.
+- **Compaction budget**: shows the DSH compaction threshold and recommended `bigGate` from the current context and output limit.
+- **Warmup**: loads GenieX model weights when selected. Dots: yellow warming, green resident, red not resident, blue another provider.
+- **Sampling defaults**: enter values manually, or use **Read recommended** and then save.
+- **MTP**: available only on supported GenieX models. With an image model, an image send asks whether to send directly or disable MTP for that send.
+- **Inference backend**: GenieX Compute and Vision Encoder; empty uses upstream defaults.
 - **Model highlight**: abliterated / uncensored models use a bright orange-yellow name.
+- **Session usage**: sessions containing From GenieX replies show cumulative tokens only; click to see input and output.
 - **Reply Only**: hides and denies tools.
-- **Reasoning content**: whether historical thinking is preserved depends on the model template; no fake toggle is exposed.
 
 ### Limitations
 
-- Warmup reduces model load time, not prompt prefill. A long first TTFT after warmup can come from the prompt itself.
+- Warmup reduces model load time, not time spent processing a long prompt.
 - GenieX keeps one model resident at a time; selecting different models in different sessions unloads the previous one.
-- When images and MTP are used together, the image may not be processed by the upstream; the send flow asks first.
+- MTP with images may prevent the upstream from processing the image; the send flow asks first.
 - Model catalogs come from the upstream model list; no catalog means no models.
+- Warmup, MTP, GGUF metadata, and inference backends are GenieX-only; QwenCloud keeps provider management, sampling, thinking parameters, stats, and Reply Only.
 
 ---
 

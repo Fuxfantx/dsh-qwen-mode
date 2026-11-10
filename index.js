@@ -1162,7 +1162,7 @@ async function warmUpModel(ctx, settings, model, vision = false, context = null,
     stream: false,
   }
   if (settings.protocol === 'qwen') body.enable_thinking = false
-  else Object.assign(body, { enable_think: false, reasoning_format: 'none' }, inferenceFields(settings, vision), loadFields(settings, context, mtp, mtpFile))
+  else Object.assign(body, { enable_think: false, reasoning_format: 'auto' }, inferenceFields(settings, vision), loadFields(settings, context, mtp, mtpFile))
   const startedAt = Date.now()
   const response = await fetch(url, {
     method: 'POST',
@@ -1688,6 +1688,9 @@ export async function apply(ctx) {
         const model = text(payload?.model)
         if (model === '' || !managedModels.has(model)) throw httpError(400, 'unknown managed model')
         if (settings.autoNctx && !modelContexts.has(model)) {
+          await refreshManagedModels()
+          if (!managedModels.has(model)) throw httpError(400, 'unknown managed model')
+        } else if (settings.mtp && !modelCapabilities.has(model)) {
           await refreshManagedModels()
           if (!managedModels.has(model)) throw httpError(400, 'unknown managed model')
         }

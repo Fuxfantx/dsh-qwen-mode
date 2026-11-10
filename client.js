@@ -367,9 +367,11 @@ window.__ModuleLoader__.load({
      */
     function ModelLabel({ provider, model, placement, selected, sessionId, getLocale }) {
       const [warmEnabled, setWarmEnabled] = React.useState(false)
+      const [preheatEnabled, setPreheatEnabled] = React.useState(preheat.enabled)
       const [residentState, setResidentState] = React.useState('')
       const [warmRevision, setWarmRevision] = React.useState(warmState.revision)
       const [modelMeta, setModelMeta] = React.useState(null)
+      React.useEffect(() => preheat.subscribe(() => setPreheatEnabled(preheat.enabled)), [])
       React.useEffect(() => {
         const update = () => {
           setWarmEnabled((current) => current === warmState.enabled ? current : warmState.enabled)
@@ -433,7 +435,7 @@ window.__ModuleLoader__.load({
         })
         warmChain.set(key, job.catch(() => {}))
         void job
-      }, [placement, selected, provider?.id, model?.id, sessionId, warmRevision])
+      }, [placement, selected, provider?.id, model?.id, sessionId, warmRevision, preheatEnabled])
 
       const name = model?.name ?? model?.id ?? ''
       const dotKind = !warmEnabled || placement !== 'option'
@@ -1170,6 +1172,12 @@ window.__ModuleLoader__.load({
         else preheat.selected.set(sessionId, modelId)
         for (const listener of preheat.listeners) listener()
       },
+      setEnabled(value) {
+        const next = value === true
+        if (preheat.enabled === next) return
+        preheat.enabled = next
+        for (const listener of preheat.listeners) listener()
+      },
       isActive(sessionId) {
         const modelId = preheat.selected.get(sessionId)
         return modelId !== undefined && (preheat.active.get(`${sessionId}\u0000${modelId}`) ?? 0) > 0
@@ -1207,9 +1215,17 @@ window.__ModuleLoader__.load({
         for (const listener of preheat.listeners) listener()
       },
     }
-    preheat.ready = call('state', undefined, { signal: AbortSignal.timeout(10000) })
-      .then((next) => { preheat.enabled = next?.mode === 'auto' && next?.warm === true })
-      .catch(() => {})
+    preheat.ready = (async () => {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          const next = await call('state', undefined, { signal: AbortSignal.timeout(10000) })
+          preheat.setEnabled(next?.mode === 'auto' && next?.warm === true)
+          return
+        } catch {
+          if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 500))
+        }
+      }
+    })()
 
     function Field({ label, hint, children }) {
       return h('div', { style: S.field }, [
@@ -1300,7 +1316,7 @@ window.__ModuleLoader__.load({
       }, [modelInfo, refreshModelInfo, settings?.protocol])
 
       React.useEffect(() => {
-        preheat.enabled = settings?.mode === 'auto' && settings?.warm === true
+        preheat.setEnabled(settings?.mode === 'auto' && settings?.warm === true)
       }, [settings?.mode, settings?.warm])
 
       const update = (key, value) => setSettings((current) => current === null ? current : { ...current, [key]: value })
