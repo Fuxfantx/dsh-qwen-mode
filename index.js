@@ -1388,6 +1388,7 @@ export async function apply(ctx) {
     return typeof model === 'string' && managedModels.has(model)
   }
   const turnMetrics = new Map()
+  const sessionProviders = new Map()
   const stepStarts = new Map()
   const firstTokens = new Map()
   const derivedSessions = new Set()
@@ -1397,6 +1398,11 @@ export async function apply(ctx) {
       if (oldest === undefined) return
       map.delete(oldest)
     }
+  }
+  const markSessionProvider = (sessionId, provider) => {
+    if (provider !== providerIdFor('geniex') && provider !== providerNameFor('geniex')) return
+    sessionProviders.set(sessionId, true)
+    trimMap(sessionProviders, 2000)
   }
   const deriveSessionMetrics = (session) => {
     if (derivedSessions.has(session.id)) return
@@ -1421,7 +1427,10 @@ export async function apply(ctx) {
       } else if (event.type === 'assistant/message') {
         const first = firsts.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
         const metric = buildTurnMetric(event, first, starts.get(key) ?? first)
-        if (metric !== null) turnMetrics.set(`${session.id}:${turn}`, metric)
+        if (metric !== null) {
+          turnMetrics.set(`${session.id}:${turn}`, metric)
+          markSessionProvider(session.id, metric.provider)
+        }
       }
     }
     derivedSessions.add(session.id)
@@ -1456,6 +1465,7 @@ export async function apply(ctx) {
     const metric = buildTurnMetric(event, first, start)
     if (metric === null) return
     turnMetrics.set(`${session.id}:${turn}`, metric)
+    markSessionProvider(session.id, metric.provider)
     trimMap(turnMetrics, 2000)
   }), `${SCOPE}: turn metrics`)
 
@@ -1619,6 +1629,15 @@ export async function apply(ctx) {
       if (session === undefined) return null
       deriveSessionMetrics(session)
       return turnMetrics.get(key) ?? null
+    },
+    sessionProvider: (payload) => {
+      const sessionId = text(payload?.sessionId)
+      if (sessionId === '') return { geniex: false }
+      if (sessionProviders.get(sessionId) !== true) {
+        const session = ctx.sessions.get(sessionId)
+        if (session !== undefined) deriveSessionMetrics(session)
+      }
+      return { geniex: sessionProviders.get(sessionId) === true }
     },
     permissionLabel: async (payload) => {
       const locale = text(payload?.locale).toLowerCase()

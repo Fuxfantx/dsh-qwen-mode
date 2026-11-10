@@ -11,6 +11,12 @@ window.__ModuleLoader__.load({
   id: 'dsh-qwen-mode',
   factory: (require) => {
     const React = require('react')
+    let ReactDOM = null
+    try {
+      ReactDOM = require('react-dom')
+    } catch {
+      // The fixed panel still renders inline when react-dom is unavailable.
+    }
     const h = React.createElement
     const NS = 'qwenMode'
     const API = '/qwen-mode/api'
@@ -87,6 +93,8 @@ window.__ModuleLoader__.load({
       'stats.tps': '{value} tok/s',
       'stats.ms': '{value} ms',
       'stats.sec': '{value} s',
+      'usage.input': '输入',
+      'usage.output': '输出',
     }
 
     const en = {
@@ -160,6 +168,8 @@ window.__ModuleLoader__.load({
       'stats.tps': '{value} tok/s',
       'stats.ms': '{value} ms',
       'stats.sec': '{value} s',
+      'usage.input': 'Input',
+      'usage.output': 'Output',
     }
 
     function format(template, params) {
@@ -593,6 +603,142 @@ window.__ModuleLoader__.load({
       }, [stats, turnNumber, t])
       return null
     }
+
+    /** Whole-session token pill for sessions that contain From GenieX replies. */
+    const sessionProviderCache = new Map()
+    const formatCompactTokens = (value) => {
+      if (value >= 1000000) return `${(value / 1000000).toFixed(1).replace(/\.0$/u, '')}M`
+      if (value >= 1000) return `${Math.round(value / 1000)}K`
+      return String(value)
+    }
+    const QwenUsagePill = React.memo(function QwenUsagePill({ sessionId, useProjection, getLocale }) {
+      const usage = useProjection('tokenUsage')
+      const [providerState, setProviderState] = React.useState(() => ({
+        sessionId,
+        geniex: sessionProviderCache.get(sessionId) === true,
+      }))
+      const [open, setOpen] = React.useState(false)
+      const [position, setPosition] = React.useState(null)
+      const buttonRef = React.useRef(null)
+      const panelRef = React.useRef(null)
+      const input = usage === undefined
+        ? 0
+        : (usage.uncachedInputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+      const output = usage?.outputTokens ?? 0
+      const total = input + output
+      const signature = `${usage?.uncachedInputTokens ?? 0}:${usage?.cacheReadTokens ?? 0}:${usage?.cacheWriteTokens ?? 0}:${output}`
+
+      React.useEffect(() => {
+        if (typeof sessionId !== 'string' || sessionId === '') return undefined
+        const cached = sessionProviderCache.get(sessionId) === true
+        if (cached) {
+          setProviderState((current) => current.sessionId === sessionId && current.geniex
+            ? current
+            : { sessionId, geniex: true })
+          return undefined
+        }
+        let alive = true
+        void call('sessionProvider', { sessionId }, { signal: AbortSignal.timeout(3000) }).then((value) => {
+          if (!alive) return
+          const geniex = value?.geniex === true
+          if (geniex) sessionProviderCache.set(sessionId, true)
+          if (sessionProviderCache.size > 500) sessionProviderCache.delete(sessionProviderCache.keys().next().value)
+          setProviderState((current) => current.sessionId === sessionId && current.geniex === geniex
+            ? current
+            : { sessionId, geniex })
+        }).catch(() => {})
+        return () => {
+          alive = false
+        }
+      }, [sessionId, signature])
+
+      React.useEffect(() => {
+        if (!open) return undefined
+        const close = (event) => {
+          if (panelRef.current?.contains(event.target) || buttonRef.current?.contains(event.target)) return
+          setOpen(false)
+        }
+        const onKey = (event) => {
+          if (event.key === 'Escape') setOpen(false)
+        }
+        document.addEventListener('pointerdown', close, true)
+        document.addEventListener('keydown', onKey)
+        return () => {
+          document.removeEventListener('pointerdown', close, true)
+          document.removeEventListener('keydown', onKey)
+        }
+      }, [open])
+
+      if (providerState.sessionId !== sessionId || !providerState.geniex || total <= 0) return null
+      const locale = String(getLocale?.() ?? 'zh')
+      const exact = new Intl.NumberFormat(locale)
+      const toggle = () => {
+        if (open) {
+          setOpen(false)
+          return
+        }
+        const rect = buttonRef.current?.getBoundingClientRect()
+        if (rect === undefined) return
+        setPosition({
+          right: Math.max(8, window.innerWidth - rect.right),
+          bottom: Math.max(8, window.innerHeight - rect.top + 8),
+        })
+        setOpen(true)
+      }
+      const row = (label, value) => h('div', {
+        key: label,
+        style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '24px', lineHeight: '22px' },
+      }, [
+        h('span', { key: 'label', style: { color: 'var(--dsw-alias-label-secondary)' } }, label),
+        h('span', { key: 'value', style: { color: 'var(--dsw-alias-label-primary)', fontVariantNumeric: 'tabular-nums' } }, exact.format(value)),
+      ])
+      const panel = open && position !== null ? h('div', {
+        ref: panelRef,
+        role: 'dialog',
+        'data-qwen-usage-panel': '',
+        style: {
+          position: 'fixed',
+          right: `${position.right}px`,
+          bottom: `${position.bottom}px`,
+          zIndex: 2147483000,
+          minWidth: '170px',
+          padding: '10px 12px',
+          borderRadius: '10px',
+          border: '1px solid var(--dsw-alias-border-l2)',
+          background: 'var(--dsw-alias-bg-overlay)',
+          color: 'var(--dsw-alias-label-primary)',
+          boxShadow: 'var(--dsw-elevation-prominent)',
+          fontSize: '12px',
+        },
+      }, [row(locale.startsWith('zh') ? '输入' : 'Input', input), row(locale.startsWith('zh') ? '输出' : 'Output', output)]) : null
+      return h('span', {
+        'data-composer-stat': 'qwen-usage',
+        style: { display: 'inline-flex', minWidth: 0, fontSize: 'calc(var(--dsh-content-font-size-secondary,13px) - 1px)', lineHeight: '20px' },
+      }, [
+        h('button', {
+          key: 'button',
+          ref: buttonRef,
+          type: 'button',
+          'data-qwen-usage': '',
+          'aria-haspopup': 'dialog',
+          'aria-expanded': open,
+          onClick: toggle,
+          style: {
+            border: 'none',
+            background: 'transparent',
+            color: 'var(--dsw-alias-label-tertiary)',
+            font: 'inherit',
+            fontVariantNumeric: 'tabular-nums',
+            lineHeight: 'inherit',
+            padding: '1px 8px',
+            borderRadius: 'var(--dsw-radius-sm)',
+            cursor: 'pointer',
+            whiteSpace: 'nowrap',
+          },
+        }, `${formatCompactTokens(total)} tok`),
+        panel === null ? null : ReactDOM?.createPortal !== undefined ? ReactDOM.createPortal(panel, document.body) : panel,
+      ])
+    })
 
     /** Replaces the send button with a spinner while a warmup request is in flight. */
     function PreheatOverlay(props) {
@@ -1451,7 +1597,7 @@ window.__ModuleLoader__.load({
         if (typeof document !== 'undefined') {
           const style = document.createElement('style')
           style.id = 'qwen-model-option-warm'
-          style.textContent = 'button[role="option"] [data-provider-id]{display:flex!important;align-items:center!important;width:100%!important;min-width:0!important}@keyframes qwen-model-name-marquee{from{transform:translateX(0)}to{transform:translateX(calc(-1 * var(--qwen-model-name-distance,0px)))}}'
+          style.textContent = 'button[role="option"] [data-provider-id]{display:flex!important;align-items:center!important;width:100%!important;min-width:0!important}@keyframes qwen-model-name-marquee{from{transform:translateX(0)}to{transform:translateX(calc(-1 * var(--qwen-model-name-distance,0px)))}}body:has([data-qwen-usage]) [data-composer-stat="usage"]{display:none!important}'
           document.head.appendChild(style)
           ctx.effect(() => () => style.remove(), 'qwen-mode: model option warm style')
           ctx.effect(() => {
@@ -1511,6 +1657,15 @@ window.__ModuleLoader__.load({
           id: 'qwen-warm',
           order: 0,
         }, PreheatOverlay))
+
+        ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
+          name: 'conversation.composer.dock',
+          id: 'qwen-usage',
+          order: 1.1,
+          inject: () => ({
+            getLocale: () => ctx.locale.getLocale().active,
+          }),
+        }, QwenUsagePill))
 
         ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
           name: 'conversation.chat.turnTail',
