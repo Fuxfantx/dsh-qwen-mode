@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Qwen mode",
-    "description": "Adds Qwen / GenieX thinking controls and sampling defaults through a local OpenAI-compatible proxy, with a Settings switch."
+    "description": "Maintains Qwen / GenieX providers through a local OpenAI-compatible proxy, normalizes thinking parameters, and adds model limits, warmup, MTP, and stats."
   }
 }

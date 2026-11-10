@@ -1,9 +1,12 @@
 {
   "name": "dsh-qwen-mode",
   "version": "1.7.5",
-  "description": "Qwen mode for DSH: managed Qwen/GenieX providers, reasoning parsing, model limits, warmup and per-turn stats through a loopback OpenAI-compatible proxy.",
+  "description": "Qwen mode for DSH: managed Qwen/GenieX/QwenCloud providers, thinking normalization, local model capabilities, warmup, MTP and per-turn stats through a loopback OpenAI-compatible proxy.",
   "type": "module",
   "main": "index.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -13,6 +16,7 @@
   "files": [
     "index.js",
     "client.js",
+    "lib/*.js",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",

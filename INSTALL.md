@@ -17,11 +17,12 @@ Version / 版本: **1.7.5**
 3. 刷新 DSH 页面，打开 **Settings → Qwen mode**。
 4. 选择 GenieX 或 QwenCloud，填写上游地址：
    - GenieX 可填 `http://127.0.0.1:18181`，插件自动使用 `/v1`；
-   - QwenCloud 填写完整兼容端点，插件不会自动追加 `/v1`。
-5. 点击「保存并应用」，插件会自动创建 **From GenieX** / **From QwenCloud** Provider。
-6. 在模型选择器中选择该 Provider 下的模型。
+   - QwenCloud 填写完整兼容端点（例如 `https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`），插件不会自动追加 `/v1`。
+5. 使用 QwenCloud 时，在「高级选项 → API Key 变量名」填写保存 Key 的环境变量名（例如 `DASHSCOPE_API_KEY`），并在启动 DSH 的环境中导出该变量；该字段接收变量名，不是 Key 本身。
+6. 点击「保存并应用」，插件会自动创建 **From GenieX** / **From QwenCloud** Provider。
+7. 在模型选择器中选择该 Provider 下的模型。
 
-本包没有 npm 依赖，离线安装不需要联网。代理固定监听 `127.0.0.1:18182`。
+本包没有 npm 依赖，离线安装不需要联网。代理默认监听 `127.0.0.1:18182`；端口被占用时会自动顺延，并把新端口写回配置。
 
 ## English
 
@@ -38,8 +39,9 @@ Install:
 3. Refresh DSH and open **Settings → Qwen mode**.
 4. Choose GenieX or QwenCloud and enter the upstream URL:
    - For GenieX, `http://127.0.0.1:18181` is enough; the plugin uses `/v1` automatically.
-   - For QwenCloud, enter the full compatible endpoint; the plugin does not append `/v1`.
-5. Click **Save and apply**; the plugin creates **From GenieX** / **From QwenCloud** automatically.
-6. Select a model under that provider in the model picker.
+   - For QwenCloud, enter the full compatible endpoint (for example `https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`); the plugin does not append `/v1`.
+5. With QwenCloud, put the name of the environment variable that stores the key in **Advanced → API key reference** (for example `DASHSCOPE_API_KEY`) and export it where DSH starts; the field takes a reference, not the key.
+6. Click **Save and apply**; the plugin creates **From GenieX** / **From QwenCloud** automatically.
+7. Select a model under that provider in the model picker.
 
-The package has no npm dependencies, so offline installation needs no network access. The proxy listens on `127.0.0.1:18182`.
+The package has no npm dependencies, so offline installation needs no network access. The proxy listens on `127.0.0.1:18182` by default and slides to the next free port when that one is taken, writing the chosen port back to the settings file.

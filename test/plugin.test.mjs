@@ -1,0 +1,567 @@
+import assert from 'node:assert/strict'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import http from 'node:http'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Readable } from 'node:stream'
+
+const root = await mkdtemp(join(tmpdir(), 'qwen-mode-plugin-'))
+const home = join(root, 'home')
+const cacheRoot = join(home, '.cache', 'geniex', 'models')
+const modelDir = join(cacheRoot, 'org', 'qwen3.8-27b')
+const draftDir = join(cacheRoot, 'org', 'qwen3.8-27b-assistant')
+await mkdir(modelDir, { recursive: true })
+await mkdir(draftDir, { recursive: true })
+
+// Isolate the GenieX CLI lookup (none on PATH) and the cache fallback.
+const emptyPath = join(root, 'bin')
+await mkdir(emptyPath, { recursive: true })
+const savedEnv = { PATH: process.env.PATH, USERPROFILE: process.env.USERPROFILE, HOME: process.env.HOME, DSH_PROFILE_DIR: process.env.DSH_PROFILE_DIR }
+process.env.PATH = emptyPath
+process.env.USERPROFILE = home
+process.env.HOME = home
+process.env.DSH_PROFILE_DIR = join(root, 'profile')
+
+function u32(value) {
+  const buffer = Buffer.alloc(4)
+  buffer.writeUInt32LE(value)
+  return buffer
+}
+function u64(value) {
+  const buffer = Buffer.alloc(8)
+  buffer.writeBigUInt64LE(BigInt(value))
+  return buffer
+}
+function str(value) {
+  const body = Buffer.from(value, 'utf8')
+  return Buffer.concat([u64(body.length), body])
+}
+function gguf({ context, template, name }) {
+  const entries = [
+    Buffer.concat([str('general.architecture'), u32(8), str('qwen3')]),
+    Buffer.concat([str('general.name'), u32(8), str(name)]),
+    Buffer.concat([str('qwen3.context_length'), u32(4), u32(context)]),
+    Buffer.concat([str('tokenizer.chat_template'), u32(8), str(template)]),
+  ]
+  return Buffer.concat([Buffer.from('GGUF', 'ascii'), u32(3), u64(0), u64(entries.length), ...entries])
+}
+
+await writeFile(join(modelDir, 'model.gguf'), gguf({
+  context: 40960,
+  template: '{% if reasoning_effort %}"low" "high"{% endif %}',
+  name: 'Qwen3.8-27B',
+}))
+await writeFile(join(modelDir, 'geniex.json'), JSON.stringify({
+  ModelType: 'vlm',
+  PluginId: 'llama_cpp',
+  ModelFile: { Q4_0: { Name: 'model.gguf', Downloaded: true } },
+}))
+await writeFile(join(draftDir, 'draft.gguf'), gguf({ context: 40960, template: '', name: 'Qwen3.8 assistant' }))
+await writeFile(join(draftDir, 'geniex.json'), JSON.stringify({
+  ModelType: 'llm',
+  PluginId: 'llama_cpp',
+  ModelFile: { Q4_0: { Name: 'draft.gguf', Downloaded: true } },
+}))
+
+const upstreamRequests = []
+const qwenRequests = []
+
+function geniexUpstream() {
+  const server = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => {
+      upstreamRequests.push({ url: req.url, headers: req.headers, body: Buffer.concat(chunks).toString('utf8') })
+      if (req.url === '/v1/models') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          object: 'list',
+          data: [{ id: 'org/qwen3.8-27b:Q4_0' }, { id: 'org/qwen3.8-27b-assistant:Q4_0' }],
+        }))
+        return
+      }
+      if (req.url === '/status') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ alive: true, models: [{ id: 'org/qwen3.8-27b:Q4_0', state: 'active' }] }))
+        return
+      }
+      if (req.url === '/v1/chat/completions') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' })
+        const chunk = (payload) => `data: ${JSON.stringify(payload)}\n\n`
+        res.write(chunk({ id: 'chat-1', created: 1, model: 'org/qwen3.8-27b:Q4_0', choices: [{ index: 0, delta: { content: '<think>thinking' }, finish_reason: null }] }))
+        res.write(chunk({ id: 'chat-1', created: 1, model: 'org/qwen3.8-27b:Q4_0', choices: [{ index: 0, delta: { content: '</think>answer' }, finish_reason: null }] }))
+        res.write(chunk({
+          id: 'chat-1',
+          created: 1,
+          model: 'org/qwen3.8-27b:Q4_0',
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            prompt_tokens_details: { cached_tokens: 2 },
+            completion_tokens_details: { accepted_prediction_tokens: 2, rejected_prediction_tokens: 1 },
+          },
+        }))
+        res.write('data: [DONE]\n\n')
+        res.end()
+        return
+      }
+      res.writeHead(404).end()
+    })
+  })
+  return server
+}
+
+function qwenUpstream() {
+  const server = http.createServer((req, res) => {
+    const chunks = []
+    req.on('data', (chunk) => chunks.push(chunk))
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8')
+      qwenRequests.push({ url: req.url, headers: req.headers, body: raw })
+      if (req.url.startsWith('/api/v1/models')) {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({
+          success: true,
+          output: {
+            total: 5,
+            page_no: 1,
+            page_size: 100,
+            models: [
+              {
+                model: 'qwen3.8-max',
+                capabilities: ['TG', 'Reasoning'],
+                inference_metadata: { request_modality: ['Text'], response_modality: ['Text'] },
+                model_info: { context_window: 262144, max_output_tokens: 65536 },
+              },
+              {
+                model: 'qwen3.6-plus',
+                capabilities: ['TG', 'Reasoning'],
+                inference_metadata: { request_modality: ['Text'], response_modality: ['Text'] },
+                model_info: { context_window: 262144, max_output_tokens: 32768 },
+              },
+              {
+                model: 'qwen3-coder-plus',
+                capabilities: ['TG'],
+                inference_metadata: { request_modality: ['Text'], response_modality: ['Text'] },
+                model_info: { context_window: 262144, max_output_tokens: 16384 },
+              },
+              {
+                model: 'qwen3-vl-plus',
+                capabilities: ['TG', 'Reasoning', 'VU'],
+                inference_metadata: { request_modality: ['Text', 'Image'], response_modality: ['Text'] },
+                model_info: { context_window: 131072, max_output_tokens: 16384 },
+              },
+              {
+                model: 'qwen-image-3.0-pro',
+                capabilities: ['IG'],
+                inference_metadata: { request_modality: ['Text'], response_modality: ['Image'] },
+                model_info: { context_window: null, max_output_tokens: null },
+              },
+            ],
+          },
+        }))
+        return
+      }
+      if (req.url.endsWith('/models')) {
+        res.writeHead(404, { 'content-type': 'application/json' })
+        res.end('{}')
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({
+        id: 'chat-2',
+        created: 1,
+        model: JSON.parse(raw).model,
+        choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 3, completion_tokens: 1 },
+      }))
+    })
+  })
+  return server
+}
+
+const upstream = geniexUpstream()
+const qwen = qwenUpstream()
+await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+await new Promise((resolve) => qwen.listen(0, '127.0.0.1', resolve))
+const upstreamURL = `http://127.0.0.1:${upstream.address().port}`
+const qwenURL = `http://127.0.0.1:${qwen.address().port}/compatible-mode/v1`
+
+// ---- mock Cordis context --------------------------------------------------
+
+function createContext(entryConfig) {
+  const routes = []
+  const effects = []
+  const credentials = new Map()
+  const config = { providers: {} }
+  const entry = { options: { id: 'llm-pi-ai', config }, id: 'include:llm-pi-ai' }
+  const ctx = {
+    logger: () => ({ info: () => {}, warn: () => {}, error: () => {} }),
+    effect: (fn) => {
+      const disposer = fn()
+      if (typeof disposer === 'function') effects.push(disposer)
+      return disposer
+    },
+    on: () => () => {},
+    emit: () => {},
+    tools: { guard: () => () => {} },
+    agents: { list: () => [], get: () => undefined },
+    sessions: { get: () => undefined },
+    permissionPresets: { current: () => 'custom' },
+    credentials: {
+      resolve: async (ref) => (credentials.has(ref) ? { value: credentials.get(ref) } : undefined),
+      set: async (ref, value) => { credentials.set(ref, value) },
+      has: (ref) => credentials.has(ref),
+    },
+    connection: { requestRejection: () => undefined },
+    webServer: {
+      register: (route) => {
+        routes.push(route)
+        return () => {}
+      },
+    },
+    configEditor: {
+      entries: () => [entry],
+      configuration: () => [{ entry, inherited: {}, override: structuredClone(config) }],
+      edit: async (target, change) => {
+        const next = change(structuredClone(config), {})
+        for (const key of Object.keys(config)) delete config[key]
+        Object.assign(config, next)
+      },
+    },
+    routes,
+    effects,
+    config,
+  }
+  return ctx
+}
+
+function callApi(ctx, method, payload = {}) {
+  const route = ctx.routes.find((candidate) => candidate.path === '/qwen-mode/api')
+  assert.ok(route, 'settings API registered')
+  return new Promise((resolve, reject) => {
+    const req = Readable.from([Buffer.from(JSON.stringify(payload))])
+    req.method = 'POST'
+    req.url = `/qwen-mode/api/${method}`
+    req.headers = { 'content-type': 'application/json' }
+    const chunks = []
+    const res = {
+      statusCode: 0,
+      headers: {},
+      setHeader(name, value) { this.headers[name.toLowerCase()] = value },
+      writeHead(status, headers) { this.statusCode = status; Object.assign(this.headers, headers ?? {}) },
+      write(chunk) { chunks.push(Buffer.from(chunk)); return true },
+      end(chunk) {
+        if (chunk !== undefined) chunks.push(Buffer.from(chunk))
+        const body = Buffer.concat(chunks).toString('utf8')
+        let parsed
+        try {
+          parsed = JSON.parse(body)
+        } catch {
+          reject(new Error(`non-JSON API response: ${body}`))
+          return
+        }
+        resolve({ status: this.statusCode, body: parsed })
+      },
+      flushHeaders() {},
+      writableEnded: false,
+    }
+    route.handler(req, res).catch(reject)
+  })
+}
+
+async function callProxy(port, body) {
+  const response = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  return { status: response.status, text: await response.text() }
+}
+
+const results = []
+function check(name, fn) {
+  try {
+    fn()
+    results.push(`ok - ${name}`)
+  } catch (error) {
+    results.push(`not ok - ${name}: ${error.stack}`)
+    process.exitCode = 1
+  }
+}
+
+try {
+  const { apply } = await import('../index.js')
+  const ctx = createContext()
+  await apply(ctx)
+  await new Promise((resolve) => setTimeout(resolve, 250))
+
+  let state = (await callApi(ctx, 'state')).body.value
+  check('starts with defaults', () => {
+    assert.equal(state.mode, 'off')
+    assert.equal(state.maxOutputTokens, 16384)
+  })
+
+  const saved = (await callApi(ctx, 'save', {
+    mode: 'auto',
+    warm: true,
+    protocol: 'geniex',
+    upstream: upstreamURL,
+    contextWindow: null,
+    maxOutputTokens: 4096,
+    autoNctx: false,
+    mtp: true,
+    compute: 'npu',
+    vitCompute: 'npu',
+  })).body
+  assert.equal(saved.ok, true, JSON.stringify(saved))
+  state = saved.value
+  const port = state.proxyPort
+
+  const provider = ctx.config['providers']['from-geniex']
+  check('provider has the chat model only', () => {
+    assert.deepEqual(provider.models.map((model) => model.id), ['org/qwen3.8-27b:Q4_0'])
+    assert.equal(provider.baseURL, `http://127.0.0.1:${port}/v1`)
+    assert.equal(provider.apiKeyEnv, 'local')
+    assert.equal(provider.compat.thinkingFormat, 'qwen')
+    assert.equal(provider.compat.maxTokensField, 'max_completion_tokens')
+  })
+  check('model metadata comes from the local cache', () => {
+    const model = provider.models[0]
+    assert.equal(model.contextWindow, 40960)
+    assert.equal(model.maxTokens, 4096)
+    assert.deepEqual(model.input, ['text', 'image'])
+    assert.deepEqual(model.reasoningEfforts, { off: null, low: 'low', high: 'high' })
+  })
+  check('a missing local credential is created for GenieX', () => {
+    assert.equal(ctx.credentials.has('local'), true)
+  })
+  const contextOf = () => ctx.config.providers['from-geniex'].models[0].contextWindow
+  await callApi(ctx, 'save', { contextWindow: 8192 })
+  check('an explicit context window overrides model metadata', () => {
+    assert.equal(contextOf(), 8192)
+  })
+  await callApi(ctx, 'save', { contextWindow: 8192, autoNctx: true })
+  check('prefer-model overrides the explicit value', () => {
+    assert.equal(contextOf(), 40960)
+  })
+  await callApi(ctx, 'save', { contextWindow: null, autoNctx: false })
+  check('an empty context falls back to metadata', () => {
+    assert.equal(contextOf(), 40960)
+  })
+  const restored = (await callApi(ctx, 'state')).body.value
+  check('context changes persist in state', () => {
+    assert.equal(restored.contextWindow, null)
+    assert.equal(restored.autoNctx, false)
+  })
+  check('vision is resolved without the HTTP detail endpoint', () => {
+    assert.equal(upstreamRequests.some((request) => request.url.startsWith('/v1/models/')), false)
+  })
+
+  const info = (await callApi(ctx, 'modelInfo')).body.value
+  check('model info reports the paired MTP draft', () => {
+    const entry = info.models['org/qwen3.8-27b:Q4_0']
+    assert.equal(entry.vision, true)
+    assert.equal(entry.mtpReady, true)
+    assert.equal(entry.contextLength, 40960)
+    assert.equal(entry.abliterated, false)
+  })
+  check('state exposes the managed provider', () => {
+    assert.equal(state.provider.exists, true)
+    assert.deepEqual(state.provider.models, ['org/qwen3.8-27b:Q4_0'])
+  })
+
+  const media = [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }]
+  const first = await callProxy(port, {
+    model: 'org/qwen3.8-27b:Q4_0',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }, ...media] }],
+    stream: true,
+    max_completion_tokens: 999999,
+    temperature: 0.2,
+    reasoning_effort: 'high',
+  })
+  check('proxy response rewrites inline reasoning', () => {
+    assert.equal(first.status, 200)
+    assert.match(first.text, /"reasoning_content":"thinking"/u)
+    assert.match(first.text, /"content":"answer"/u)
+    assert.match(first.text, /"finish_reason":"stop"/u)
+    assert.match(first.text, /data: \[DONE\]/u)
+  })
+  const firstBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
+  check('request normalization matches GenieX and DSH expectations', () => {
+    assert.equal(firstBody.enable_think, true)
+    assert.equal(firstBody.reasoning_format, 'auto')
+    assert.equal(firstBody.nctx, 40960)
+    assert.equal(firstBody.max_completion_tokens, 40960)
+    assert.equal(firstBody.vit_compute, 'HTP2')
+    assert.equal(firstBody.compute, 'npu')
+    assert.equal(firstBody.reasoning_effort, 'high')
+    assert.equal(firstBody.temperature, 0.2)
+    assert.equal(firstBody.stream_options.include_usage, true)
+    assert.equal(firstBody.spec_type, undefined)
+  })
+
+  await callApi(ctx, 'mtpChoice', { model: 'org/qwen3.8-27b:Q4_0', allow: true })
+  await callProxy(port, {
+    model: 'org/qwen3.8-27b:Q4_0',
+    messages: [{ role: 'user', content: media }],
+    stream: false,
+  })
+  const mtpBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
+  check('approved MTP attaches the draft model', () => {
+    assert.equal(mtpBody.spec_type, 'draft-mtp')
+    assert.equal(mtpBody.spec_draft_model, 'org/qwen3.8-27b-assistant:Q4_0')
+    assert.equal(mtpBody.spec_n_max, 3)
+  })
+  await callProxy(port, {
+    model: 'org/qwen3.8-27b:Q4_0',
+    messages: [{ role: 'user', content: media }],
+    stream: false,
+  })
+  const afterBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
+  check('the image approval is consumed after one request', () => {
+    assert.equal(afterBody.spec_type, undefined)
+  })
+  await callProxy(port, {
+    model: 'org/qwen3.8-27b:Q4_0',
+    messages: [{ role: 'user', content: 'text only' }],
+    stream: false,
+  })
+  const textBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
+  check('text-only requests keep MTP enabled', () => {
+    assert.equal(textBody.spec_type, 'draft-mtp')
+  })
+
+  const warm = (await callApi(ctx, 'warm', { model: 'org/qwen3.8-27b:Q4_0' })).body
+  check('warmup uses the native GenieX warm-up shape', () => {
+    assert.equal(warm.ok, true, JSON.stringify(warm))
+    assert.equal(warm.value.warmed, true)
+    const body = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
+    assert.equal(body.messages.length, 1)
+    assert.equal(body.messages[0].role, 'system')
+    assert.equal(body.enable_think, false)
+  })
+
+  const status = (await callApi(ctx, 'modelStatus')).body.value
+  check('status maps GenieX model state', () => {
+    assert.equal(status.active, true)
+    assert.deepEqual(status.models, ['org/qwen3.8-27b:Q4_0'])
+    assert.equal(status.states['org/qwen3.8-27b:Q4_0'], 'active')
+  })
+
+  const stats = (await callApi(ctx, 'turnStats', { sessionId: 'missing', turn: 1 })).body.value
+  check('unknown sessions have no turn stats', () => {
+    assert.equal(stats, null)
+  })
+
+  const permission = (await callApi(ctx, 'permissionLabel', { locale: 'en' })).body.value
+  check('a missing permission entry is tolerated', () => {
+    assert.equal(permission.updated, false)
+  })
+
+  // ---- QwenCloud --------------------------------------------------------
+  const switched = (await callApi(ctx, 'save', {
+    mode: 'auto',
+    protocol: 'qwen',
+    upstream: qwenURL,
+    apiKeyEnv: 'DASHSCOPE_API_KEY',
+    contextWindow: null,
+    maxOutputTokens: 8192,
+    topK: 20,
+    minP: 0.1,
+  })).body
+  assert.equal(switched.ok, true, JSON.stringify(switched))
+  const qwenProvider = ctx.config.providers['from-qwencloud']
+  check('switching source replaces the provider', () => {
+    assert.equal(ctx.config.providers['from-geniex'], undefined)
+    assert.ok(qwenProvider !== undefined)
+    assert.equal(qwenProvider.apiKeyEnv, 'DASHSCOPE_API_KEY')
+    assert.deepEqual(qwenProvider.models.map((model) => model.id).sort(), ['qwen3-coder-plus', 'qwen3-vl-plus', 'qwen3.6-plus', 'qwen3.8-max'])
+    assert.equal(qwenRequests.some((request) => request.url === '/compatible-mode/v1/models'), false)
+    assert.ok(qwenRequests.some((request) => request.url.startsWith('/api/v1/models')))
+  })
+  check('QwenCloud catalog carries context, output, vision, and reasoning', () => {
+    const byId = new Map(qwenProvider.models.map((model) => [model.id, model]))
+    assert.deepEqual(byId.get('qwen3.8-max').reasoningEfforts, { off: null, low: 'low', medium: 'medium', xhigh: 'xhigh' })
+    assert.deepEqual(byId.get('qwen3.6-plus').reasoningEfforts, { off: null, max: 'enabled' })
+    assert.equal(byId.get('qwen3-coder-plus').reasoningEfforts, false)
+    assert.deepEqual(byId.get('qwen3-vl-plus').input, ['text', 'image'])
+    assert.equal(byId.get('qwen3.8-max').contextWindow, 262144)
+    assert.equal(byId.get('qwen3.8-max').maxTokens, 8192)
+    assert.equal(byId.get('qwen3-vl-plus').contextWindow, 131072)
+  })
+
+  const qwenPort = switched.value.proxyPort
+  const qwenSend = async (body) => {
+    const response = await fetch(`http://127.0.0.1:${qwenPort}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    return { status: response.status, text: await response.text() }
+  }
+  const lastQwenBody = () => JSON.parse(qwenRequests.filter((request) => request.url.endsWith('/chat/completions')).at(-1).body)
+
+  await qwenSend({ model: 'qwen3.8-max', messages: [{ role: 'user', content: 'hi' }], reasoning_effort: 'xhigh' })
+  check('QwenCloud requests keep valid reasoning params only', () => {
+    const body = lastQwenBody()
+    assert.equal(body.enable_thinking, true)
+    assert.equal(body.preserve_thinking, true)
+    assert.equal(body.reasoning_effort, 'xhigh')
+    assert.equal(body.min_p, undefined)
+    assert.equal(body.top_k, 20)
+    assert.equal(body.nctx, undefined)
+    assert.equal(body.enable_think, undefined)
+  })
+  await qwenSend({ model: 'qwen3.6-plus', messages: [{ role: 'user', content: 'hi' }], reasoning_effort: 'enabled' })
+  check('an on/off alias is dropped before Model Studio sees it', () => {
+    const body = lastQwenBody()
+    assert.equal(body.enable_thinking, true)
+    assert.equal(body.reasoning_effort, undefined)
+  })
+  await qwenSend({ model: 'qwen3.8-max', messages: [{ role: 'user', content: 'hi' }], reasoning_effort: 'off' })
+  check('off disables thinking and stops preserving history reasoning', () => {
+    const body = lastQwenBody()
+    assert.equal(body.enable_thinking, false)
+    assert.equal(body.preserve_thinking, undefined)
+  })
+  await qwenSend({ model: 'qwen3-coder-plus', messages: [{ role: 'user', content: 'hi' }] })
+  check('a non-reasoning model gets no thinking parameters', () => {
+    const body = lastQwenBody()
+    assert.equal(body.enable_thinking, undefined)
+    assert.equal(body.preserve_thinking, undefined)
+  })
+
+  const cleared = (await callApi(ctx, 'remove')).body.value
+  check('removing the provider clears its catalog', () => {
+    assert.equal(ctx.config.providers['from-qwencloud'], undefined)
+    assert.equal(cleared.provider, null)
+  })
+
+  await (await callApi(ctx, 'setMode', { mode: 'off' })).body
+  check('mode off persists', () => {
+    assert.equal(ctx.config.providers['from-qwencloud'], undefined)
+  })
+
+  for (const disposer of ctx.effects.reverse()) {
+    try {
+      await disposer()
+    } catch {
+      // Individual disposer failures are not this test's subject.
+    }
+  }
+} finally {
+  await new Promise((resolve) => upstream.close(() => resolve()))
+  await new Promise((resolve) => qwen.close(() => resolve()))
+  process.env.PATH = savedEnv.PATH
+  if (savedEnv.USERPROFILE === undefined) delete process.env.USERPROFILE
+  else process.env.USERPROFILE = savedEnv.USERPROFILE
+  if (savedEnv.HOME === undefined) delete process.env.HOME
+  else process.env.HOME = savedEnv.HOME
+  if (savedEnv.DSH_PROFILE_DIR === undefined) delete process.env.DSH_PROFILE_DIR
+  else process.env.DSH_PROFILE_DIR = savedEnv.DSH_PROFILE_DIR
+  await rm(root, { recursive: true, force: true })
+}
+
+console.log(results.join('\n'))

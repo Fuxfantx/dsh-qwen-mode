@@ -26,7 +26,11 @@ window.__ModuleLoader__.load({
     const h = React.createElement
     const NS = 'qwenMode'
     const API = '/qwen-mode/api'
-    const DEFAULT_CONTEXT_WINDOW = 262144
+    const DEFAULT_QWEN_CONTEXT = 262144
+    const DEFAULT_GENIEX_CONTEXT = 131072
+    const DEFAULT_MAX_OUTPUT = 16384
+    const CREDENTIAL_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u
+    const COMPACTION_HEADROOM = 65536
 
     const zh = {
       'section.title': 'Qwen 模式',
@@ -38,10 +42,12 @@ window.__ModuleLoader__.load({
       'protocol.geniex': 'GenieX',
       'protocol.qwen': 'QwenCloud',
       'upstream.label': '上游地址',
-      'apiKeyEnv.label': 'API Key（可选）',
-      'apiKeyEnv.placeholder': 'local',
+      'apiKeyEnv.label': 'API Key 变量名（可选）',
+      'apiKeyEnv.placeholder': 'DASHSCOPE_API_KEY',
+      'apiKeyEnv.hint': '填写保存 Key 的环境变量名或 DSH 凭据名，而不是 Key 本身；GenieX 不校验 Key，留空即可。',
+      'apiKeyEnv.invalid': 'Key 变量名只能包含字母、数字和下划线，且不能以数字开头。',
       'warm.label': '选择 From GenieX 模型时自动预热',
-      'warm.hint': '发送一个最小 system prompt、单 token 且关闭推理的请求，让 GenieX 提前加载模型；预热期间发送按钮显示转圈。',
+      'warm.hint': '发送仅含 system 消息的原生预热请求，让 GenieX 按相同加载参数提前驻留模型；预热期间发送按钮显示转圈。',
       'advanced': '高级选项',
       'provider.title': '自动维护的 Provider',
       'provider.name': 'Provider',
@@ -63,7 +69,7 @@ window.__ModuleLoader__.load({
       'vit.npu': 'NPU',
       'limits.invalid': '最大输出长度不能大于上下文窗口。',
       'contextWindow.label': '上下文窗口',
-      'contextWindow.geniexPlaceholder': 'GENIEX_NCTX（default 4096）',
+      'contextWindow.geniexPlaceholder': '留空：有 GGUF 元数据时用模型值，否则 131072',
       'autoNctx.label': '优先使用模型上下文阈限',
       'autoNctx.sublabel': '( GGUF context_length )',
       'maxOutputTokens.label': '最大输出长度',
@@ -80,7 +86,7 @@ window.__ModuleLoader__.load({
       'mtp.disableHint': '需要重新加载模型',
       'mtp.cancel': '取消',
       'sampling.title': '采样默认值',
-      'sampling.hint': '仅在请求未携带该字段时填充；留空则不注入。',
+      'sampling.hint': '仅在请求未携带该字段时填充；留空则不注入。min_p 仅对 GenieX 生效。',
       'sampling.fill': '读取推荐值',
       'sampling.none': '当前没有带推荐采样值的模型',
       'temperature.label': 'temperature',
@@ -105,6 +111,7 @@ window.__ModuleLoader__.load({
       'usage.title': 'Token 用量',
       'compaction.dsh': 'DSH 压缩阈值',
       'compaction.gate': '推荐 bigGate',
+      'compaction.unavailable': '上下文不足以容纳 64K 压缩预留，DSH 压缩不可用；请增大上下文窗口或减小最大输出长度。',
     }
 
     const en = {
@@ -117,10 +124,12 @@ window.__ModuleLoader__.load({
       'protocol.geniex': 'GenieX',
       'protocol.qwen': 'QwenCloud',
       'upstream.label': 'Upstream URL',
-      'apiKeyEnv.label': 'API key (optional)',
-      'apiKeyEnv.placeholder': 'local',
+      'apiKeyEnv.label': 'API key reference (optional)',
+      'apiKeyEnv.placeholder': 'DASHSCOPE_API_KEY',
+      'apiKeyEnv.hint': 'Name of the environment variable or DSH credential that holds the key, not the key itself; GenieX ignores it.',
+      'apiKeyEnv.invalid': 'The reference may contain only letters, digits, and underscores, and cannot start with a digit.',
       'warm.label': 'Warm up when selecting a From GenieX model',
-      'warm.hint': 'Sends a minimal system prompt with a one-token, non-thinking request so GenieX loads the model; the send button shows a spinner while warming.',
+      'warm.hint': "Sends GenieX's native warm-up request (a single system message) so the model loads with the same load parameters; the send button shows a spinner while warming.",
       'advanced': 'Advanced',
       'provider.title': 'Managed provider',
       'provider.name': 'Provider',
@@ -142,7 +151,7 @@ window.__ModuleLoader__.load({
       'vit.npu': 'NPU',
       'limits.invalid': 'Max output tokens cannot exceed the context window.',
       'contextWindow.label': 'Context window',
-      'contextWindow.geniexPlaceholder': 'GENIEX_NCTX (default 4096)',
+      'contextWindow.geniexPlaceholder': 'Empty: the model value when GGUF metadata exists, else 131072',
       'autoNctx.label': 'Prefer model context limit',
       'autoNctx.sublabel': '( GGUF context_length )',
       'maxOutputTokens.label': 'Max output tokens',
@@ -159,7 +168,7 @@ window.__ModuleLoader__.load({
       'mtp.disableHint': 'The model must reload',
       'mtp.cancel': 'Cancel',
       'sampling.title': 'Sampling Defaults',
-      'sampling.hint': 'Filled only when the request does not already carry the field; empty omits it.',
+      'sampling.hint': 'Filled only when the request does not already carry the field; empty omits it. min_p applies to GenieX only.',
       'sampling.fill': 'Read recommended',
       'sampling.none': 'No model currently exposes recommended sampling',
       'temperature.label': 'temperature',
@@ -184,6 +193,7 @@ window.__ModuleLoader__.load({
       'usage.title': 'Token usage',
       'compaction.dsh': 'DSH compaction threshold',
       'compaction.gate': 'Recommended bigGate',
+      'compaction.unavailable': 'The context cannot hold the 64K compaction reserve, so DSH compaction is unavailable; raise the context window or lower the output limit.',
     }
 
     function format(template, params) {
@@ -240,6 +250,17 @@ window.__ModuleLoader__.load({
       timer: null,
       subscribers: 0,
       refreshing: false,
+      stopPolling() {
+        if (warmState.timer === null) return
+        window.clearInterval(warmState.timer)
+        warmState.timer = null
+      },
+      startPolling() {
+        if (warmState.timer !== null) return
+        warmState.timer = window.setInterval(() => {
+          if (typeof document === 'undefined' || !document.hidden) void warmState.refresh()
+        }, 4000)
+      },
       async refresh() {
         if (warmState.refreshing) return
         warmState.refreshing = true
@@ -255,6 +276,9 @@ window.__ModuleLoader__.load({
           warmState.enabled = false
         }
         warmState.refreshing = false
+        // Warming state changes rarely; only poll while warmup is enabled.
+        if (warmState.enabled) warmState.startPolling()
+        else warmState.stopPolling()
         for (const listener of warmState.listeners) {
           try {
             listener()
@@ -266,18 +290,12 @@ window.__ModuleLoader__.load({
       subscribe(listener) {
         warmState.listeners.add(listener)
         warmState.subscribers += 1
-        if (warmState.subscribers === 1) {
-          void warmState.refresh()
-          warmState.timer = window.setInterval(() => void warmState.refresh(), 2500)
-        }
+        if (warmState.subscribers === 1) void warmState.refresh()
         listener()
         return () => {
           warmState.listeners.delete(listener)
           warmState.subscribers -= 1
-          if (warmState.subscribers === 0 && warmState.timer !== null) {
-            window.clearInterval(warmState.timer)
-            warmState.timer = null
-          }
+          if (warmState.subscribers === 0) warmState.stopPolling()
         }
       },
     }
@@ -290,6 +308,7 @@ window.__ModuleLoader__.load({
       refreshing: false,
       async refresh() {
         if (modelMetaState.refreshing) return
+        if (typeof document !== 'undefined' && document.hidden) return
         modelMetaState.refreshing = true
         try {
           const info = await call('modelInfo', undefined, { signal: AbortSignal.timeout(5000) })
@@ -311,7 +330,7 @@ window.__ModuleLoader__.load({
         modelMetaState.subscribers += 1
         if (modelMetaState.subscribers === 1) {
           void modelMetaState.refresh()
-          modelMetaState.timer = window.setInterval(() => void modelMetaState.refresh(), 5000)
+          modelMetaState.timer = window.setInterval(() => void modelMetaState.refresh(), 8000)
         }
         listener()
         return () => {
@@ -419,6 +438,7 @@ window.__ModuleLoader__.load({
         selectedMtp.model = selectedModel ?? ''
         const previousProvider = lastProvider.get(key)
         lastProvider.set(key, provider?.id)
+        trimWarmTracking()
         if (previousProvider !== undefined && previousProvider !== provider?.id) {
           for (const cooldownKey of [...lastWarmAt.keys()]) {
             if (cooldownKey.startsWith(`${key}\u0000`)) lastWarmAt.delete(cooldownKey)
@@ -444,6 +464,7 @@ window.__ModuleLoader__.load({
           lastWarm.set(key, modelId)
           lastWarmRevision.set(modelKey, warmRevision)
           lastWarmAt.set(modelKey, Date.now())
+          trimWarmTracking()
           preheat.begin(modelKey, modelId)
           try {
             await call('warm', { model: modelId })
@@ -454,6 +475,7 @@ window.__ModuleLoader__.load({
           }
         })
         warmChain.set(key, job.catch(() => {}))
+        trimWarmTracking()
         void job
       }, [placement, selected, provider?.id, model?.id, sessionId, warmRevision, preheatEnabled])
 
@@ -577,9 +599,11 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         if (stats === null || stats === undefined || typeof document === 'undefined') return
         const model = String(stats.model ?? '').split('/').pop().replace(/:[^:]+$/u, '')
-        const ttft = stats.ttftMs < 1000
-          ? t('stats.ms', { value: stats.ttftMs })
-          : t('stats.sec', { value: (stats.ttftMs / 1000).toFixed(1) })
+        const ttftMs = Number(stats.ttftMs)
+        if (!Number.isFinite(ttftMs)) return
+        const ttft = ttftMs < 1000
+          ? t('stats.ms', { value: ttftMs })
+          : t('stats.sec', { value: (ttftMs / 1000).toFixed(1) })
         const span = document.createElement('span')
         span.setAttribute('data-qwen-turn-stats', '')
         span.style.cssText = 'display:inline-flex;align-items:center;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1.5;white-space:nowrap;'
@@ -643,6 +667,7 @@ window.__ModuleLoader__.load({
     /** Whole-session token pill for sessions that contain From GenieX replies. */
     const sessionProviderCache = new Map()
     const numberFormats = new Map()
+    const tokenFormatter = new Intl.NumberFormat()
     const exactFormatter = (locale) => {
       let formatter = numberFormats.get(locale)
       if (formatter === undefined) {
@@ -652,8 +677,9 @@ window.__ModuleLoader__.load({
       return formatter
     }
     const formatCompactTokens = (value) => {
-      if (value >= 1000000) return `${(value / 1000000).toFixed(1).replace(/\.0$/u, '')}M`
-      if (value >= 1000) return `${Math.round(value / 1000)}K`
+      if (value >= 995000) return `${(value / 1000000).toFixed(1).replace(/\.0$/u, '')}M`
+      if (value >= 10000) return `${Math.round(value / 1000)}K`
+      if (value >= 1000) return `${(value / 1000).toFixed(1).replace(/\.0$/u, '')}K`
       return String(value)
     }
     const QwenUsagePill = React.memo(function QwenUsagePill({ sessionId, useProjection, getLocale }) {
@@ -848,7 +874,21 @@ window.__ModuleLoader__.load({
         alignStyle.id = 'qwen-permission-align'
         document.head.appendChild(alignStyle)
       }
-      alignStyle.textContent = 'button[role="option"]{align-items:center!important}button[role="option"]>span[aria-hidden="true"]{display:inline-flex!important;align-items:center!important;justify-content:center!important;width:14px!important;height:20px!important;flex:0 0 14px!important}button[role="option"]>span[aria-hidden="true"] svg{display:block;width:14px;height:14px}button[role="option"]>span[class*="itemName"]{display:flex!important;align-items:center!important;line-height:20px}[data-qwen-reply-icon]{height:20px!important;min-height:20px!important;align-self:center!important;transform:none!important}[class*="triggerLabel"]{display:inline-flex;align-items:center}[class*="triggerIcon"]{display:inline-flex;align-items:center;justify-content:center}button:has([data-provider-id])>[class*="triggerIcon"]{display:none!important}button:has([data-provider-id])>[class*="triggerLabel"],button:has([data-provider-id])>[class*="triggerEffort"]{display:inline-flex!important;align-items:center!important;height:20px!important;line-height:20px!important}button:has([data-provider-id])>[class*="triggerLabel"]>span[data-provider-id]{display:inline-flex!important;align-items:center!important;height:20px!important;line-height:20px!important}'
+      // Scope the option-layout overrides to the one menu row this plugin
+      // decorates; unscoped `button[role="option"]` rules reached every menu.
+      alignStyle.textContent = [
+        'button[role="option"]:has([data-qwen-reply-icon]){align-items:center!important}',
+        'button[role="option"]:has([data-qwen-reply-icon])>span[aria-hidden="true"]{display:inline-flex!important;align-items:center!important;justify-content:center!important;width:14px!important;height:20px!important;flex:0 0 14px!important}',
+        'button[role="option"]:has([data-qwen-reply-icon])>span[aria-hidden="true"] svg{display:block;width:14px;height:14px}',
+        'button[role="option"]:has([data-qwen-reply-icon])>span[class*="itemName"]{display:flex!important;align-items:center!important;line-height:20px}',
+        '[data-qwen-reply-icon]{height:20px!important;min-height:20px!important;align-self:center!important;transform:none!important}',
+        'button:has([data-qwen-reply-icon])>[class*="triggerLabel"]{display:inline-flex;align-items:center}',
+        'button:has([data-qwen-reply-icon])>[class*="triggerIcon"]{display:inline-flex;align-items:center;justify-content:center}',
+        'button:has([data-provider-id])>[class*="triggerLabel"]{display:inline-flex;align-items:center}',
+        'button:has([data-provider-id])>[class*="triggerIcon"]{display:none!important}',
+        'button:has([data-provider-id])>[class*="triggerLabel"],button:has([data-provider-id])>[class*="triggerEffort"]{display:inline-flex!important;align-items:center!important;height:20px!important;line-height:20px!important}',
+        'button:has([data-provider-id])>[class*="triggerLabel"]>span[data-provider-id]{display:inline-flex!important;align-items:center!important;height:20px!important;line-height:20px!important}',
+      ].join('')
       const createIcon = () => {
         const span = document.createElement('span')
         span.setAttribute('data-qwen-reply-icon', '')
@@ -893,18 +933,22 @@ window.__ModuleLoader__.load({
           if (!hasReplyLabel(host)) icon.remove()
         }
         const seen = new Set()
-        for (const button of document.querySelectorAll('button[role="option"], button')) {
+        for (const button of document.querySelectorAll('button')) {
+          // Cheap pre-filter: the tree walk below is only needed for buttons
+          // whose visible text actually names the preset.
+          const label = button.textContent ?? ''
+          if (!label.includes('仅回复') && !label.includes('Reply Only')) continue
           const walker = document.createTreeWalker(button, NodeFilter.SHOW_TEXT)
           for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
             const text = node.nodeValue?.trim()
             if (text === undefined || !REPLY_LABELS.has(text)) continue
-            const label = node.parentElement
-            const host = label?.parentElement
-            if (label === null || label === undefined || host === null || host === undefined) continue
+            const parent = node.parentElement
+            const host = parent?.parentElement
+            if (parent === null || parent === undefined || host === null || host === undefined) continue
             if (seen.has(host) || host.querySelector('[data-qwen-reply-icon]') !== null) continue
             seen.add(host)
             const icon = createIcon()
-            host.insertBefore(icon, label)
+            host.insertBefore(icon, parent)
             guardIcon(host, icon)
           }
         }
@@ -974,20 +1018,35 @@ window.__ModuleLoader__.load({
     const lastWarmRevision = new Map()
     const warmChain = new Map()
     const selectedMtp = { model: '' }
+    const WARM_TRACKING_LIMIT = 200
+    function trimWarmTracking() {
+      for (const map of [lastWarm, lastProvider, lastWarmAt, lastWarmRevision, warmChain]) {
+        while (map.size > WARM_TRACKING_LIMIT) {
+          const oldest = map.keys().next().value
+          if (oldest === undefined) break
+          map.delete(oldest)
+        }
+      }
+    }
 
     /** Replace the composer send button with a spinner while warmup is active. */
     const sendWarm = {
       button: null,
       spinner: null,
       timer: null,
+      interval: null,
       style: null,
     }
     const SEND_LABELS = new Set(['发送消息', 'Send message', '发送', 'Send'])
     const REPLY_LABELS = new Set(['仅回复', 'Reply Only'])
     function clearSendWarm() {
       if (sendWarm.timer !== null) {
-        clearInterval(sendWarm.timer)
+        clearTimeout(sendWarm.timer)
         sendWarm.timer = null
+      }
+      if (sendWarm.interval !== null) {
+        clearInterval(sendWarm.interval)
+        sendWarm.interval = null
       }
       if (sendWarm.spinner !== null) {
         sendWarm.spinner.remove()
@@ -1142,7 +1201,12 @@ window.__ModuleLoader__.load({
       }
       const button = findSendButton()
       if (button === null) {
-        sendWarm.timer = setTimeout(showSendWarm, 120)
+        if (sendWarm.timer === null) {
+          sendWarm.timer = setTimeout(() => {
+            sendWarm.timer = null
+            showSendWarm()
+          }, 120)
+        }
         return
       }
       const spinner = document.createElement('span')
@@ -1178,11 +1242,17 @@ window.__ModuleLoader__.load({
       button.insertAdjacentElement('afterend', spinner)
       sendWarm.button = button
       sendWarm.spinner = spinner
-      sendWarm.timer = setInterval(() => {
+      if (sendWarm.interval !== null) clearInterval(sendWarm.interval)
+      sendWarm.interval = setInterval(() => {
         if (sendWarm.spinner !== null && sendWarm.spinner.isConnected && sendWarm.button?.isConnected) return
-        sendWarm.spinner?.remove()
+        // The composer re-rendered and dropped the spinner nodes; retry once
+        // from a clean slate instead of spawning a second loop.
+        clearInterval(sendWarm.interval)
+        sendWarm.interval = null
+        const stale = sendWarm.spinner
         sendWarm.spinner = null
         sendWarm.button = null
+        stale?.remove()
         showSendWarm()
       }, 300)
     }
@@ -1237,8 +1307,13 @@ window.__ModuleLoader__.load({
         else preheat.active.delete(key)
         if (typeof modelId === 'string') {
           const count = (warmState.warming.get(modelId) ?? 0) - 1
-          if (count > 0) warmState.warming.set(modelId, count)
-          else warmState.warming.delete(modelId)
+          if (count > 0) {
+            warmState.warming.set(modelId, count)
+          } else {
+            warmState.warming.delete(modelId)
+            // The model is resident now; fold the server state back in once.
+            void warmState.refresh()
+          }
           for (const listener of warmState.listeners) {
             try {
               listener()
@@ -1347,11 +1422,23 @@ window.__ModuleLoader__.load({
         void load()
       }, [load])
 
+      const modelPollCount = React.useRef(0)
       React.useEffect(() => {
         if (settings?.protocol !== 'geniex') return undefined
         const hasModels = modelInfo !== null && Object.keys(modelInfo.models ?? {}).length > 0
-        if (hasModels) return undefined
-        const timer = window.setInterval(() => void refreshModelInfo('geniex'), 3000)
+        if (hasModels) {
+          modelPollCount.current = 0
+          return undefined
+        }
+        if (modelPollCount.current >= 12) return undefined
+        const timer = window.setInterval(() => {
+          modelPollCount.current += 1
+          if (modelPollCount.current > 12) {
+            window.clearInterval(timer)
+            return
+          }
+          void refreshModelInfo('geniex')
+        }, 5000)
         return () => window.clearInterval(timer)
       }, [modelInfo, refreshModelInfo, settings?.protocol])
 
@@ -1383,13 +1470,31 @@ window.__ModuleLoader__.load({
         }
       }
 
+      const inferredContext = (() => {
+        let largest = null
+        for (const meta of Object.values(modelInfo?.models ?? {})) {
+          const value = Number(meta?.contextLength)
+          if (Number.isFinite(value) && value > 0 && (largest === null || value > largest)) largest = value
+        }
+        return largest
+      })()
+      // Mirrors the host's effectiveContext so the shown estimate matches the
+      // context window the provider entry and nctx actually use.
+      const effectiveContext = (configured) => {
+        const explicit = Number.isFinite(configured) && configured > 0 ? configured : null
+        if (inferredContext !== null && settings?.autoNctx === true) return inferredContext
+        if (explicit !== null) return explicit
+        if (inferredContext !== null) return inferredContext
+        return settings?.protocol === 'qwen' ? DEFAULT_QWEN_CONTEXT : DEFAULT_GENIEX_CONTEXT
+      }
+
       const changeMode = (value) => {
         if (settings === null || settings.mode === value || busy !== '') return
         const previous = settings.mode
         update('mode', value)
         void action('mode', async () => {
           try {
-            return await call('setMode', { mode: value }, { signal: AbortSignal.timeout(15000) })
+            return await call('setMode', { mode: value }, { signal: AbortSignal.timeout(30000) })
           } catch (reason) {
             update('mode', previous)
             throw reason
@@ -1399,9 +1504,26 @@ window.__ModuleLoader__.load({
 
       const save = () => {
         if (settings === null) return
+        const apiKeyEnv = String(settings.apiKeyEnv ?? '').trim()
+        if (apiKeyEnv !== '' && !CREDENTIAL_REF_PATTERN.test(apiKeyEnv)) {
+          setError(t('apiKeyEnv.invalid'))
+          return
+        }
         const numeric = {}
         const numericKeys = ['contextWindow', 'maxOutputTokens', 'temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty']
         if (settings.protocol === 'geniex') numericKeys.push('mtpDraftTokens', 'mtpDraftMin', 'mtpDraftPMin')
+        const integerKeys = new Set(['contextWindow', 'maxOutputTokens', 'topK', 'mtpDraftTokens', 'mtpDraftMin'])
+        const bounds = {
+          temperature: [0, 2],
+          topP: [0, 1],
+          minP: [0, 1],
+          presencePenalty: [-2, 2],
+          frequencyPenalty: [-2, 2],
+          repetitionPenalty: [0, 5],
+          mtpDraftTokens: [1, 64],
+          mtpDraftMin: [0, 64],
+          mtpDraftPMin: [0, 1],
+        }
         for (const key of numericKeys) {
           const raw = settings[key]
           if (raw === null || raw === undefined || String(raw).trim() === '') {
@@ -1413,29 +1535,30 @@ window.__ModuleLoader__.load({
             setError(format(t('numberInvalid'), { field: key }))
             return
           }
-          if ((key === 'contextWindow' || key === 'maxOutputTokens') && (!Number.isInteger(value) || value <= 0)) {
+          if (integerKeys.has(key) && !Number.isInteger(value)) {
             setError(format(t('numberInvalid'), { field: key }))
             return
           }
-          if (key.startsWith('mtp') && value < 0) {
+          if ((key === 'contextWindow' || key === 'maxOutputTokens') && value <= 0) {
+            setError(format(t('numberInvalid'), { field: key }))
+            return
+          }
+          const range = bounds[key]
+          if (range !== undefined && (value < range[0] || value > range[1])) {
             setError(format(t('numberInvalid'), { field: key }))
             return
           }
           numeric[key] = value
         }
-        if (!settings.autoNctx && numeric.maxOutputTokens !== null) {
-          const effectiveContext = numeric.contextWindow
-            ?? (settings.protocol === 'qwen' ? DEFAULT_CONTEXT_WINDOW : null)
-          if (effectiveContext !== null && numeric.maxOutputTokens > effectiveContext) {
-            setError(t('limits.invalid'))
-            return
-          }
+        if (numeric.maxOutputTokens !== null && numeric.maxOutputTokens > effectiveContext(numeric.contextWindow)) {
+          setError(t('limits.invalid'))
+          return
         }
         const payload = {
           mode: settings.mode,
           protocol: settings.protocol,
           upstream: settings.upstream,
-          apiKeyEnv: settings.apiKeyEnv,
+          apiKeyEnv,
           ...numeric,
         }
         if (settings.protocol === 'geniex') {
@@ -1478,22 +1601,15 @@ window.__ModuleLoader__.load({
         const number = Number(value)
         return Number.isFinite(number) && number > 0 ? number : null
       }
-      const maxOutput = positiveSetting(settings.maxOutputTokens) ?? 131072
-      const inferredContexts = Object.values(modelInfo?.models ?? {})
-        .map((meta) => positiveSetting(meta?.contextLength))
-        .filter((value) => value !== null)
-      const inferredContext = inferredContexts.length === 0 ? null : Math.max(...inferredContexts)
-      const fallbackContext = settings.protocol === 'qwen' ? DEFAULT_CONTEXT_WINDOW : maxOutput
-      const contextWindow = positiveSetting(settings.contextWindow)
-        ?? (settings.autoNctx === true ? inferredContext : null)
-        ?? fallbackContext
+      const maxOutput = positiveSetting(settings.maxOutputTokens) ?? DEFAULT_MAX_OUTPUT
+      const contextWindow = effectiveContext(positiveSetting(settings.contextWindow))
       const reservedOutput = Math.min(maxOutput, contextWindow)
-      const thresholdRaw = Math.floor(Math.min(contextWindow * 0.8, contextWindow - reservedOutput - 65536))
+      const thresholdRaw = Math.floor(Math.min(contextWindow * 0.8, contextWindow - reservedOutput - COMPACTION_HEADROOM))
       const compactionThreshold = thresholdRaw > 0 ? thresholdRaw : null
       const recommendedGate = compactionThreshold === null
         ? null
         : Math.max(0, Math.floor((compactionThreshold - 5000) / 1000) * 1000)
-      const formatTokens = (value) => value === null ? '—' : new Intl.NumberFormat().format(value)
+      const formatTokens = (value) => value === null ? '—' : tokenFormatter.format(value)
 
       const provider = settings.provider
       const providerExists = provider !== null && provider !== undefined && provider.exists === true
@@ -1575,10 +1691,11 @@ window.__ModuleLoader__.load({
               h(Field, {
                 key: 'apiKeyEnv',
                 label: t('apiKeyEnv.label'),
+                hint: t('apiKeyEnv.hint'),
               }, h('input', {
                 style: S.input,
                 value: settings.apiKeyEnv,
-                placeholder: t('apiKeyEnv.placeholder'),
+                placeholder: settings.protocol === 'qwen' ? t('apiKeyEnv.placeholder') : 'local',
                 onChange: (event) => update('apiKeyEnv', event.target.value),
               })),
               settings.protocol === 'geniex' ? h('label', { key: 'warm', style: S.checkRow }, [
@@ -1648,6 +1765,12 @@ window.__ModuleLoader__.load({
               }, [
                 h('span', { key: 'threshold' }, `${t('compaction.dsh')}: ${formatTokens(compactionThreshold)}`),
                 h('span', { key: 'gate' }, `${t('compaction.gate')}: ${formatTokens(recommendedGate)}`),
+                compactionThreshold === null
+                  ? h('span', {
+                      key: 'unavailable',
+                      style: { maxWidth: '320px', color: 'var(--dsw-alias-state-warn-primary)' },
+                    }, t('compaction.unavailable'))
+                  : null,
               ]),
             ]),
           ]),
@@ -1655,14 +1778,23 @@ window.__ModuleLoader__.load({
           h('div', { key: 'sampling', style: S.configSection }, [
             h('div', { key: 'heading', style: S.configHeading }, t('sampling.title')),
             h('div', { key: 'hint', style: S.hint }, t('sampling.hint')),
-            h('div', { key: 'grid', style: { ...S.grid, gridTemplateColumns: 'repeat(4, minmax(0, 1fr))' } }, [
-              ...['temperature', 'topP', 'topK', 'minP'].map((key) => h(Field, {
+            h('div', {
+              key: 'grid',
+              style: {
+                ...S.grid,
+                gridTemplateColumns: `repeat(${settings.protocol === 'geniex' ? 4 : 3}, minmax(0, 1fr))`,
+              },
+            }, [
+              ...(settings.protocol === 'geniex'
+                ? ['temperature', 'topP', 'topK', 'minP']
+                : ['temperature', 'topP', 'topK']
+              ).map((key) => h(Field, {
                 key,
                 label: t(`${key}.label`),
               }, h('input', {
                 key: 'input',
                 style: S.input,
-                inputMode: 'decimal',
+                inputMode: key === 'topK' ? 'numeric' : 'decimal',
                 value: numberValue(key),
                 onChange: (event) => setNumber(key, event.target.value),
               }))),

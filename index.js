@@ -2,256 +2,169 @@
  * Host half of the Qwen mode bundle.
  *
  * Starts a loopback OpenAI-compatible proxy and maintains dedicated
- * `llm-pi-ai` providers (`From GenieX`, `From QwenCloud`, ...) that point at
- * it. The proxy normalizes thinking parameters and passes through or rebuilds
- * `reasoning_content` from tagged or inline reasoning.
+ * `llm-pi-ai` providers (`From GenieX`, `From QwenCloud`) that point at it.
+ * The proxy normalizes Qwen-family thinking parameters, forwards GenieX model
+ * load knobs, and rebuilds `reasoning_content` for upstreams that inline their
+ * chain of thought.
  *
  * @module dsh-qwen-mode
  */
 
-import { execFile } from 'node:child_process'
-import { appendFile, mkdir, open, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
+import { attachMtpDrafts, createCapabilityResolver } from './lib/capabilities.js'
+import { createThinkState, rewriteMessage, transformSseEvent } from './lib/reasoning.js'
+import {
+  clampedNumber,
+  httpError,
+  isCredentialRef,
+  loggerFor,
+  mapLimit,
+  numberOrNull,
+  positiveInt,
+  positiveIntOrNull,
+  readJson,
+  sendJson,
+  shortModelName,
+  text,
+  trimMap,
+} from './lib/util.js'
 
 const SCOPE = 'qwen-mode'
 const API_PREFIX = '/qwen-mode/api'
 const STORE_FILE = 'qwen-mode.json'
-const MAX_BODY = 8 * 1024 * 1024
+const CLIENT_ERROR_LOG = 'qwen-client-errors.log'
+const CLIENT_ERROR_LOG_LIMIT = 256 * 1024
+const MAX_API_BODY = 512 * 1024
 const MAX_PROXY_BODY = 32 * 1024 * 1024
-const DEFAULT_PORT = 18182
+const DEFAULT_PROXY_PORT = 18182
+const PROXY_PORT_ATTEMPTS = 8
+const DEFAULT_QWEN_CONTEXT = 262144
+const DEFAULT_GENIEX_CONTEXT = 131072
+// The output cap is a per-request reservation shared with the prompt, so a
+// local model needs a prompt budget far larger than its answer budget.
+const DEFAULT_MAX_OUTPUT = 16384
 const MTP_SPEC_TYPE = 'draft-mtp'
 const MTP_DRAFT_TOKENS = 3
 const VIT_COMPUTE_VALUE = { cpu: 'CPU', gpu: 'GPU', npu: 'HTP2' }
-const VISION_MODEL_PATTERN = /(?:^|[/_-])(?:vl|vision)(?:[/_-]|$)/iu
-const KNOWN_REASONING_EFFORTS = [
-  { match: '3.6-35b-a3b', efforts: { off: null, max: 'enabled' } },
-  { match: '3.8', efforts: { off: null, low: 'low', medium: 'medium', xhigh: 'xhigh' } },
-]
-const CAPABILITY_CACHE_TTL_MS = 5 * 60 * 1000
-const CAPABILITY_CACHE_LIMIT = 512
-const GGUF_PREFIX_BYTES = 32 * 1024 * 1024
-const reasoningEffortCache = new Map()
-const visionCache = new Map()
-const modelMetadataCache = new Map()
+const PROVIDERS = {
+  geniex: { id: 'from-geniex', name: 'From GenieX' },
+  qwen: { id: 'from-qwencloud', name: 'From QwenCloud' },
+}
+const QWEN_REASONING_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
+const GENIEX_REASONING_EFFORTS = new Set(['low', 'medium', 'high', 'xhigh'])
+/** Model Studio only documents `preserve_thinking` for these generations. */
+const PRESERVE_THINKING_PATTERN = /(?:qwen3\.[678]|kimi-k2\.[67])/iu
+const MEDIA_PART_TYPES = new Set(['image_url', 'input_image', 'image', 'input_audio', 'audio', 'video', 'video_url'])
+const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']
+const SUPPORTED_MODES = ['off', 'auto']
+const REPLY_ONLY_KEY = 'reply-only'
 
 const DEFAULTS = {
-  version: 1,
-  mode: 'off',
-  warm: false,
-  protocol: 'geniex',
   upstream: 'http://127.0.0.1:18181',
-  apiKeyEnv: '',
-  proxyPort: DEFAULT_PORT,
-  managedProviderId: null,
-  contextWindow: 262144,
-  maxOutputTokens: 131072,
-  autoNctx: false,
-  mtp: false,
+  maxOutputTokens: DEFAULT_MAX_OUTPUT,
   mtpDraftTokens: MTP_DRAFT_TOKENS,
-  mtpDraftMin: 0,
-  mtpDraftPMin: 0,
-  compute: '',
   vitCompute: 'npu',
-  temperature: null,
-  topP: null,
-  topK: null,
-  minP: null,
-  repetitionPenalty: null,
-  presencePenalty: null,
-  frequencyPenalty: null,
 }
 
 /** Services required by the proxy, provider maintenance, and settings API. */
 export const inject = ['webServer', 'connection', 'configEditor', 'credentials', 'permissionPresets', 'sessions', 'agents', 'tools']
 
-function text(value) {
-  return typeof value === 'string' ? value.trim() : ''
-}
-
 function normalizeUpstream(value) {
   const candidate = text(value).replace(/\/+$/u, '')
   try {
     const url = new URL(candidate)
-    return url.protocol === 'http:' || url.protocol === 'https:' ? candidate : DEFAULTS.upstream
+    if (url.protocol === 'http:' || url.protocol === 'https:') return candidate
   } catch {
-    return DEFAULTS.upstream
+    // Fall through to the default.
   }
+  return DEFAULTS.upstream
 }
 
 function assertUpstream(value) {
-  const candidate = text(value)
   try {
-    const url = new URL(candidate)
+    const url = new URL(text(value))
     if (url.protocol === 'http:' || url.protocol === 'https:') return
-  } catch {}
+  } catch {
+    // Reported below.
+  }
   throw httpError(400, 'Upstream URL must be an absolute http(s) URL')
 }
 
-function numberOrNull(value) {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null
+/** An invalid reference is dropped on load and rejected on save. */
+function normalizeApiKeyRef(value) {
+  const ref = text(value)
+  return ref === '' || isCredentialRef(ref) ? ref : ''
 }
 
-function nonNegativeNumber(value, fallback) {
-  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : fallback
-}
-
-function positiveInt(value, fallback) {
-  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : fallback
-}
-
-function positiveIntOrNull(value) {
-  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : null
-}
-
-function streamFirstTokenTime(stream) {
-  if (!Array.isArray(stream)) return undefined
-  for (const record of stream) {
-    if (record?.type === 'chunk' && record.chunk?.type !== 'usage') return record.time
-    if (record?.type === 'text-chunks' || record?.type === 'reasoning-chunks') {
-      if (Array.isArray(record.texts) && record.texts.some((text) => text !== '')) return record.time0
-    }
-    if (record?.type === 'tool-call-chunks' && record.name !== undefined) return record.time0
-  }
-  return undefined
-}
-
-/** Build the compact UI metric for one settled assistant message. */
-function buildTurnMetric(event, first, start) {
-  const source = event.data?.message?.source
-  if (typeof source?.provider !== 'string' || typeof source?.model !== 'string') return null
-  const outputTokens = event.data?.usage?.outputTokens ?? null
-  const decodeMs = Math.max(1, event.time - first)
-  return {
-    provider: source.provider,
-    model: source.model,
-    ttftMs: Math.max(0, Math.round(first - start)),
-    tps: outputTokens === null ? null : Math.round(outputTokens / (decodeMs / 1000) * 10) / 10,
-    outputTokens,
+function assertApiKeyRef(value) {
+  const ref = text(value)
+  if (ref !== '' && !isCredentialRef(ref)) {
+    throw httpError(400, 'API key reference must be an environment variable name (letters, digits, underscore)')
   }
 }
 
-function loggerFor(ctx) {
-  try {
-    const scoped = ctx.logger(SCOPE)
-    if (scoped !== undefined && scoped !== null && typeof scoped.info === 'function') return scoped
-  } catch {}
-  const base = ctx.logger ?? {}
-  return {
-    info: (message) => base.info?.(message),
-    warn: (message) => base.warn?.(message),
-    error: (message) => base.error?.(message),
-  }
-}
-
-function httpError(status, message) {
-  const error = new Error(message)
-  error.status = status
-  return error
-}
-
-function sendJson(res, status, body) {
-  const payload = JSON.stringify(body)
-  res.statusCode = status
-  res.setHeader('content-type', 'application/json; charset=utf-8')
-  res.setHeader('cache-control', 'no-store')
-  res.end(payload)
-}
-
-function readJson(req) {
-  return new Promise((resolve, reject) => {
-    let size = 0
-    let rejected = false
-    const chunks = []
-    req.on('data', (chunk) => {
-      if (rejected) return
-      size += chunk.length
-      if (size > MAX_BODY) {
-        rejected = true
-        chunks.length = 0
-        reject(httpError(413, 'request body is too large'))
-        return
-      }
-      chunks.push(chunk)
-    })
-    req.on('end', () => {
-      if (rejected) return
-      if (chunks.length === 0) {
-        resolve({})
-        return
-      }
-      try {
-        const value = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-        resolve(value !== null && typeof value === 'object' ? value : {})
-      } catch {
-        reject(httpError(400, 'request body is not valid JSON'))
-      }
-    })
-    req.on('error', reject)
-    req.on('aborted', () => reject(httpError(400, 'request aborted')))
-  })
+function integerOrNull(value, min, max) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null
+  return Math.min(max, Math.max(min, Math.round(value)))
 }
 
 function normalizeSettings(raw) {
   const source = raw !== null && typeof raw === 'object' ? raw : {}
-  const port = typeof source.proxyPort === 'number' && Number.isInteger(source.proxyPort) && source.proxyPort > 0 && source.proxyPort < 65536
-    ? source.proxyPort
-    : DEFAULT_PORT
   const protocol = source.protocol === 'qwen' ? 'qwen' : 'geniex'
+  const proxyPort = positiveIntOrNull(source.proxyPort)
   const contextWindow = positiveIntOrNull(source.contextWindow)
-  const autoNctx = source.autoNctx === true
-  const effectiveContext = contextWindow ?? (protocol === 'qwen' ? DEFAULTS.contextWindow : null)
   const maxOutput = positiveInt(source.maxOutputTokens, DEFAULTS.maxOutputTokens)
+  const ceiling = contextWindow ?? (protocol === 'qwen' ? DEFAULT_QWEN_CONTEXT : null)
   return {
     version: 1,
-    mode: ['off', 'auto'].includes(source.mode)
-      ? source.mode
-      : source.enabled === true || source.mode === 'always' ? 'auto' : 'off',
+    mode: SUPPORTED_MODES.includes(source.mode) ? source.mode : source.enabled === true || source.mode === 'always' ? 'auto' : 'off',
     warm: source.warm === true,
     protocol,
     upstream: normalizeUpstream(source.upstream),
-    apiKeyEnv: text(source.apiKeyEnv),
-    proxyPort: port,
+    apiKeyEnv: normalizeApiKeyRef(source.apiKeyEnv),
+    proxyPort: proxyPort !== null && proxyPort < 65536 ? proxyPort : DEFAULT_PROXY_PORT,
     managedProviderId: text(source.managedProviderId) || null,
     contextWindow,
-    maxOutputTokens: autoNctx ? maxOutput : effectiveContext === null ? maxOutput : Math.min(maxOutput, effectiveContext),
-    autoNctx,
+    maxOutputTokens: ceiling === null ? maxOutput : Math.min(maxOutput, ceiling),
+    autoNctx: source.autoNctx === true,
     mtp: source.mtp === true,
-    mtpDraftTokens: Math.floor(nonNegativeNumber(source.mtpDraftTokens, DEFAULTS.mtpDraftTokens)),
-    mtpDraftMin: Math.floor(nonNegativeNumber(source.mtpDraftMin, 0)),
-    mtpDraftPMin: nonNegativeNumber(source.mtpDraftPMin, 0),
+    mtpDraftTokens: integerOrNull(source.mtpDraftTokens, 1, 64) ?? DEFAULTS.mtpDraftTokens,
+    mtpDraftMin: integerOrNull(source.mtpDraftMin, 0, 64) ?? 0,
+    mtpDraftPMin: clampedNumber(source.mtpDraftPMin, 0, 1) ?? 0,
     compute: text(source.compute).slice(0, 100),
     vitCompute: ['cpu', 'gpu', 'npu'].includes(source.vitCompute) ? source.vitCompute : DEFAULTS.vitCompute,
-    temperature: numberOrNull(source.temperature),
-    topP: numberOrNull(source.topP),
-    topK: numberOrNull(source.topK),
-    minP: numberOrNull(source.minP),
-    repetitionPenalty: numberOrNull(source.repetitionPenalty),
-    presencePenalty: numberOrNull(source.presencePenalty),
-    frequencyPenalty: numberOrNull(source.frequencyPenalty),
+    temperature: clampedNumber(source.temperature, 0, 2),
+    topP: clampedNumber(source.topP, 0, 1),
+    topK: integerOrNull(source.topK, 0, 1000),
+    minP: clampedNumber(source.minP, 0, 1),
+    repetitionPenalty: clampedNumber(source.repetitionPenalty, 0, 5),
+    presencePenalty: clampedNumber(source.presencePenalty, -2, 2),
+    frequencyPenalty: clampedNumber(source.frequencyPenalty, -2, 2),
     lastError: text(source.lastError) || null,
   }
 }
 
 function providerIdFor(protocol) {
-  return protocol === 'qwen' ? 'from-qwencloud' : 'from-geniex'
+  return protocol === 'qwen' ? PROVIDERS.qwen.id : PROVIDERS.geniex.id
 }
 
 function providerNameFor(protocol) {
-  return protocol === 'qwen' ? 'From QwenCloud' : 'From GenieX'
-}
-
-function proxyBaseURL(settings) {
-  return `http://127.0.0.1:${settings.proxyPort}/v1`
+  return protocol === 'qwen' ? PROVIDERS.qwen.name : PROVIDERS.geniex.name
 }
 
 function apiKeyRef(settings) {
   return text(settings.apiKeyEnv) || 'local'
 }
 
+function proxyBaseURL(port) {
+  return `http://127.0.0.1:${port}/v1`
+}
+
+/** Build the upstream endpoint for one documented API path. */
 function upstreamURL(settings, path) {
   const base = new URL(settings.upstream)
   let pathname = base.pathname.replace(/\/+$/u, '')
@@ -262,6 +175,7 @@ function upstreamURL(settings, path) {
   return base
 }
 
+/** Map a proxy request URL onto the upstream base path. */
 function upstreamRequestURL(settings, requestUrl) {
   const base = new URL(settings.upstream)
   const basePath = base.pathname.replace(/\/+$/u, '')
@@ -272,215 +186,31 @@ function upstreamRequestURL(settings, requestUrl) {
   return new URL(`${basePath}${requestPath}${requestUrl.search}`, base)
 }
 
-let geniexModelsRootPromise = null
-function geniexModelsRoot() {
-  if (geniexModelsRootPromise !== null) return geniexModelsRootPromise
-  geniexModelsRootPromise = new Promise((resolveRoot) => {
-    execFile(
-      process.platform === 'win32' ? 'geniex.exe' : 'geniex',
-      ['list'],
-      { windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 },
-      (error, stdout) => {
-        if (error) {
-          resolveRoot(join(homedir(), '.cache', 'geniex', 'models'))
-          return
-        }
-        const match = /Models cached in\s+(.+)/iu.exec(stdout)
-        const root = match === null ? '' : match[1].replace(/\x1b\[[0-9;]*m/gu, '').trim()
-        resolveRoot(root === '' ? join(homedir(), '.cache', 'geniex', 'models') : root)
-      },
-    )
-  })
-  return geniexModelsRootPromise
+/**
+ * The context window one model request and its provider entry both use.
+ *
+ * GenieX loads with `nctx` explicitly, so the value advertised to DSH must be
+ * the same number: over-claiming makes DSH skip compaction until the upstream
+ * rejects the prompt, under-claiming compacts far too early.
+ */
+function effectiveContext(settings, metadataContext) {
+  const metadata = positiveIntOrNull(metadataContext)
+  // "Prefer model context limit" overrides an explicit value; otherwise an
+  // explicit setting is the user's override and wins over the model metadata.
+  if (metadata !== null && settings.autoNctx) return metadata
+  if (settings.contextWindow !== null) return settings.contextWindow
+  if (metadata !== null) return metadata
+  return settings.protocol === 'qwen' ? DEFAULT_QWEN_CONTEXT : DEFAULT_GENIEX_CONTEXT
 }
 
-const GGUF_SCALAR_SIZE = new Map([
-  [0, 1], [1, 1], [2, 2], [3, 2], [4, 4], [5, 4], [6, 4], [7, 1], [10, 8], [11, 8], [12, 8],
-])
-const GGUF_SAMPLING_KEYS = {
-  'general.sampling.temp': 'temperature',
-  'general.sampling.temperature': 'temperature',
-  'general.sampling.top_k': 'topK',
-  'general.sampling.top_p': 'topP',
-  'general.sampling.min_p': 'minP',
-  'general.sampling.presence_penalty': 'presencePenalty',
-  'general.sampling.frequency_penalty': 'frequencyPenalty',
-  'general.sampling.repetition_penalty': 'repetitionPenalty',
+function requestedEffort(body) {
+  return typeof body?.reasoning_effort === 'string' ? body.reasoning_effort.trim().toLowerCase() : ''
 }
 
-function parseGgufPrefix(buffer) {
-  let offset = 0
-  const remaining = () => buffer.length - offset
-  const need = (size) => {
-    if (remaining() < size) throw new Error('truncated GGUF header')
-  }
-  const u32 = () => {
-    need(4)
-    const value = buffer.readUInt32LE(offset)
-    offset += 4
-    return value
-  }
-  const u64 = () => {
-    need(8)
-    const value = Number(buffer.readBigUInt64LE(offset))
-    offset += 8
-    return value
-  }
-  const string = () => {
-    const length = u64()
-    if (length > remaining()) throw new Error('truncated GGUF string')
-    const value = buffer.toString('utf8', offset, offset + length)
-    offset += length
-    return value
-  }
-  const skipString = () => {
-    const length = u64()
-    if (length > remaining()) throw new Error('truncated GGUF string')
-    offset += length
-  }
-  const skipValue = (type, depth = 0) => {
-    if (depth > 8) throw new Error('GGUF nesting too deep')
-    if (GGUF_SCALAR_SIZE.has(type)) {
-      const size = GGUF_SCALAR_SIZE.get(type)
-      need(size)
-      offset += size
-      return
-    }
-    if (type === 8) {
-      skipString()
-      return
-    }
-    if (type !== 9) throw new Error(`unsupported GGUF type ${type}`)
-    const inner = u32()
-    const count = u64()
-    for (let index = 0; index < count; index += 1) skipValue(inner, depth + 1)
-  }
-  const readScalar = (type) => {
-    if (type === 0) { need(1); return buffer.readUInt8(offset++) }
-    if (type === 1) { need(1); return buffer.readInt8(offset++) }
-    if (type === 2) { need(2); const v = buffer.readUInt16LE(offset); offset += 2; return v }
-    if (type === 3) { need(2); const v = buffer.readInt16LE(offset); offset += 2; return v }
-    if (type === 4) return u32()
-    if (type === 5) { need(4); const v = buffer.readInt32LE(offset); offset += 4; return v }
-    if (type === 6) { need(4); const v = buffer.readFloatLE(offset); offset += 4; return v }
-    if (type === 7) { need(1); return buffer.readUInt8(offset++) !== 0 }
-    if (type === 10) return u64()
-    if (type === 11) { need(8); const v = Number(buffer.readBigInt64LE(offset)); offset += 8; return v }
-    if (type === 12) { need(8); const v = buffer.readDoubleLE(offset); offset += 8; return v }
-    throw new Error(`unsupported GGUF scalar ${type}`)
-  }
-  const readStringArray = (count) => {
-    const values = []
-    for (let index = 0; index < count; index += 1) values.push(string())
-    return values
-  }
-
-  need(4)
-  if (buffer.toString('ascii', 0, 4) !== 'GGUF') throw new Error('not a GGUF file')
-  offset = 4
-  const version = u32()
-  const tensorCount = u64()
-  const kvCount = u64()
-  const meta = {}
-  for (let index = 0; index < kvCount; index += 1) {
-    const key = string()
-    const type = u32()
-    if (type === 8) {
-      if (key === 'general.name' || key === 'general.finetune' || key === 'general.basename' || key === 'general.architecture') {
-        meta[key] = string()
-      } else {
-        skipString()
-      }
-    } else if (type === 9) {
-      const inner = u32()
-      const count = u64()
-      if (key === 'general.tags' && inner === 8) meta[key] = readStringArray(count)
-      else for (let item = 0; item < count; item += 1) skipValue(inner)
-    } else {
-      meta[key] = readScalar(type)
-    }
-  }
-  let hasMtp = Object.entries(meta).some(([key, value]) => {
-    return /nextn_predict_layers|mtp/i.test(key) && typeof value === 'number' && value > 0
-  })
-  for (let index = 0; index < tensorCount; index += 1) {
-    const name = string()
-    if (/nextn|mtp|draft_head/i.test(name)) hasMtp = true
-    const dimensions = u32()
-    need(dimensions * 8 + 12)
-    offset += dimensions * 8 + 12
-  }
-  const contextKey = Object.keys(meta).find((key) => key.endsWith('.context_length'))
-  const contextLength = contextKey === undefined ? null : positiveIntOrNull(meta[contextKey])
-  const tags = Array.isArray(meta['general.tags']) ? meta['general.tags'].map((tag) => String(tag).toLowerCase()) : []
-  const abliterated = tags.some((tag) => tag.includes('abliterat') || tag.includes('uncensored') || tag.includes('refusal-direction'))
-  const sampling = {}
-  for (const [key, name] of Object.entries(GGUF_SAMPLING_KEYS)) {
-    if (typeof meta[key] === 'number' && Number.isFinite(meta[key])) sampling[name] = meta[key]
-  }
-  return {
-    version,
-    tensorCount,
-    architecture: typeof meta['general.architecture'] === 'string' ? meta['general.architecture'] : '',
-    name: typeof meta['general.name'] === 'string' ? meta['general.name'] : '',
-    finetune: typeof meta['general.finetune'] === 'string' ? meta['general.finetune'] : '',
-    contextLength,
-    hasMtp,
-    tags,
-    abliterated,
-    sampling,
-  }
-}
-
-async function readModelMetadata(settings, id, fresh = false) {
-  if (settings.protocol !== 'geniex') return null
-  const cacheKey = `${settings.upstream}|${id}`
-  const cached = modelMetadataCache.get(cacheKey)
-  if (!fresh && cached !== undefined && Date.now() - cached.at < CAPABILITY_CACHE_TTL_MS) return cached.value
-  let value = null
-  try {
-    const cacheRoot = await geniexModelsRoot()
-    const { owner, leaf, precision } = splitModelId(id)
-    const manifest = JSON.parse(await readFile(join(cacheRoot, owner, leaf, 'geniex.json'), 'utf8'))
-    const file = manifest?.ModelFile?.[precision]?.Name
-      ?? Object.values(manifest?.ModelFile ?? {}).find((entry) => entry?.Downloaded === true)?.Name
-    if (typeof file === 'string' && file !== '') {
-      const path = join(cacheRoot, owner, leaf, file)
-      const directory = join(cacheRoot, owner, leaf)
-      let mtpFile = ''
-      try {
-        const names = await readdir(directory)
-        const mtpName = names.find((name) => /^mtp.*\.gguf$/iu.test(name))
-        if (mtpName !== undefined) mtpFile = join(directory, mtpName)
-      } catch {
-        // The optional MTP companion is absent.
-      }
-      const handle = await open(path, 'r')
-      try {
-        const buffer = Buffer.allocUnsafe(GGUF_PREFIX_BYTES)
-        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
-        value = {
-          ...parseGgufPrefix(buffer.subarray(0, bytesRead)),
-          pluginId: typeof manifest?.PluginId === 'string' ? manifest.PluginId : '',
-          mtpFile,
-        }
-      } finally {
-        await handle.close()
-      }
-    }
-  } catch {
-    // A missing or partial cache entry simply disables the optional model metadata.
-  }
-  modelMetadataCache.set(cacheKey, { value, at: Date.now() })
-  if (modelMetadataCache.size > CAPABILITY_CACHE_LIMIT) {
-    modelMetadataCache.delete(modelMetadataCache.keys().next().value)
-  }
-  return value
-}
-
+/** Whether one request body asks the model to think. */
 function thinkingEnabled(body) {
-  const effort = typeof body.reasoning_effort === 'string' ? body.reasoning_effort.trim().toLowerCase() : null
-  if (effort !== null && effort !== '') return !['off', 'none'].includes(effort)
+  const effort = requestedEffort(body)
+  if (effort !== '') return !['off', 'none'].includes(effort)
   if (typeof body.enable_think === 'boolean') return body.enable_think
   if (typeof body.enable_thinking === 'boolean') return body.enable_thinking
   return true
@@ -493,45 +223,73 @@ function inferenceFields(settings, vision) {
   return fields
 }
 
-function loadFields(settings, context, mtp, mtpFile = '') {
+function loadFields(settings, context, mtp, mtpDraft) {
   const fields = {}
-  if (settings.protocol === 'geniex') {
-    if (typeof context === 'number' && context > 0) fields.nctx = context
-    if (mtp && mtpFile !== '') {
-      fields.spec_type = MTP_SPEC_TYPE
-      fields.spec_draft_model = mtpFile
-      fields.spec_n_max = settings.mtpDraftTokens
-      fields.spec_n_min = settings.mtpDraftMin
-      fields.spec_p_min = settings.mtpDraftPMin
-    }
+  if (settings.protocol !== 'geniex') return fields
+  if (typeof context === 'number' && context > 0) fields.nctx = context
+  if (mtp === true && mtpDraft !== '') {
+    fields.spec_type = MTP_SPEC_TYPE
+    fields.spec_draft_model = mtpDraft
+    fields.spec_n_max = settings.mtpDraftTokens
+    fields.spec_n_min = settings.mtpDraftMin
+    fields.spec_p_min = settings.mtpDraftPMin
   }
   return fields
 }
 
-function applyRequestDefaults(body, settings, vision = false, context = null, mtp = false, mtpFile = '') {
+/**
+ * Apply Qwen-family thinking parameters and GenieX load knobs to one request.
+ * @param body - parsed request body.
+ * @param settings - current settings snapshot.
+ * @param options - thinking, vision, context, and MTP decisions.
+ */
+function applyRequestDefaults(body, settings, options) {
   const output = { ...body }
-  const thinking = thinkingEnabled(body)
-  if (settings.protocol === 'qwen') {
-    output.enable_thinking = thinking
-    output.preserve_thinking = true
-    delete output.enable_think
-  } else {
-    output.enable_think = thinking
-    delete output.enable_thinking
-    const effort = typeof body.reasoning_effort === 'string' ? body.reasoning_effort.trim().toLowerCase() : ''
-    if (thinking && ['low', 'medium', 'high', 'xhigh'].includes(effort)) output.reasoning_effort = effort
-    else delete output.reasoning_effort
-    output.reasoning_format = 'auto'
-    Object.assign(output, inferenceFields(settings, vision))
-  }
+  delete output.nctx
   for (const key of Object.keys(output)) {
     if (key.startsWith('spec_')) delete output[key]
   }
-  if (settings.protocol === 'geniex') delete output.nctx
-  Object.assign(output, loadFields(settings, context, mtp, mtpFile))
-  if (settings.protocol === 'geniex' && typeof context === 'number' && context > 0) {
+  const qwen = settings.protocol === 'qwen'
+  if (qwen) {
+    delete output.enable_think
+    delete output.compute
+    delete output.vit_compute
+    delete output.ngl
+    delete output.power_mode
+    delete output.reasoning_format
+    delete output.min_p
+    if (options.reasoning === false) {
+      delete output.enable_thinking
+      delete output.preserve_thinking
+      delete output.reasoning_effort
+    } else {
+      output.enable_thinking = options.thinking
+      if (options.thinking && typeof body.model === 'string' && PRESERVE_THINKING_PATTERN.test(body.model)) {
+        output.preserve_thinking = true
+      } else {
+        delete output.preserve_thinking
+      }
+      const effort = requestedEffort(body)
+      // Model Studio accepts only its documented levels; the family table's
+      // `enabled` spelling for on/off is not one of them and would 400.
+      if (options.thinking && QWEN_REASONING_EFFORTS.has(effort)) output.reasoning_effort = effort
+      else delete output.reasoning_effort
+    }
+  } else {
+    output.enable_think = options.thinking
+    delete output.enable_thinking
+    delete output.preserve_thinking
+    const effort = requestedEffort(body)
+    if (options.thinking && GENIEX_REASONING_EFFORTS.has(effort)) output.reasoning_effort = effort
+    else delete output.reasoning_effort
+    output.reasoning_format = 'auto'
+    Object.assign(output, inferenceFields(settings, options.vision))
+    Object.assign(output, loadFields(settings, options.context, options.mtp, options.mtpDraft))
+  }
+  // Both protocols share one window between prompt and completion.
+  if (typeof options.context === 'number' && options.context > 0) {
     for (const key of ['max_completion_tokens', 'max_tokens']) {
-      if (typeof output[key] === 'number' && output[key] > context) output[key] = context
+      if (typeof output[key] === 'number' && output[key] > options.context) output[key] = options.context
     }
   }
   const fill = (key, value) => {
@@ -540,7 +298,8 @@ function applyRequestDefaults(body, settings, vision = false, context = null, mt
   fill('temperature', settings.temperature)
   fill('top_p', settings.topP)
   fill('top_k', settings.topK)
-  fill('min_p', settings.minP)
+  // `min_p` is a llama.cpp sampler; Model Studio documents no such parameter.
+  if (!qwen) fill('min_p', settings.minP)
   fill('repetition_penalty', settings.repetitionPenalty)
   fill('presence_penalty', settings.presencePenalty)
   fill('frequency_penalty', settings.frequencyPenalty)
@@ -553,384 +312,683 @@ function applyRequestDefaults(body, settings, vision = false, context = null, mt
   return output
 }
 
-function createThinkState(assumeReasoning = false) {
-  return { buffer: '', inThink: false, assumeReasoning, separated: false, pending: false, serverSeparated: false }
+/** Whether a request carries any media part that takes GenieX's VLM path. */
+function bodyHasMedia(body) {
+  if (!Array.isArray(body?.messages)) return false
+  return body.messages.some((message) => {
+    if (!Array.isArray(message?.content)) return false
+    return message.content.some((part) => typeof part?.type === 'string' && MEDIA_PART_TYPES.has(part.type.toLowerCase()))
+  })
 }
 
-/** Locate the first Markdown heading that likely starts the final answer. */
-function headingStart(value) {
-  const match = /(?:^|\n\n)(?=#{1,6}\s)/mu.exec(value)
-  if (match === null) return -1
-  return match.index + (match[0] === '\n\n' ? 2 : 0)
-}
-
-function safePrefix(value) {
-  const index = value.lastIndexOf('<')
-  if (index === -1) return value.length
-  const tail = value.slice(index)
-  return ['<think>', '</think>'].some((tag) => tag.startsWith(tail)) ? index : value.length
-}
-
-function pushPiece(out, type, value) {
-  if (value !== '') out.push({ type, text: value })
-}
-
-function feedReasoning(value, state) {
-  if (state.serverSeparated) {
-    const out = []
-    pushPiece(out, 'content', value)
-    return out
+/** The first streamed token's timestamp, whichever record carries it. */
+function streamFirstTokenTime(stream) {
+  if (!Array.isArray(stream)) return undefined
+  for (const record of stream) {
+    if (record?.type === 'chunk') {
+      const type = record.chunk?.type
+      if (type === 'text-delta' || type === 'reasoning-delta' || type === 'tool-call-delta') return record.time
+      continue
+    }
+    if (record?.type === 'text-chunks' || record?.type === 'reasoning-chunks') {
+      if (Array.isArray(record.texts) && record.texts.some((value) => value !== '')) return record.time0
+      continue
+    }
+    if (record?.type === 'tool-call-chunks' && record.name !== undefined) return record.time0
   }
-  state.buffer += value
-  const out = []
-  while (state.buffer !== '') {
-    if (!state.inThink) {
-      if (state.pending) {
-        const heading = headingStart(state.buffer)
-        if (heading !== -1) {
-          pushPiece(out, 'reasoning', state.buffer.slice(0, heading))
-          state.buffer = state.buffer.slice(heading)
-          state.pending = false
-          state.separated = true
-          continue
-        }
-        if (state.buffer.length <= 1200) break
-        pushPiece(out, 'content', state.buffer)
-        state.buffer = ''
-        state.pending = false
-        state.separated = true
-        continue
-      }
-      if (state.separated) {
-        const safe = safePrefix(state.buffer)
-        if (safe > 0) {
-          pushPiece(out, 'content', state.buffer.slice(0, safe))
-          state.buffer = state.buffer.slice(safe)
-        }
-        break
-      }
-      const open = state.buffer.indexOf('<think>')
-      const close = state.buffer.indexOf('</think>')
-      if (open !== -1 && (close === -1 || open < close)) {
-        pushPiece(out, 'content', state.buffer.slice(0, open))
-        state.buffer = state.buffer.slice(open + 7)
-        state.inThink = true
-        continue
-      }
-      if (close !== -1) {
-        pushPiece(out, 'reasoning', state.buffer.slice(0, close))
-        state.buffer = state.buffer.slice(close + 8)
-        state.inThink = false
-        state.separated = true
-        state.pending = true
-        continue
-      }
-      if (state.assumeReasoning && !state.separated) {
-        const parts = state.buffer.split('\n\n')
-        if (parts.length > 1) {
-          const held = parts.pop()
-          pushPiece(out, 'reasoning', parts.join('\n\n'))
-          state.buffer = held
-          state.separated = true
-          state.pending = true
-          continue
-        }
-        break
-      }
-      const safe = safePrefix(state.buffer)
-      if (safe > 0) {
-        pushPiece(out, 'content', state.buffer.slice(0, safe))
-        state.buffer = state.buffer.slice(safe)
-      }
-      break
-    }
-    const close = state.buffer.indexOf('</think>')
-    if (close === -1) {
-      const safe = safePrefix(state.buffer)
-      if (safe > 0) {
-        pushPiece(out, 'reasoning', state.buffer.slice(0, safe))
-        state.buffer = state.buffer.slice(safe)
-      }
-      break
-    }
-    pushPiece(out, 'reasoning', state.buffer.slice(0, close))
-    state.buffer = state.buffer.slice(close + 8)
-    state.inThink = false
-    state.separated = true
-    state.pending = true
-  }
-  return out
+  return undefined
 }
 
-function flushReasoning(state) {
-  const out = []
-  if (state.buffer !== '') {
-    if (state.serverSeparated) {
-      pushPiece(out, 'content', state.buffer)
-      state.buffer = ''
-      return out
-    }
-    if (state.pending) {
-      const heading = headingStart(state.buffer)
-      if (heading !== -1) {
-        pushPiece(out, 'reasoning', state.buffer.slice(0, heading))
-        pushPiece(out, 'content', state.buffer.slice(heading))
-      } else {
-        pushPiece(out, 'content', state.buffer)
-      }
-      state.pending = false
-      state.buffer = ''
-      return out
-    }
-    const type = state.inThink ? 'reasoning' : 'content'
-    out.push({ type, text: state.buffer })
-    state.buffer = ''
-  }
-  return out
-}
-
-function rewriteMessage(message, state) {
-  if (message === null || typeof message !== 'object' || typeof message.content !== 'string') return message
-  if (typeof message.reasoning_content === 'string' && message.reasoning_content.trim() !== '') return message
-  const pieces = [...feedReasoning(message.content, state), ...flushReasoning(state)]
-  const reasoning = pieces.filter((piece) => piece.type === 'reasoning').map((piece) => piece.text).join('')
-  const content = pieces.filter((piece) => piece.type === 'content').map((piece) => piece.text).join('')
+/** Build the compact UI metric for one settled assistant message. */
+function buildTurnMetric(event, first, start) {
+  const source = event.data?.message?.source
+  if (typeof source?.provider !== 'string' || typeof source?.model !== 'string') return null
+  const outputTokens = event.data?.usage?.outputTokens ?? null
+  const ttftMs = Math.max(0, Math.round(first - start))
+  const decodeMs = Math.max(1, event.time - first)
   return {
-    ...message,
-    content,
-    ...reasoning === '' ? {} : { reasoning_content: `${message.reasoning_content ?? ''}${reasoning}` },
+    provider: source.provider,
+    model: source.model,
+    ttftMs,
+    tps: outputTokens === null ? null : Math.round(outputTokens / (decodeMs / 1000) * 10) / 10,
+    outputTokens,
   }
 }
 
-function rewriteChunk(chunk, state) {
-  if (chunk === null || typeof chunk !== 'object' || !Array.isArray(chunk.choices)) return [chunk]
-  if (chunk.choices.length === 0) return [chunk]
-  const out = []
-  for (const choice of chunk.choices) {
-    const delta = choice?.delta
-    if (delta === null || typeof delta !== 'object') {
-      out.push({ ...chunk, choices: [choice] })
-      continue
-    }
-    if (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '') {
-      state.serverSeparated = true
-      out.push({ ...chunk, choices: [choice] })
-      continue
-    }
-    if (state.serverSeparated) {
-      out.push({ ...chunk, choices: [choice] })
-      continue
-    }
-    if (typeof delta.content !== 'string') {
-      out.push({ ...chunk, choices: [choice] })
-      continue
-    }
-    if (delta.content === '' && !state.inThink && state.buffer === '') {
-      out.push({ ...chunk, choices: [choice] })
-      continue
-    }
-    const pieces = feedReasoning(delta.content, state)
-    if (pieces.length === 0) {
-      out.push({ ...chunk, choices: [{ ...choice, delta: { ...delta, content: '' } }] })
-      continue
-    }
-    for (const [index, piece] of pieces.entries()) {
-      const nextDelta = index === 0 ? { ...delta } : {}
-      delete nextDelta.content
-      delete nextDelta.reasoning_content
-      nextDelta[piece.type === 'reasoning' ? 'reasoning_content' : 'content'] = piece.text
-      out.push({
-        ...chunk,
-        choices: [{
-          ...choice,
-          delta: nextDelta,
-          finish_reason: index === pieces.length - 1 ? choice.finish_reason : null,
-        }],
-      })
-    }
-  }
-  return out
+function userError(message) {
+  return message instanceof Error ? message.message : String(message)
 }
 
-function sseEvent(chunk) {
-  return `data: ${JSON.stringify(chunk)}\n\n`
+/** Merge inherited and profile-layer provider maps. */
+function providerMap(inherited, current) {
+  return {
+    ...((inherited ?? {}).providers ?? {}),
+    ...((current ?? {}).providers ?? {}),
+  }
 }
 
-function transformSseEvent(raw, state, meta) {
-  const data = raw
-    .split(/\r?\n/u)
-    .filter((line) => line.startsWith('data:'))
-    .map((line) => line.slice(5).trimStart())
-    .join('\n')
-  if (data === '') return `${raw}\n\n`
-  if (data.trim() === '[DONE]') {
-    const tail = flushReasoning(state)
-    let output = ''
-    for (const piece of tail) {
-      output += sseEvent({
-        id: meta.id ?? 'qwen-mode',
-        object: 'chat.completion.chunk',
-        created: meta.created ?? Math.floor(Date.now() / 1000),
-        model: meta.model ?? '',
-        choices: [{
-          index: 0,
-          delta: piece.type === 'reasoning' ? { reasoning_content: piece.text } : { content: piece.text },
-          finish_reason: null,
-        }],
-      })
-    }
-    return `${output}data: [DONE]\n\n`
-  }
-  let parsed
+/** Find the loader entry that owns the `llm-pi-ai` provider table. */
+function findLlmEntry(ctx) {
+  return ctx.configEditor.entries().find((entry) => {
+    return entry.options?.id === 'llm-pi-ai' || entry.id?.endsWith(':llm-pi-ai')
+  })
+}
+
+function readProviderConfig(ctx) {
+  const entry = findLlmEntry(ctx)
+  if (entry === undefined) throw httpError(400, 'llm-pi-ai entry not found')
+  const row = ctx.configEditor.configuration().find((candidate) => candidate.entry === entry)
+  const merged = { ...(row?.inherited ?? {}), ...(row?.override ?? {}) }
+  const providers = merged.providers !== null && typeof merged.providers === 'object' ? merged.providers : {}
+  return { editor: ctx.configEditor, entry, providers }
+}
+
+/** Merge a change into the provider table through one config edit. */
+async function editProviders(ctx, change) {
+  const { editor, entry } = readProviderConfig(ctx)
+  await editor.edit(entry, (current, inherited) => {
+    const config = { ...(inherited ?? {}), ...(current ?? {}) }
+    const providers = providerMap(inherited, current)
+    change(providers)
+    return { ...config, providers }
+  })
+}
+
+async function credentialHeader(ctx, settings) {
   try {
-    parsed = JSON.parse(data)
+    const value = (await ctx.credentials.resolve(apiKeyRef(settings)))?.value ?? ''
+    return value === '' ? {} : { authorization: `Bearer ${value}` }
   } catch {
-    return `${raw}\n\n`
+    return {}
   }
-  if (parsed?.id !== undefined) meta.id = parsed.id
-  if (parsed?.created !== undefined) meta.created = parsed.created
-  if (parsed?.model !== undefined) meta.model = parsed.model
-  if (parsed?.usage !== undefined && typeof meta.onUsage === 'function') meta.onUsage(parsed.usage)
-  return rewriteChunk(parsed, state).map(sseEvent).join('')
 }
 
-function writeProxyResponse(upstream, res, active, assumeReasoning, onUsage) {
-  const headers = { ...upstream.headers }
-  delete headers['content-length']
-  delete headers['transfer-encoding']
-  for (const name of ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'upgrade']) {
-    delete headers[name]
+async function ensureLocalCredential(ctx) {
+  try {
+    // `resolve` reports a missing reference as undefined, not as a throw.
+    const value = (await ctx.credentials.resolve('local'))?.value ?? ''
+    if (value !== '') return
+    await ctx.credentials.set('local', 'local')
+  } catch (error) {
+    runtime.logger?.warn?.(`[${SCOPE}] cannot store the local credential: ${userError(error)}`)
   }
-  headers['cache-control'] = 'no-store'
-  res.writeHead(upstream.statusCode ?? 502, headers)
-  res.flushHeaders()
-  res.socket?.setNoDelay(true)
-  const contentType = String(upstream.headers['content-type'] ?? '')
-  if (!active || !contentType.includes('text/event-stream')) {
-    if (!active || !contentType.includes('application/json')) {
-      upstream.pipe(res)
+}
+
+/** Build one provider model entry from resolved capabilities. */
+function buildModelSpec(settings, id, capability) {
+  const metadataContext = positiveIntOrNull(capability?.contextLength)
+  const contextWindow = effectiveContext(settings, metadataContext)
+  const declaredMaxOutput = positiveIntOrNull(capability?.maxOutput)
+  const model = {
+    id,
+    name: shortModelName(id),
+    maxTokens: Math.max(1, Math.min(settings.maxOutputTokens, declaredMaxOutput ?? Number.MAX_SAFE_INTEGER, contextWindow)),
+    contextWindow,
+    input: capability?.vision === true ? ['text', 'image'] : ['text'],
+  }
+  if (capability?.reasoningEfforts !== undefined) model.reasoningEfforts = capability.reasoningEfforts
+  return model
+}
+
+/**
+ * Discover the upstream catalog and resolve every model's capabilities.
+ *
+ * Paired MTP drafts are hidden from the chat catalog: GenieX's documented MTP
+ * setup pulls an assistant model alongside its target, and offering it as a
+ * chat model only produces confusing failures.
+ */
+async function discoverModels(ctx, settings, capabilities) {
+  if (settings.protocol === 'qwen') {
+    // Model Studio's compatible base URL has no /models endpoint; its catalog
+    // lives under /api/v1/models and also reports context and modalities.
+    const listed = await capabilities.listQwenModels(settings)
+    if (listed.size > 0) {
+      const models = [...listed].map(([id, capability]) => buildModelSpec(settings, id, capability))
+      return { models, capabilities: listed, advertised: [...listed.keys()] }
+    }
+  }
+  const url = upstreamURL(settings, 'models')
+  const headers = { accept: 'application/json', ...await credentialHeader(ctx, settings) }
+  const response = await fetch(url, { headers, signal: AbortSignal.timeout(15000) })
+  if (!response.ok) throw httpError(502, `model discovery failed: HTTP ${response.status}`)
+  const body = await response.json()
+  const rows = Array.isArray(body?.data) ? body.data : []
+  const ids = [...new Set(rows.map((row) => (typeof row?.id === 'string' ? row.id.trim() : '')).filter((id) => id !== ''))]
+  if (ids.length === 0) throw httpError(502, 'model discovery returned no models')
+  const resolved = new Map()
+  await mapLimit(ids, 4, async (id) => {
+    resolved.set(id, await capabilities.resolve(settings, id))
+  })
+  const drafts = attachMtpDrafts(ids, resolved)
+  const models = []
+  const kept = new Map()
+  for (const id of ids) {
+    if (drafts.has(id)) continue
+    const capability = resolved.get(id) ?? null
+    models.push(buildModelSpec(settings, id, capability))
+    kept.set(id, capability)
+  }
+  return { models, capabilities: kept, advertised: ids }
+}
+
+async function upsertProvider(ctx, settings) {
+  const keyRef = apiKeyRef(settings)
+  if (keyRef === 'local') await ensureLocalCredential(ctx)
+  const { models, capabilities, advertised } = await discoverModels(ctx, settings, runtimeCapabilities(ctx))
+  const id = providerIdFor(settings.protocol)
+  const desired = {
+    displayName: providerNameFor(settings.protocol),
+    api: 'openai-completions',
+    baseURL: proxyBaseURL(settings.proxyPort),
+    apiKeyEnv: keyRef,
+    compat: {
+      thinkingFormat: 'qwen',
+      supportsReasoningEffort: true,
+      supportsUsageInStreaming: true,
+      maxTokensField: 'max_completion_tokens',
+    },
+    models,
+  }
+  const previous = settings.managedProviderId
+  await editProviders(ctx, (providers) => {
+    if (previous !== null && previous !== id) delete providers[previous]
+    providers[id] = desired
+  })
+  settings.managedProviderId = id
+  settings.lastError = null
+  try {
+    ctx.emit('llm/models-updated', id)
+    ctx.emit('llm/adapters-updated')
+  } catch {
+    // Catalog refresh is best-effort; the provider config is already committed.
+  }
+  return {
+    id,
+    displayName: desired.displayName,
+    baseURL: desired.baseURL,
+    models: models.map((model) => model.id),
+    visionModels: models.filter((model) => model.input.includes('image')).map((model) => model.id),
+    capabilities,
+    advertised,
+    entries: models,
+  }
+}
+
+async function deleteProvider(ctx, id) {
+  if (id === null) return
+  await editProviders(ctx, (providers) => {
+    delete providers[id]
+  })
+  try {
+    ctx.emit('llm/models-updated', id)
+  } catch {
+    // Catalog refresh is best-effort.
+  }
+}
+
+function readManagedProvider(ctx, settings) {
+  try {
+    const { providers } = readProviderConfig(ctx)
+    const id = settings.managedProviderId
+    const provider = id === null ? undefined : providers[id]
+    return {
+      provider: id === null ? null : {
+        id,
+        displayName: provider?.displayName ?? providerNameFor(settings.protocol),
+        baseURL: provider?.baseURL ?? '',
+        exists: provider !== undefined,
+        models: Array.isArray(provider?.models) ? provider.models.map((model) => model?.id).filter((value) => typeof value === 'string') : [],
+        visionModels: Array.isArray(provider?.models)
+          ? provider.models.filter((model) => Array.isArray(model?.input) && model.input.includes('image')).map((model) => model.id)
+          : [],
+        entries: Array.isArray(provider?.models) ? provider.models : [],
+      },
+    }
+  } catch {
+    return { provider: null }
+  }
+}
+
+/** Create the mutable state shared by the API, proxy, and background sync. */
+function createRuntime() {
+  return {
+    settings: normalizeSettings({}),
+    profileDir: '',
+    storePath: '',
+    logger: null,
+    capabilities: null,
+    managedModels: new Set(),
+    visionModels: new Set(),
+    advertisedModels: [],
+    mtpModels: new Set(),
+    mtpDrafts: new Map(),
+    modelContexts: new Map(),
+    modelCapabilities: new Map(),
+    modelReasoning: new Map(),
+    capabilitySignature: '',
+    modelRevision: 0,
+    capabilityRetryAt: 0,
+    managedRefresh: null,
+    managedRefreshKey: '',
+    stateCache: null,
+    statusCache: { key: '', at: 0, value: null },
+    turnMetrics: new Map(),
+    sessionProviders: new Set(),
+    stepStarts: new Map(),
+    firstTokens: new Map(),
+    derivedSessions: new Set(),
+    deriving: new Map(),
+    mtpSuppressed: new Set(),
+    mtpApproved: new Set(),
+    mtpStats: new Map(),
+    warmingModels: new Set(),
+    warmQueue: Promise.resolve(),
+    warmGeneration: 0,
+    bindError: null,
+    replyRestrictions: new Map(),
+    startupTimer: null,
+  }
+}
+
+let runtime = createRuntime()
+let providerChain = Promise.resolve()
+let persistChain = Promise.resolve()
+
+function invalidateState() {
+  runtime.stateCache = null
+}
+
+/** Apply one provider snapshot to the managed model sets. */
+function applyManagedProvider(provider) {
+  runtime.managedModels.clear()
+  runtime.visionModels.clear()
+  runtime.modelReasoning.clear()
+  for (const id of provider?.models ?? []) runtime.managedModels.add(id)
+  for (const id of provider?.visionModels ?? []) runtime.visionModels.add(id)
+  // The provider entry already records each model's thinking capability, so a
+  // restart keeps the per-family decision until capabilities are re-resolved.
+  for (const model of provider?.entries ?? []) {
+    if (typeof model?.id !== 'string') continue
+    if (model.reasoningEfforts === false) runtime.modelReasoning.set(model.id, false)
+    else if (model.reasoningEfforts !== undefined) runtime.modelReasoning.set(model.id, true)
+  }
+}
+
+/** Rebuild the capability-derived sets; returns whether anything changed. */
+function applyCapabilities(capabilities) {
+  const signature = JSON.stringify([...capabilities]
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([id, capability]) => [
+      id,
+      capability?.contextLength ?? null,
+      capability?.maxOutput ?? null,
+      capability?.vision ?? null,
+      capability?.reasoningEfforts ?? null,
+      capability?.mtpDraft ?? null,
+      capability?.hasMtp ?? null,
+      capability?.tags ?? null,
+      capability?.sampling ?? null,
+    ]))
+  runtime.mtpModels.clear()
+  runtime.mtpDrafts.clear()
+  runtime.modelContexts.clear()
+  runtime.modelCapabilities.clear()
+  for (const [id, capability] of capabilities) {
+    runtime.modelCapabilities.set(id, capability)
+    if (typeof capability?.mtpDraft === 'string' && capability.mtpDraft !== '') {
+      runtime.mtpModels.add(id)
+      runtime.mtpDrafts.set(id, capability.mtpDraft)
+    }
+    if (positiveIntOrNull(capability?.contextLength) !== null) runtime.modelContexts.set(id, capability.contextLength)
+  }
+  const changed = signature !== runtime.capabilitySignature
+  runtime.capabilitySignature = signature
+  return changed
+}
+
+function runtimeCapabilities(ctx) {
+  if (runtime.capabilities === null) {
+    runtime.capabilities = createCapabilityResolver({
+      authHeaders: (settings) => credentialHeader(ctx, settings),
+      logger: runtime.logger,
+    })
+  }
+  return runtime.capabilities
+}
+
+/** The ids the upstream advertised; drafts stay addressable for pairing. */
+function advertisedModels(fallback) {
+  return runtime.advertisedModels.length > 0 ? runtime.advertisedModels : fallback
+}
+
+/** Resolve capabilities for every managed model and refresh both catalogs. */
+function refreshManagedModels(ctx, force = false) {
+  const snapshot = { ...runtime.settings }
+  const key = [snapshot.mode, snapshot.protocol, snapshot.upstream, snapshot.managedProviderId].join('|')
+  if (!force && runtime.managedRefresh !== null && runtime.managedRefreshKey === key) return runtime.managedRefresh
+  const promise = (async () => {
+    const provider = readManagedProvider(ctx, snapshot).provider
+    const capabilities = new Map()
+    if (snapshot.protocol === 'geniex') {
+      const ids = provider?.models ?? []
+      await mapLimit(ids, 4, async (id) => {
+        capabilities.set(id, await runtimeCapabilities(ctx).resolve(snapshot, id))
+      })
+      attachMtpDrafts(advertisedModels(ids), capabilities)
+    }
+    const current = [runtime.settings.mode, runtime.settings.protocol, runtime.settings.upstream, runtime.settings.managedProviderId].join('|')
+    if (current !== key) return
+    applyManagedProvider(provider)
+    if (snapshot.protocol === 'geniex' && applyCapabilities(capabilities)) runtime.modelRevision += 1
+    invalidateState()
+  })().finally(() => {
+    if (runtime.managedRefresh === promise) {
+      runtime.managedRefresh = null
+      runtime.managedRefreshKey = ''
+    }
+  })
+  runtime.managedRefresh = promise
+  runtime.managedRefreshKey = key
+  return promise
+}
+
+/** Serialize provider-config writes with background refreshes. */
+function providerTask(operation) {
+  const run = providerChain.then(operation, operation)
+  providerChain = run.then(() => undefined, () => undefined)
+  return run
+}
+
+/** Rebuild or remove the managed provider for the current settings. */
+function syncProvider(ctx) {
+  return providerTask(async () => {
+    invalidateState()
+    const settings = runtime.settings
+    if (settings.mode === 'off') {
+      await deleteProvider(ctx, settings.managedProviderId)
+      settings.managedProviderId = null
+      runtime.advertisedModels = []
+      applyManagedProvider(null)
+      if (applyCapabilities(new Map())) runtime.modelRevision += 1
+      invalidateState()
       return
     }
+    const provider = await upsertProvider(ctx, settings)
+    runtime.advertisedModels = provider.advertised
+    applyManagedProvider(provider)
+    if (applyCapabilities(provider.capabilities)) runtime.modelRevision += 1
+    invalidateState()
+  })
+}
+
+function canMtp(model) {
+  return runtime.settings.mtp
+    && runtime.settings.protocol === 'geniex'
+    && runtime.mtpModels.has(model)
+    && runtime.mtpDrafts.has(model)
+}
+
+function useMtp(model) {
+  return canMtp(model) && !runtime.mtpSuppressed.has(model)
+}
+
+function mtpDraftFor(model) {
+  return runtime.mtpDrafts.get(model) ?? ''
+}
+
+function consumeMtpChoice(model) {
+  runtime.mtpApproved.delete(model)
+  runtime.mtpSuppressed.delete(model)
+}
+
+function recordMtpUsage(model, usage, active) {
+  if (!active) return
+  const details = usage?.completion_tokens_details ?? usage?.completionTokensDetails
+  const accepted = numberOrNull(details?.accepted_prediction_tokens ?? details?.acceptedPredictionTokens)
+  const rejected = numberOrNull(details?.rejected_prediction_tokens ?? details?.rejectedPredictionTokens)
+  if (accepted === null || rejected === null || accepted + rejected <= 0) return
+  runtime.mtpStats.set(model, {
+    accepted,
+    rejected,
+    rate: accepted / (accepted + rejected),
+    updatedAt: Date.now(),
+  })
+  trimMap(runtime.mtpStats, 64)
+}
+
+function ownsModel(model) {
+  return runtime.settings.mode === 'auto' && typeof model === 'string' && runtime.managedModels.has(model)
+}
+
+function modelLoadContext(model) {
+  return effectiveContext(runtime.settings, runtime.modelContexts.get(model) ?? null)
+}
+
+/** The thinking capability of one managed model: true, false, or undefined. */
+function modelReasoning(model) {
+  const value = runtime.modelCapabilities.get(model)?.reasoningEfforts
+  if (value === false) return false
+  if (value !== undefined) return true
+  return runtime.modelReasoning.get(model)
+}
+
+/** Store one turn's timing and token counts. */
+function recordTurn(sessionId, turn, metric) {
+  runtime.turnMetrics.set(`${sessionId}:${turn}`, metric)
+  trimMap(runtime.turnMetrics, 2000)
+  if (metric.provider !== PROVIDERS.geniex.id) return
+  runtime.sessionProviders.add(sessionId)
+  while (runtime.sessionProviders.size > 2000) {
+    const oldest = runtime.sessionProviders.values().next().value
+    if (oldest === undefined) break
+    runtime.sessionProviders.delete(oldest)
+  }
+}
+
+/** Replay one restored session's stream records into turn metrics. */
+function deriveSessionMetrics(session) {
+  if (runtime.derivedSessions.has(session.id)) return Promise.resolve()
+  const inFlight = runtime.deriving.get(session.id)
+  if (inFlight !== undefined) return inFlight
+  let events
+  try {
+    events = session.snapshotEvents()
+  } catch {
+    return Promise.resolve()
+  }
+  const promise = (async () => {
+    const starts = new Map()
+    const firsts = new Map()
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index]
+      const turn = event.data?.turn
+      const step = event.data?.step
+      if (Number.isInteger(turn) && Number.isInteger(step)) {
+        const key = `${turn}:${step}`
+        if (event.type === 'step/start') {
+          starts.set(key, event.time)
+        } else if (event.type === 'assistant/attempt') {
+          const first = streamFirstTokenTime(event.data.stream)
+          if (first !== undefined) firsts.set(key, first)
+        } else if (event.type === 'assistant/message') {
+          const first = firsts.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
+          const metric = buildTurnMetric(event, first, starts.get(key) ?? first)
+          if (metric !== null) recordTurn(session.id, turn, metric)
+        }
+      }
+      if (index % 400 === 399) await new Promise((resolve) => setImmediate(resolve))
+    }
+    runtime.derivedSessions.add(session.id)
+    while (runtime.derivedSessions.size > 200) {
+      const oldest = runtime.derivedSessions.values().next().value
+      if (oldest === undefined) break
+      runtime.derivedSessions.delete(oldest)
+    }
+  })().finally(() => {
+    runtime.deriving.delete(session.id)
+  })
+  runtime.deriving.set(session.id, promise)
+  return promise
+}
+
+/** Stream one upstream response to the client, rewriting reasoning fields. */
+function writeProxyResponse(upstream, res, { active, onUsage }) {
+  const headers = { ...upstream.headers }
+  for (const name of [...HOP_BY_HOP, 'content-length', 'transfer-encoding']) delete headers[name]
+  headers['cache-control'] = 'no-store'
+  try {
+    res.writeHead(upstream.statusCode ?? 502, headers)
+    res.flushHeaders?.()
+  } catch {
+    upstream.destroy()
+    return
+  }
+  res.socket?.setNoDelay(true)
+
+  const contentType = String(upstream.headers['content-type'] ?? '')
+  const streaming = contentType.includes('text/event-stream')
+  res.on('close', () => {
+    if (!res.writableEnded) upstream.destroy()
+  })
+  upstream.on('error', () => res.destroy())
+  upstream.on('aborted', () => res.destroy())
+
+  if (!active || (!streaming && !contentType.includes('application/json'))) {
+    upstream.pipe(res)
+    return
+  }
+
+  const end = (value) => {
+    if (res.writableEnded) return
+    try {
+      res.end(value)
+    } catch {
+      res.destroy()
+    }
+  }
+
+  if (!streaming) {
     const chunks = []
     upstream.on('data', (chunk) => chunks.push(chunk))
     upstream.on('end', () => {
+      const raw = Buffer.concat(chunks)
+      let payload
       try {
-        const payload = JSON.parse(Buffer.concat(chunks).toString('utf8'))
-        if (payload?.usage !== undefined && typeof onUsage === 'function') onUsage(payload.usage)
-        if (Array.isArray(payload.choices)) {
-          payload.choices = payload.choices.map((choice) => ({
-            ...choice,
-            message: rewriteMessage(choice.message, createThinkState(assumeReasoning)),
-          }))
-        }
-        res.end(JSON.stringify(payload))
+        payload = JSON.parse(raw.toString('utf8'))
       } catch {
-        res.end(Buffer.concat(chunks))
+        end(raw)
+        return
       }
+      onUsage?.(payload?.usage)
+      if (Array.isArray(payload.choices)) {
+        payload.choices = payload.choices.map((choice) => ({ ...choice, message: rewriteMessage(choice.message) }))
+      }
+      end(JSON.stringify(payload))
     })
     return
   }
+
   const decoder = new StringDecoder('utf8')
-  const state = createThinkState(assumeReasoning)
+  const state = createThinkState()
   const meta = { onUsage }
   let buffer = ''
+  const write = (value) => {
+    if (value === '' || res.writableEnded) return
+    try {
+      if (!res.write(value)) {
+        upstream.pause()
+        res.once('drain', () => upstream.resume())
+      }
+    } catch {
+      upstream.destroy()
+    }
+  }
   upstream.on('data', (chunk) => {
     buffer += decoder.write(chunk)
-    let index = -1
-    let width = 2
     while (true) {
       const lf = buffer.indexOf('\n\n')
       const crlf = buffer.indexOf('\r\n\r\n')
+      let index = -1
+      let width = 2
       if (crlf !== -1 && (lf === -1 || crlf < lf)) {
         index = crlf
         width = 4
       } else if (lf !== -1) {
         index = lf
-        width = 2
       } else {
         break
       }
       const raw = buffer.slice(0, index)
       buffer = buffer.slice(index + width)
-      res.write(transformSseEvent(raw, state, meta))
+      write(transformSseEvent(raw, state, meta))
     }
   })
   upstream.on('end', () => {
     buffer += decoder.end()
-    if (buffer.trim() !== '') res.write(transformSseEvent(buffer, state, meta))
-    res.end()
+    if (buffer.trim() !== '') write(transformSseEvent(buffer, state, meta))
+    end()
   })
 }
 
-function bodyHasImages(body) {
-  if (!Array.isArray(body?.messages)) return false
-  return body.messages.some((message) => {
-    if (!Array.isArray(message?.content)) return false
-    return message.content.some((part) => {
-      const type = typeof part?.type === 'string' ? part.type.toLowerCase() : ''
-      return type === 'image_url' || type === 'input_image' || type === 'image'
-    })
-  })
-}
-
-function forward(req, res, settings, logger, ownsModel, isVision, modelLoadContext, useMtp, canMtp, mtpApprovedFor, mtpFileFor, consumeMtpChoice, onUsageFor) {
+/** Forward one proxy request to the configured upstream. */
+function handleProxyRequest(req, res) {
+  const settings = runtime.settings
+  const logger = runtime.logger
   let upstreamUrl
   try {
-    const requestUrl = new URL(req.url ?? '/', 'http://qwen.invalid')
-    upstreamUrl = upstreamRequestURL(settings, requestUrl)
+    upstreamUrl = upstreamRequestURL(settings, new URL(req.url ?? '/', 'http://qwen.invalid'))
   } catch (error) {
-    sendJson(res, 500, { ok: false, error: { message: `Invalid upstream URL: ${String(error)}` } })
+    sendJson(res, 500, { ok: false, error: { message: `Invalid upstream URL: ${userError(error)}` } })
     return
   }
   const transport = upstreamUrl.protocol === 'https:' ? https : http
   const headers = { ...req.headers, host: upstreamUrl.host, 'accept-encoding': 'identity' }
-  delete headers['content-length']
-  delete headers['transfer-encoding']
-  const bodyChunks = []
-  let bodySize = 0
+  for (const name of [...HOP_BY_HOP, 'content-length']) delete headers[name]
+  const chunks = []
+  let size = 0
   let rejected = false
   let upstreamReq = null
   req.on('data', (chunk) => {
     if (rejected) return
-    bodySize += chunk.length
-    if (bodySize > MAX_PROXY_BODY) {
+    size += chunk.length
+    if (size > MAX_PROXY_BODY) {
       rejected = true
-      bodyChunks.length = 0
+      chunks.length = 0
       sendJson(res, 413, { ok: false, error: { message: 'request body is too large' } })
       req.resume()
       return
     }
-    bodyChunks.push(chunk)
+    chunks.push(chunk)
   })
   req.on('end', () => {
     if (rejected) return
-    let body = Buffer.concat(bodyChunks)
+    let body = Buffer.concat(chunks)
     let active = false
-    let thinking = false
     let activeModel = ''
     let mtpActive = false
-    if (settings.mode !== 'off' && body.length > 0) {
+    if (settings.mode === 'auto' && body.length > 0) {
       try {
         const parsed = JSON.parse(body.toString('utf8'))
-        active = ownsModel(parsed?.model)
-        if (active) {
-          thinking = thinkingEnabled(parsed, settings)
-          const model = parsed?.model
+        if (ownsModel(parsed?.model)) {
+          const model = parsed.model
+          active = true
           activeModel = model
-          const vision = isVision(model)
-          const hasImages = bodyHasImages(parsed)
-          const mtp = hasImages && vision
-            ? canMtp(model) && mtpApprovedFor(model)
+          const reasoning = modelReasoning(model)
+          const vision = runtime.visionModels.has(model)
+          const media = bodyHasMedia(parsed)
+          const thinking = reasoning === false ? false : thinkingEnabled(parsed)
+          const mtp = media && vision
+            ? canMtp(model) && runtime.mtpApproved.has(model)
             : useMtp(model)
           mtpActive = mtp
-          body = Buffer.from(JSON.stringify(applyRequestDefaults(
-            parsed,
-            settings,
+          body = Buffer.from(JSON.stringify(applyRequestDefaults(parsed, settings, {
+            thinking,
+            reasoning,
             vision,
-            modelLoadContext(model),
+            context: modelLoadContext(model),
             mtp,
-            mtpFileFor(model),
-          )), 'utf8')
+            mtpDraft: mtpDraftFor(model),
+          })), 'utf8')
           consumeMtpChoice(model)
         }
       } catch {
@@ -940,25 +998,28 @@ function forward(req, res, settings, logger, ownsModel, isVision, modelLoadConte
     headers['content-length'] = String(body.length)
     try {
       upstreamReq = transport.request(upstreamUrl, { method: req.method, headers }, (upstreamRes) => {
-        writeProxyResponse(upstreamRes, res, active, thinking, (usage) => onUsageFor(activeModel, usage, mtpActive))
+        writeProxyResponse(upstreamRes, res, {
+          active,
+          onUsage: (usage) => recordMtpUsage(activeModel, usage, mtpActive),
+        })
       })
     } catch (error) {
-      logger.warn(`[${SCOPE}] cannot create upstream request: ${String(error)}`)
-      sendJson(res, 502, { ok: false, error: { message: String(error) } })
+      logger.warn(`[${SCOPE}] cannot create upstream request: ${userError(error)}`)
+      sendJson(res, 502, { ok: false, error: { message: userError(error) } })
       return
     }
     upstreamReq.setNoDelay(true)
     upstreamReq.on('error', (error) => {
-      logger.warn(`[${SCOPE}] upstream request failed: ${String(error)}`)
-      if (!res.headersSent) sendJson(res, 502, { ok: false, error: { message: String(error) } })
+      logger.warn(`[${SCOPE}] upstream request failed: ${userError(error)}`)
+      if (!res.headersSent) sendJson(res, 502, { ok: false, error: { message: userError(error) } })
       else res.destroy()
     })
     upstreamReq.end(body)
   })
   req.on('error', (error) => {
     upstreamReq?.destroy()
-    logger.warn(`[${SCOPE}] proxy request failed: ${String(error)}`)
-    if (!res.headersSent) sendJson(res, 400, { ok: false, error: { message: String(error) } })
+    logger.warn(`[${SCOPE}] proxy request failed: ${userError(error)}`)
+    if (!res.headersSent) sendJson(res, 400, { ok: false, error: { message: userError(error) } })
   })
   req.on('aborted', () => {
     rejected = true
@@ -969,200 +1030,72 @@ function forward(req, res, settings, logger, ownsModel, isVision, modelLoadConte
   })
 }
 
-function readProviderConfig(ctx) {
-  const editor = ctx.configEditor
-  const entry = editor.entries().find((candidate) => candidate.id === 'include:llm-pi-ai' || candidate.id?.endsWith(':llm-pi-ai'))
-  if (entry === undefined) throw httpError(400, 'llm-pi-ai entry not found')
-  const rows = editor.configuration()
-  const row = rows.find((candidate) => candidate.entry === entry || candidate.entry?.id === entry.id)
-  const config = { ...(row?.inherited ?? {}), ...(row?.override ?? {}) }
-  const providers = config.providers !== null && typeof config.providers === 'object' ? config.providers : {}
-  return { editor, entry, config, providers }
+/** The reply-only preset text for one locale. */
+function replyOnlyText(locale) {
+  return locale.startsWith('en')
+    ? { name: 'Reply Only', description: 'Tool calls are hidden and denied; replies stay plain text.' }
+    : { name: '仅回复', description: '禁止工具调用，仅进行纯文本对话。' }
 }
 
-function shortName(id) {
-  return id.split('/').pop().replace(/:[^:]+$/u, '') || id
-}
-
-async function mapLimit(items, limit, operation) {
-  const results = new Array(items.length)
-  let next = 0
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (next < items.length) {
-      const index = next
-      next += 1
-      results[index] = await operation(items[index], index)
-    }
-  })
-  await Promise.all(workers)
-  return results
-}
-
-function splitModelId(id) {
-  const parts = id.split('/')
-  const owner = parts.shift() ?? 'local'
-  const leaf = (parts.join('/') || owner).replace(/:[^:]+$/u, '')
-  const colon = id.lastIndexOf(':')
-  return { owner, leaf, precision: colon === -1 ? '' : id.slice(colon + 1) }
-}
-
-function buildModelSpec(id, settings, vision = false, reasoningEfforts, metadata = null) {
-  const known = KNOWN_REASONING_EFFORTS.find((entry) => id.toLowerCase().includes(entry.match))?.efforts
-  const metadataContext = positiveIntOrNull(metadata?.contextLength)
-  const contextWindow = settings.autoNctx
-    ? metadataContext ?? settings.contextWindow
-    : settings.contextWindow
-  const effectiveContext = contextWindow ?? (settings.protocol === 'qwen' ? DEFAULTS.contextWindow : settings.maxOutputTokens)
-  const model = {
-    id,
-    name: shortName(id),
-    maxTokens: Math.min(settings.maxOutputTokens, effectiveContext),
-    reasoningEfforts: reasoningEfforts ?? known,
-    input: vision ? ['text', 'image'] : ['text'],
-  }
-  model.contextWindow = effectiveContext
-  return model
-}
-
-async function credentialHeader(ctx, settings) {
-  const ref = apiKeyRef(settings)
-  try {
-    const key = (await ctx.credentials.resolve(ref))?.value ?? ''
-    return key === '' ? {} : { authorization: `Bearer ${key}` }
-  } catch {
-    return {}
-  }
-}
-
-async function detectReasoningEfforts(settings, id) {
-  if (settings.protocol !== 'geniex') return undefined
-  const cacheKey = `${settings.upstream}|${id}`
-  const cached = reasoningEffortCache.get(cacheKey)
-  if (cached !== undefined && Date.now() - cached.at < CAPABILITY_CACHE_TTL_MS) return cached.value
-  let result
-  try {
-    const cacheRoot = await geniexModelsRoot()
-    const { owner, leaf, precision } = splitModelId(id)
-    const meta = JSON.parse(await readFile(join(cacheRoot, owner, leaf, 'geniex.json'), 'utf8'))
-    const file = meta?.ModelFile?.[precision]?.Name
-      ?? Object.values(meta?.ModelFile ?? {}).find((entry) => entry?.Downloaded === true)?.Name
-    if (typeof file === 'string' && file !== '') {
-      const handle = await open(join(cacheRoot, owner, leaf, file), 'r')
-      try {
-        const buffer = Buffer.alloc(4 * 1024 * 1024)
-        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0)
-        const text = buffer.subarray(0, bytesRead).toString('utf8')
-        const start = text.indexOf('tokenizer.chat_template')
-        const template = start === -1 ? '' : text.slice(start, start + 200000)
-        if (template.includes('reasoning_effort')) {
-          const levels = new Set()
-          for (const match of template.matchAll(/['"](low|medium|high|xhigh)['"]/gu)) levels.add(match[1])
-          if (levels.size > 0) {
-            result = { off: null }
-            for (const level of levels) result[level] = level
-          }
-        } else if (template.includes('enable_thinking')) {
-          result = { off: null, max: 'enabled' }
-        }
-      } finally {
-        await handle.close()
-      }
-    }
-  } catch {
-    // The cache is optional; known model families still provide a fallback.
-  }
-  reasoningEffortCache.set(cacheKey, { value: result, at: Date.now() })
-  if (reasoningEffortCache.size > CAPABILITY_CACHE_LIMIT) reasoningEffortCache.delete(reasoningEffortCache.keys().next().value)
-  return result
-}
-
-async function detectVision(settings, id, headers) {
-  const cacheKey = `${settings.protocol}|${settings.upstream}|${id}`
-  const cached = visionCache.get(cacheKey)
-  if (cached !== undefined && Date.now() - cached.at < CAPABILITY_CACHE_TTL_MS) return cached.value
-  const value = await detectVisionUncached(settings, id, headers)
-  visionCache.set(cacheKey, { value, at: Date.now() })
-  if (visionCache.size > CAPABILITY_CACHE_LIMIT) visionCache.delete(visionCache.keys().next().value)
-  return value
-}
-
-async function detectVisionUncached(settings, id, headers) {
-  if (settings.protocol === 'geniex') {
-    try {
-      const detailUrl = upstreamURL(settings, 'models')
-      detailUrl.pathname = `${detailUrl.pathname.replace(/\/+$/u, '')}/${id.split('/').map(encodeURIComponent).join('/')}`
-      const response = await fetch(detailUrl, { headers, signal: AbortSignal.timeout(8000) })
-      if (response.ok) {
-        const detail = await response.json()
-        if (typeof detail?.model_type === 'string') return detail.model_type.toLowerCase() === 'vlm'
-      }
-    } catch {
-      // Fall back to the cache metadata or the model name.
-    }
-    try {
-      const cacheRoot = await geniexModelsRoot()
-      const { owner, leaf } = splitModelId(id)
-      const meta = JSON.parse(await readFile(join(cacheRoot, owner, leaf, 'geniex.json'), 'utf8'))
-      return meta?.ModelType === 'vlm' || meta?.MMProjFile?.Downloaded === true
-    } catch {
-      // Cache metadata is optional.
-    }
-  }
-  return VISION_MODEL_PATTERN.test(id)
-}
-
-async function discoverModels(ctx, settings) {
-  const url = upstreamURL(settings, 'models')
-  const headers = { accept: 'application/json', ...await credentialHeader(ctx, settings) }
-  const response = await fetch(url, { headers, signal: AbortSignal.timeout(15000) })
-  if (!response.ok) throw httpError(502, `model discovery failed: HTTP ${response.status}`)
-  const body = await response.json()
-  const rows = Array.isArray(body?.data) ? body.data : []
-  const unique = new Map()
-  for (const row of rows) {
-    const id = typeof row?.id === 'string' ? row.id : ''
-    if (id === '') continue
-    const modelType = typeof row?.model_type === 'string' ? row.model_type : null
-    const previous = unique.get(id)
-    if (previous === undefined || (previous.modelType === null && modelType !== null)) {
-      unique.set(id, { id, modelType })
-    }
-  }
-  if (unique.size === 0) throw httpError(502, 'model discovery returned no models')
-  const discovered = await mapLimit([...unique.values()], 6, async ({ id, modelType }) => {
-    const known = KNOWN_REASONING_EFFORTS.find((entry) => id.toLowerCase().includes(entry.match))
-    const [vision, reasoningEfforts, metadata] = await Promise.all([
-      modelType !== null
-        ? Promise.resolve(modelType.toLowerCase() === 'vlm')
-        : detectVision(settings, id, headers),
-      known === undefined ? detectReasoningEfforts(settings, id) : Promise.resolve(known.efforts),
-      readModelMetadata(settings, id),
-    ])
-    return {
-      spec: buildModelSpec(id, settings, vision, reasoningEfforts, metadata),
-      metadata,
-    }
-  })
+function replyOnlyPreset(presets, locale) {
+  const current = presets[REPLY_ONLY_KEY]
+  const text = replyOnlyText(locale)
   return {
-    models: discovered.map((entry) => entry.spec),
-    capabilities: new Map(discovered.map((entry) => [entry.spec.id, entry.metadata])),
+    sandbox: current?.sandbox ?? 'read-only',
+    approval: current?.approval ?? 'never',
+    name: text.name,
+    description: text.description,
   }
 }
 
-async function warmUpModel(ctx, settings, model, vision = false, context = null, mtp = false, mtpFile = '') {
+function samePreset(left, right) {
+  return left?.sandbox === right.sandbox
+    && left?.approval === right.approval
+    && left?.name === right.name
+    && left?.description === right.description
+}
+
+/** Read the merged permission config without editing it. */
+function readPermissionConfig(ctx) {
+  const entry = ctx.configEditor.entries().find((candidate) => {
+    return candidate.options?.id === 'permission' || candidate.id?.endsWith(':permission')
+  })
+  if (entry === undefined) return { entry: null, config: {} }
+  const row = ctx.configEditor.configuration().find((candidate) => candidate.entry === entry)
+  return { entry, config: { ...(row?.inherited ?? {}), ...(row?.override ?? {}) } }
+}
+
+/**
+ * Keep the reply-only preset present and localized, without rewriting the
+ * profile patch when nothing changed.
+ */
+async function ensureReplyOnlyPreset(ctx, locale) {
+  const { entry, config } = readPermissionConfig(ctx)
+  const text = replyOnlyText(locale)
+  if (entry === null) return { updated: false, ...text }
+  const presets = config.presets !== null && typeof config.presets === 'object' ? config.presets : {}
+  if (samePreset(presets[REPLY_ONLY_KEY], replyOnlyPreset(presets, locale))) return { updated: false, ...text }
+  await ctx.configEditor.edit(entry, (current, inherited) => {
+    const base = { ...(inherited ?? {}), ...(current ?? {}) }
+    const merged = { ...((inherited ?? {}).presets ?? {}), ...((current ?? {}).presets ?? {}) }
+    return { ...base, presets: { ...merged, [REPLY_ONLY_KEY]: replyOnlyPreset(merged, locale) } }
+  })
+  return { updated: true, ...text }
+}
+
+async function warmUpModel(ctx, settings, model, options) {
   const url = upstreamURL(settings, 'chat/completions')
   const body = {
     model,
-    messages: [
-      { role: 'system', content: `You are ${shortName(model)}, a helpful agent. This is the warming stage.` },
-      { role: 'user', content: 'Hi' },
-    ],
-    max_completion_tokens: 1,
-    temperature: 0,
+    // GenieX treats a lone system message as a warm-up: the model loads with
+    // these exact load parameters and no prefill or decoding runs.
+    messages: [{ role: 'system', content: `You are ${shortModelName(model)}. Load the model; do not answer.` }],
     stream: false,
+    enable_think: false,
+    reasoning_format: 'auto',
+    ...inferenceFields(settings, options.vision),
+    ...loadFields(settings, options.context, options.mtp, options.mtpDraft),
   }
-  if (settings.protocol === 'qwen') body.enable_thinking = false
-  else Object.assign(body, { enable_think: false, reasoning_format: 'auto' }, inferenceFields(settings, vision), loadFields(settings, context, mtp, mtpFile))
   const startedAt = Date.now()
   const response = await fetch(url, {
     method: 'POST',
@@ -1181,600 +1114,231 @@ async function warmUpModel(ctx, settings, model, vision = false, context = null,
   return { elapsedMs: Date.now() - startedAt, usage }
 }
 
-async function upsertProvider(ctx, settings) {
-  const { editor, entry } = readProviderConfig(ctx)
-  const id = providerIdFor(settings.protocol)
-  const keyRef = apiKeyRef(settings)
-  if (keyRef === 'local') {
-    try {
-      await ctx.credentials.resolve('local')
-    } catch {
-      await ctx.credentials.set('local', 'local')
-    }
+/** Read the loaded-model state from GenieX's `/status`. */
+async function readModelStatus(ctx) {
+  const settings = runtime.settings
+  if (!(settings.mode === 'auto' && settings.protocol === 'geniex' && settings.warm === true)) {
+    return { active: false, models: [], warming: [], revision: runtime.modelRevision }
   }
-  const { models, capabilities } = await discoverModels(ctx, settings)
-  const desired = {
-    displayName: providerNameFor(settings.protocol),
-    api: 'openai-completions',
-    baseURL: proxyBaseURL(settings),
-    apiKeyEnv: keyRef,
-    compat: {
-      thinkingFormat: 'qwen',
-      supportsReasoningEffort: true,
-      supportsUsageInStreaming: true,
-      maxTokensField: 'max_completion_tokens',
-    },
-    models,
+  const cached = runtime.statusCache
+  if (cached.key === settings.upstream && Date.now() - cached.at < 1500) {
+    return { ...cached.value, warming: [...runtime.warmingModels], revision: runtime.modelRevision }
   }
-  const previous = settings.managedProviderId
-  await editor.edit(entry, (current, inherited) => {
-    const config = { ...(inherited ?? {}), ...(current ?? {}) }
-    const providers = {
-      ...((inherited ?? {}).providers ?? {}),
-      ...((current ?? {}).providers ?? {}),
+  let value = { active: true, models: [], warming: [] }
+  try {
+    const url = new URL(settings.upstream)
+    url.pathname = '/status'
+    url.search = ''
+    const response = await fetch(url, {
+      headers: { accept: 'application/json', ...await credentialHeader(ctx, settings) },
+      signal: AbortSignal.timeout(2000),
+    })
+    if (response.ok) {
+      const body = await response.json()
+      const models = Array.isArray(body?.models) ? body.models.filter((model) => typeof model?.id === 'string') : []
+      value = {
+        active: true,
+        models: models.map((model) => model.id),
+        states: Object.fromEntries(models.map((model) => [model.id, model.state])),
+      }
     }
-    if (previous !== null) delete providers[previous]
-    providers[id] = desired
-    return { ...config, providers }
+  } catch {
+    // A missing status endpoint means the client cannot classify warm models.
+  }
+  value.warming = [...runtime.warmingModels]
+  value.revision = runtime.modelRevision
+  runtime.statusCache = { key: settings.upstream, at: Date.now(), value }
+  return value
+}
+
+/** The settings page state, cached until the next mutation. */
+function readState(ctx) {
+  if (runtime.stateCache !== null) return runtime.stateCache
+  const settings = runtime.settings
+  runtime.stateCache = {
+    ...settings,
+    lastError: runtime.bindError ?? settings.lastError,
+    proxyBaseURL: proxyBaseURL(settings.proxyPort),
+    ...readManagedProvider(ctx, settings),
+  }
+  return runtime.stateCache
+}
+
+/** Resolve capabilities for models the client is waiting on. */
+async function ensureCapabilities(ctx) {
+  if (runtime.managedModels.size === 0) return
+  const missing = [...runtime.managedModels].filter((id) => {
+    const capability = runtime.modelCapabilities.get(id)
+    return capability === undefined || capability === null
   })
-  settings.managedProviderId = id
-  settings.lastError = null
-  try {
-    ctx.emit('llm/models-updated', id)
-    ctx.emit('llm/adapters-updated')
-  } catch {
-    // Catalog refresh is best-effort; the provider config is already committed.
+  if (missing.length === 0 || Date.now() < runtime.capabilityRetryAt) return
+  runtime.capabilityRetryAt = Date.now() + 60000
+  const entries = await mapLimit(missing, 4, async (id) => [id, await runtimeCapabilities(ctx).resolve(runtime.settings, id, true)])
+  const merged = new Map()
+  for (const id of runtime.managedModels) {
+    const capability = runtime.modelCapabilities.get(id)
+    if (capability !== undefined) merged.set(id, capability)
   }
-  return {
-    id,
-    displayName: desired.displayName,
-    baseURL: desired.baseURL,
-    models: models.map((model) => model.id),
-    visionModels: models.filter((model) => model.input.includes('image')).map((model) => model.id),
-    capabilities,
-  }
+  for (const [id, capability] of entries) merged.set(id, capability)
+  attachMtpDrafts(advertisedModels([...runtime.managedModels]), merged)
+  if (applyCapabilities(merged)) runtime.modelRevision += 1
 }
 
-async function deleteProvider(ctx, settings) {
-  if (settings.managedProviderId === null) return
-  const { editor, entry } = readProviderConfig(ctx)
-  const id = settings.managedProviderId
-  await editor.edit(entry, (current, inherited) => {
-    const config = { ...(inherited ?? {}), ...(current ?? {}) }
-    const providers = {
-      ...((inherited ?? {}).providers ?? {}),
-      ...((current ?? {}).providers ?? {}),
-    }
-    delete providers[id]
-    return { ...config, providers }
-  })
-  try {
-    ctx.emit('llm/models-updated', id)
-  } catch {
-    // Catalog refresh is best-effort.
-  }
-  settings.managedProviderId = null
-}
-
-function readManagedProvider(ctx, settings) {
-  try {
-    const { providers } = readProviderConfig(ctx)
-    const id = settings.managedProviderId
-    const provider = id === null ? undefined : providers[id]
-    return {
-      provider: id === null ? null : {
-        id,
-        displayName: provider?.displayName ?? providerNameFor(settings.protocol),
-        baseURL: provider?.baseURL ?? '',
-        exists: provider !== undefined,
-        models: Array.isArray(provider?.models) ? provider.models.map((model) => model.id) : [],
-        visionModels: Array.isArray(provider?.models)
-          ? provider.models.filter((model) => Array.isArray(model.input) && model.input.includes('image')).map((model) => model.id)
-          : [],
-      },
-    }
-  } catch {
-    return { provider: null }
-  }
-}
-
-export async function apply(ctx) {
-  const logger = loggerFor(ctx)
-  const profileDir = text(process.env.DSH_PROFILE_DIR) || process.cwd()
-  const storePath = join(profileDir, STORE_FILE)
-  let settings = normalizeSettings({})
-  try {
-    settings = normalizeSettings(JSON.parse(await readFile(storePath, 'utf8')))
-  } catch (error) {
-    if (error?.code !== 'ENOENT') logger.warn(`[${SCOPE}] cannot read settings: ${String(error)}`)
-  }
-  const persist = async () => {
-    await mkdir(profileDir, { recursive: true })
-    const body = `${JSON.stringify(settings, null, 2)}\n`
-    const temporary = `${storePath}.${process.pid}.${Date.now()}.tmp`
-    await writeFile(temporary, body, 'utf8')
-    try {
-      await rename(temporary, storePath)
-    } catch {
-      await writeFile(storePath, body, 'utf8')
-      try {
-        await unlink(temporary)
-      } catch {
-        // A leftover temporary file is harmless.
-      }
-    }
-  }
-  settings.lastError = null
-  await persist().catch((error) => logger.warn(`[${SCOPE}] cannot save settings: ${String(error)}`))
-
-  const managedModels = new Set()
-  const visionModels = new Set()
-  const mtpModels = new Set()
-  const mtpFiles = new Map()
-  const mtpSuppressed = new Set()
-  const mtpApproved = new Set()
-  const mtpStats = new Map()
-  const modelContexts = new Map()
-  const modelCapabilities = new Map()
-  let modelRevision = 0
-  let capabilityRetryAt = 0
-  const applyCapabilities = (capabilities = new Map()) => {
-    mtpModels.clear()
-    mtpFiles.clear()
-    modelContexts.clear()
-    modelCapabilities.clear()
-    for (const [id, metadata] of capabilities) {
-      modelCapabilities.set(id, metadata)
-      if (metadata?.hasMtp === true && metadata.pluginId === 'llama_cpp' && typeof metadata.mtpFile === 'string' && metadata.mtpFile !== '') {
-        mtpModels.add(id)
-        mtpFiles.set(id, metadata.mtpFile)
-      }
-      if (typeof metadata?.contextLength === 'number') modelContexts.set(id, metadata.contextLength)
-    }
-  }
-  let managedRefresh = null
-  let managedRefreshKey = ''
-  const refreshManagedModels = () => {
-    const snapshot = { ...settings }
-    const sourceKey = `${snapshot.mode}|${snapshot.protocol}|${snapshot.upstream}|${snapshot.managedProviderId}`
-    if (managedRefresh !== null && managedRefreshKey === sourceKey) return managedRefresh
-    const promise = (async () => {
-      capabilityRetryAt = 0
-      const provider = readManagedProvider(ctx, snapshot).provider
-      const nextManaged = new Set(provider?.models ?? [])
-      const nextVision = new Set(provider?.visionModels ?? [])
-      const entries = snapshot.protocol === 'geniex'
-        ? await mapLimit([...nextManaged], 4, async (id) => {
-            return [id, await readModelMetadata(snapshot, id)]
-          })
-        : []
-      const currentKey = `${settings.mode}|${settings.protocol}|${settings.upstream}|${settings.managedProviderId}`
-      if (currentKey !== sourceKey) return
-      managedModels.clear()
-      for (const id of nextManaged) managedModels.add(id)
-      visionModels.clear()
-      for (const id of nextVision) visionModels.add(id)
-      applyCapabilities(new Map(entries))
-    })().finally(() => {
-      if (managedRefresh === promise) {
-        managedRefresh = null
-        managedRefreshKey = ''
-      }
-    })
-    managedRefresh = promise
-    managedRefreshKey = sourceKey
-    return promise
-  }
-  await refreshManagedModels()
-  const modelLoadContext = (model) => {
-    const contextual = settings.autoNctx
-      ? modelContexts.get(model) ?? settings.contextWindow
-      : settings.contextWindow
-    const context = contextual ?? settings.maxOutputTokens
-    return typeof context === 'number' && context > 0 ? context : null
-  }
-  const canMtp = (model) => {
-    return settings.mtp
-      && settings.protocol === 'geniex'
-      && mtpModels.has(model)
-      && mtpFiles.has(model)
-  }
-  const useMtp = (model) => canMtp(model) && !mtpSuppressed.has(model)
-  const mtpApprovedFor = (model) => mtpApproved.has(model)
-  const mtpFileFor = (model) => mtpFiles.get(model) ?? ''
-  const consumeMtpChoice = (model) => {
-    mtpApproved.delete(model)
-    mtpSuppressed.delete(model)
-  }
-  const recordMtpUsage = (model, usage, active = false) => {
-    if (!active) return
-    const details = usage?.completion_tokens_details ?? usage?.completionTokensDetails
-    const accepted = numberOrNull(details?.accepted_prediction_tokens ?? details?.acceptedPredictionTokens)
-    const rejected = numberOrNull(details?.rejected_prediction_tokens ?? details?.rejectedPredictionTokens)
-    if (accepted === null || rejected === null || accepted + rejected <= 0) return
-    mtpStats.set(model, {
-      accepted,
-      rejected,
-      rate: accepted / (accepted + rejected),
-      updatedAt: Date.now(),
-    })
-    while (mtpStats.size > 64) mtpStats.delete(mtpStats.keys().next().value)
-  }
-  const ownsModel = (model) => {
-    if (settings.mode !== 'auto') return false
-    return typeof model === 'string' && managedModels.has(model)
-  }
-  const turnMetrics = new Map()
-  const sessionProviders = new Map()
-  const stepStarts = new Map()
-  const firstTokens = new Map()
-  const derivedSessions = new Set()
-  const derivingPromises = new Map()
-  const trimMap = (map, max) => {
-    while (map.size > max) {
-      const oldest = map.keys().next().value
-      if (oldest === undefined) return
-      map.delete(oldest)
-    }
-  }
-  const markSessionProvider = (sessionId, provider) => {
-    if (provider !== providerIdFor('geniex') && provider !== providerNameFor('geniex')) return
-    sessionProviders.set(sessionId, true)
-    trimMap(sessionProviders, 2000)
-  }
-  const deriveSessionMetrics = (session) => {
-    if (derivedSessions.has(session.id)) return Promise.resolve()
-    const inFlight = derivingPromises.get(session.id)
-    if (inFlight !== undefined) return inFlight
-    let events
-    try {
-      events = session.snapshotEvents()
-    } catch {
-      return Promise.resolve()
-    }
-    const promise = (async () => {
-      const starts = new Map()
-      const firsts = new Map()
-      for (let index = 0; index < events.length; index += 1) {
-        const event = events[index]
-        const turn = event.data?.turn
-        const step = event.data?.step
-        if (Number.isInteger(turn) && Number.isInteger(step)) {
-          const key = `${turn}:${step}`
-          if (event.type === 'step/start') {
-            starts.set(key, event.time)
-          } else if (event.type === 'assistant/attempt') {
-            const first = streamFirstTokenTime(event.data.stream)
-            if (first !== undefined) firsts.set(key, first)
-          } else if (event.type === 'assistant/message') {
-            const first = firsts.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
-            const metric = buildTurnMetric(event, first, starts.get(key) ?? first)
-            if (metric !== null) {
-              turnMetrics.set(`${session.id}:${turn}`, metric)
-              markSessionProvider(session.id, metric.provider)
-            }
-          }
-        }
-        if (index % 400 === 399) await new Promise((resolve) => setImmediate(resolve))
-      }
-      derivedSessions.add(session.id)
-      trimMap(turnMetrics, 2000)
-      while (derivedSessions.size > 200) {
-        const oldest = derivedSessions.values().next().value
-        if (oldest === undefined) break
-        derivedSessions.delete(oldest)
-      }
-    })().finally(() => {
-      derivingPromises.delete(session.id)
-    })
-    derivingPromises.set(session.id, promise)
-    return promise
-  }
-  ctx.effect(() => ctx.on('session/event', (session, event) => {
-    const turn = event.data?.turn
-    const step = event.data?.step
-    if (!Number.isInteger(turn) || !Number.isInteger(step)) return
-    const key = `${session.id}:${turn}:${step}`
-    if (event.type === 'step/start') {
-      stepStarts.set(key, event.time)
-      trimMap(stepStarts, 2000)
-      return
-    }
-    if (event.type === 'assistant/attempt') {
-      const first = streamFirstTokenTime(event.data.stream)
-      if (first !== undefined) firstTokens.set(key, first)
-      trimMap(firstTokens, 2000)
-      return
-    }
-    if (event.type !== 'assistant/message') return
-    const first = firstTokens.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
-    const start = stepStarts.get(key) ?? first
-    stepStarts.delete(key)
-    firstTokens.delete(key)
-    const metric = buildTurnMetric(event, first, start)
-    if (metric === null) return
-    turnMetrics.set(`${session.id}:${turn}`, metric)
-    markSessionProvider(session.id, metric.provider)
-    trimMap(turnMetrics, 2000)
-  }), `${SCOPE}: turn metrics`)
-
-  let stateSnapshot = null
-  const invalidateState = () => {
-    stateSnapshot = null
-  }
-  const state = () => {
-    if (stateSnapshot !== null) return stateSnapshot
-    stateSnapshot = {
-      ...settings,
-      proxyBaseURL: proxyBaseURL(settings),
-      ...readManagedProvider(ctx, settings),
-    }
-    return stateSnapshot
-  }
-
-  const syncProvider = async () => {
-    invalidateState()
-    if (settings.mode === 'off') {
-      await deleteProvider(ctx, settings)
-      settings.managedProviderId = null
-      managedModels.clear()
-      visionModels.clear()
-      applyCapabilities()
-      modelRevision += 1
-      return
-    }
-    const provider = await upsertProvider(ctx, settings)
-    managedModels.clear()
-    visionModels.clear()
-    for (const id of provider.models) managedModels.add(id)
-    for (const id of provider.visionModels) visionModels.add(id)
-    applyCapabilities(provider.capabilities)
-    modelRevision += 1
-  }
-
-  try {
-    await syncProvider()
-    settings.lastError = null
-  } catch (error) {
-    logger.warn(`[${SCOPE}] cannot refresh managed provider: ${String(error)}`)
-  }
-  await persist().catch((error) => logger.warn(`[${SCOPE}] cannot save settings: ${String(error)}`))
-
-  const statusCache = { key: '', at: 0, value: null }
-  const readGeniexStatus = async () => {
-    const active = settings.mode === 'auto' && settings.protocol === 'geniex' && settings.warm === true
-    if (!active) return { active: false, models: [], warming: [], revision: modelRevision }
-    const key = settings.upstream
-    if (statusCache.key === key && Date.now() - statusCache.at < 1500) {
-      return { ...statusCache.value, warming: [...warmingModels], revision: modelRevision }
-    }
-    let value = { active: true, models: [], warming: [] }
-    try {
-      const url = new URL(settings.upstream)
-      url.pathname = '/status'
-      url.search = ''
-      const response = await fetch(url, {
-        headers: { accept: 'application/json', ...await credentialHeader(ctx, settings) },
-        signal: AbortSignal.timeout(2000),
-      })
-      if (response.ok) {
-        const body = await response.json()
-        const models = Array.isArray(body?.models)
-          ? body.models.filter((model) => typeof model?.id === 'string')
-          : []
-        value = {
-          active: true,
-          models: models.map((model) => model.id),
-          states: Object.fromEntries(models.map((model) => [model.id, model.state])),
-          warming: [...warmingModels],
-        }
-      }
-    } catch {
-      // A missing status endpoint means the client cannot classify warm models.
-    }
-    value.warming = [...warmingModels]
-    value.revision = modelRevision
-    statusCache.key = key
-    statusCache.at = Date.now()
-    statusCache.value = value
-    return value
-  }
-
-  let warmQueue = Promise.resolve()
-  let warmGeneration = 0
-  const warmingModels = new Set()
+/** Build the API handler table. */
+function createApi(ctx) {
   const api = {
-    state: () => state(),
-    modelStatus: readGeniexStatus,
+    state: () => readState(ctx),
+    modelStatus: () => readModelStatus(ctx),
     modelInfo: async () => {
-      if (settings.protocol !== 'geniex') return { revision: modelRevision, models: {} }
-      let capabilitiesChanged = false
-      if (managedModels.size === 0) {
-        await refreshManagedModels()
-        capabilitiesChanged = managedModels.size > 0
-      }
-      const missing = [...managedModels].filter((id) => {
-        return !modelCapabilities.has(id) || modelCapabilities.get(id) === null
-      })
-      if (missing.length > 0 && Date.now() >= capabilityRetryAt) {
-        capabilityRetryAt = Date.now() + 60000
-        const entries = await mapLimit(missing, 4, async (id) => {
-          modelMetadataCache.delete(`${settings.upstream}|${id}`)
-          return [id, await readModelMetadata(settings, id, true)]
-        })
-        const merged = new Map(modelCapabilities)
-        for (const [id, metadata] of entries) merged.set(id, metadata)
-        applyCapabilities(merged)
-        capabilitiesChanged = entries.some(([, metadata]) => metadata !== null)
-      }
-      if (capabilitiesChanged) modelRevision += 1
+      if (runtime.settings.protocol !== 'geniex') return { revision: runtime.modelRevision, models: {} }
+      await ensureCapabilities(ctx)
       return {
-        revision: modelRevision,
-        models: Object.fromEntries([...managedModels].map((id) => {
-          const metadata = modelCapabilities.get(id)
+        revision: runtime.modelRevision,
+        models: Object.fromEntries([...runtime.managedModels].map((id) => {
+          const capability = runtime.modelCapabilities.get(id)
           return [id, {
-            abliterated: metadata?.abliterated === true,
-            hasMtp: metadata?.hasMtp === true && metadata.pluginId === 'llama_cpp',
-            mtpReady: mtpModels.has(id) && mtpFiles.has(id),
-            mtpEnabled: settings.mtp === true,
-            vision: visionModels.has(id),
-            contextLength: typeof metadata?.contextLength === 'number' ? metadata.contextLength : null,
-            sampling: metadata?.sampling ?? {},
-            tags: metadata?.tags ?? [],
-            mtpStats: mtpStats.get(id) ?? null,
+            abliterated: capability?.abliterated === true,
+            hasMtp: capability?.hasMtp === true,
+            mtpReady: runtime.mtpModels.has(id) && runtime.mtpDrafts.has(id),
+            mtpEnabled: runtime.settings.mtp === true,
+            vision: runtime.visionModels.has(id),
+            contextLength: positiveIntOrNull(capability?.contextLength),
+            sampling: capability?.sampling ?? {},
+            tags: capability?.tags ?? [],
+            mtpStats: runtime.mtpStats.get(id) ?? null,
           }]
         })),
       }
     },
     mtpChoice: (payload) => {
-      if (settings.protocol !== 'geniex') throw httpError(409, 'MTP is GenieX-only')
+      if (runtime.settings.protocol !== 'geniex') throw httpError(409, 'MTP is GenieX-only')
       const model = text(payload?.model)
-      if (!mtpModels.has(model) || !mtpFiles.has(model)) throw httpError(400, 'model has no MTP companion')
+      if (!runtime.mtpModels.has(model) || !runtime.mtpDrafts.has(model)) throw httpError(400, 'model has no MTP draft')
       if (payload?.allow === true) {
-        mtpApproved.add(model)
-        mtpSuppressed.delete(model)
+        runtime.mtpApproved.add(model)
+        runtime.mtpSuppressed.delete(model)
       } else {
-        mtpApproved.delete(model)
-        mtpSuppressed.add(model)
+        runtime.mtpApproved.delete(model)
+        runtime.mtpSuppressed.add(model)
       }
       return { ok: true }
     },
     setMode: async (payload) => {
-      const mode = ['off', 'auto'].includes(payload?.mode) ? payload.mode : null
+      const mode = SUPPORTED_MODES.includes(payload?.mode) ? payload.mode : null
       if (mode === null) throw httpError(400, 'invalid mode')
-      if (mode === settings.mode) return state()
-      const previous = settings.mode
-      settings.mode = mode
-      statusCache.at = 0
+      if (mode === runtime.settings.mode) return readState(ctx)
+      const previous = runtime.settings.mode
+      runtime.settings.mode = mode
+      runtime.statusCache.at = 0
+      invalidateState()
       try {
-        await syncProvider()
-        settings.lastError = null
+        await syncProvider(ctx)
+        runtime.settings.lastError = null
       } catch (error) {
-        settings.mode = previous
-        settings.lastError = String(error)
-        await persist()
-        throw httpError(500, String(error))
+        runtime.settings.mode = previous
+        runtime.settings.lastError = userError(error)
+        invalidateState()
+        await persistSettings()
+        throw httpError(500, userError(error))
       }
-      await persist()
-      return state()
+      await persistSettings()
+      return readState(ctx)
     },
     turnStats: async (payload) => {
       const sessionId = text(payload?.sessionId)
       const turn = Number(payload?.turn)
       if (sessionId === '' || !Number.isInteger(turn)) return null
       const key = `${sessionId}:${turn}`
-      const cached = turnMetrics.get(key)
+      const cached = runtime.turnMetrics.get(key)
       if (cached !== undefined) return cached
       const session = ctx.sessions.get(sessionId)
       if (session === undefined) return null
       await deriveSessionMetrics(session)
-      return turnMetrics.get(key) ?? null
+      return runtime.turnMetrics.get(key) ?? null
     },
     sessionProvider: (payload) => {
       const sessionId = text(payload?.sessionId)
       if (sessionId === '') return { geniex: false, pending: false }
-      if (sessionProviders.get(sessionId) === true) return { geniex: true, pending: false }
+      if (runtime.sessionProviders.has(sessionId)) return { geniex: true, pending: false }
       const session = ctx.sessions.get(sessionId)
       if (session === undefined) return { geniex: false, pending: true }
-      if (!derivedSessions.has(sessionId)) {
+      if (!runtime.derivedSessions.has(sessionId)) {
         void deriveSessionMetrics(session).catch(() => {})
-        return { geniex: sessionProviders.get(sessionId) === true, pending: true }
+        return { geniex: runtime.sessionProviders.has(sessionId), pending: true }
       }
-      return { geniex: sessionProviders.get(sessionId) === true, pending: false }
+      return { geniex: runtime.sessionProviders.has(sessionId), pending: false }
     },
     clientError: async (payload) => {
-      const message = text(payload?.message)
-      const stack = text(payload?.stack)
+      const message = text(payload?.message).slice(0, 4096)
+      const stack = text(payload?.stack).slice(0, 16384)
       if (message === '' && stack === '') return { recorded: false }
-      const line = `${new Date().toISOString()} ${message}\n${stack}\n`
+      const path = join(runtime.profileDir, CLIENT_ERROR_LOG)
       try {
-        await appendFile(join(profileDir, 'qwen-client-errors.log'), line, 'utf8')
+        let size = 0
+        try {
+          size = (await stat(path)).size
+        } catch {
+          size = 0
+        }
+        if (size > CLIENT_ERROR_LOG_LIMIT) await writeFile(path, '', 'utf8')
+        await appendFile(path, `${new Date().toISOString()} ${message}\n${stack}\n`, 'utf8')
       } catch {
         // Diagnostics must never break the settings page.
       }
       return { recorded: true }
     },
-    permissionLabel: async (payload) => {
-      const locale = text(payload?.locale).toLowerCase()
-      const name = locale.startsWith('en') ? 'Reply Only' : '仅回复'
-      const entry = ctx.configEditor.entries().find((candidate) => {
-        return candidate.options.id === 'permission' || candidate.options.id?.endsWith(':permission')
-      })
-      if (entry === undefined) return { updated: false, name }
-      await ctx.configEditor.edit(entry, (current, inherited) => {
-        const config = { ...(inherited ?? {}), ...(current ?? {}) }
-        const presets = {
-          'read-only': { sandbox: 'read-only', approval: 'ask' },
-          'workspace-write': { sandbox: 'workspace-write', approval: 'ask' },
-          'danger-full-access': { sandbox: 'danger-full-access', approval: 'never' },
-          ...((inherited ?? {}).presets ?? {}),
-          ...((current ?? {}).presets ?? {}),
-        }
-        const reply = presets['reply-only'] ?? {
-          sandbox: 'read-only',
-          approval: 'never',
-          description: '禁止工具调用，仅进行纯文本对话。',
-        }
-        if (presets['reply-only']?.name === name && Object.keys(presets)[0] === 'reply-only') return config
-        const next = { 'reply-only': { ...reply, name, description: '禁止工具调用，仅进行纯文本对话。' } }
-        for (const [key, value] of Object.entries(presets)) {
-          if (key !== 'reply-only') next[key] = value
-        }
-        return { ...config, presets: next }
-      })
-      return { updated: true, name }
-    },
+    permissionLabel: async (payload) => ensureReplyOnlyPreset(ctx, text(payload?.locale).toLowerCase()),
     warm: (payload) => {
-      const generation = ++warmGeneration
+      const generation = ++runtime.warmGeneration
       const operation = async () => {
-        if (generation !== warmGeneration) return { warmed: false, skipped: true }
+        if (generation !== runtime.warmGeneration) return { warmed: false, skipped: true }
+        const settings = runtime.settings
         if (settings.protocol !== 'geniex') throw httpError(409, 'model warmup is GenieX-only')
         if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
         const model = text(payload?.model)
-        if (model === '' || !managedModels.has(model)) throw httpError(400, 'unknown managed model')
-        if (settings.autoNctx && !modelContexts.has(model)) {
-          await refreshManagedModels()
-          if (!managedModels.has(model)) throw httpError(400, 'unknown managed model')
-        } else if (settings.mtp && !modelCapabilities.has(model)) {
-          await refreshManagedModels()
-          if (!managedModels.has(model)) throw httpError(400, 'unknown managed model')
+        if (model === '' || !runtime.managedModels.has(model)) throw httpError(400, 'unknown managed model')
+        if (runtime.warmingModels.has(model)) return { warmed: false, model, skipped: true }
+        if (!runtime.modelCapabilities.has(model)) {
+          await refreshManagedModels(ctx, true)
+          if (!runtime.managedModels.has(model)) throw httpError(400, 'unknown managed model')
         }
-        warmingModels.add(model)
-        statusCache.at = 0
+        runtime.warmingModels.add(model)
+        runtime.statusCache.at = 0
         try {
-          const result = await warmUpModel(
-            ctx,
-            settings,
-            model,
-            visionModels.has(model),
-            modelLoadContext(model),
-            useMtp(model),
-            mtpFileFor(model),
-          )
+          const result = await warmUpModel(ctx, settings, model, {
+            vision: runtime.visionModels.has(model),
+            context: modelLoadContext(model),
+            mtp: useMtp(model),
+            mtpDraft: mtpDraftFor(model),
+          })
           return { warmed: true, model, ...result }
         } finally {
-          warmingModels.delete(model)
-          statusCache.at = 0
+          runtime.warmingModels.delete(model)
+          runtime.statusCache.at = 0
         }
       }
-      const result = warmQueue.then(operation, operation)
-      warmQueue = result.catch(() => {})
+      const result = runtime.warmQueue.then(operation, operation)
+      runtime.warmQueue = result.then(() => undefined, () => undefined)
       return result
     },
     save: async (payload) => {
-      const mode = ['off', 'auto', 'always'].includes(payload?.mode) ? payload.mode : settings.mode
+      const mode = [...SUPPORTED_MODES, 'always'].includes(payload?.mode) ? payload.mode : runtime.settings.mode
       if (typeof payload?.upstream === 'string') assertUpstream(payload.upstream)
-      const previous = settings
+      if (typeof payload?.apiKeyEnv === 'string') assertApiKeyRef(payload.apiKeyEnv)
+      const previous = runtime.settings
       const next = normalizeSettings({
-        ...settings,
+        ...previous,
         ...payload,
         mode,
-        proxyPort: settings.proxyPort,
+        proxyPort: previous.proxyPort,
       })
       const providerChanged = ['protocol', 'upstream', 'apiKeyEnv', 'contextWindow', 'maxOutputTokens', 'autoNctx']
         .some((key) => next[key] !== previous[key])
       const providerRemoval = next.mode === 'off' && next.managedProviderId !== null
-      const requiresSync = next.mode !== previous.mode || providerChanged || providerRemoval
+      const requiresSync = next.mode !== previous.mode
+        || providerChanged
+        || providerRemoval
+        || (next.mode === 'auto' && next.managedProviderId === null)
       const loadChanged = requiresSync
         || next.contextWindow !== previous.contextWindow
         || next.autoNctx !== previous.autoNctx
@@ -1785,69 +1349,155 @@ export async function apply(ctx) {
         || next.mtpDraftPMin !== previous.mtpDraftPMin
         || next.compute !== previous.compute
         || next.vitCompute !== previous.vitCompute
-      const revisionBefore = modelRevision
-      settings = next
+      const revisionBefore = runtime.modelRevision
+      runtime.settings = next
       invalidateState()
-      statusCache.at = 0
-      if (next.mtp && !previous.mtp && managedModels.size > 0) {
-        capabilityRetryAt = 0
-        for (const id of managedModels) modelMetadataCache.delete(`${settings.upstream}|${id}`)
-        const entries = await mapLimit([...managedModels], 4, async (id) => {
-          return [id, await readModelMetadata(settings, id, true)]
-        })
-        applyCapabilities(new Map(entries))
-      }
+      runtime.statusCache.at = 0
       try {
-        if (requiresSync) await syncProvider()
-        settings.lastError = null
+        if (requiresSync) await syncProvider(ctx)
+        runtime.settings.lastError = null
       } catch (error) {
-        settings.lastError = String(error)
+        runtime.settings.lastError = userError(error)
       }
-      if (loadChanged && modelRevision === revisionBefore) modelRevision += 1
-      await persist()
-      return state()
+      if (loadChanged && runtime.modelRevision === revisionBefore) runtime.modelRevision += 1
+      await persistSettings()
+      return readState(ctx)
     },
     apply: async () => {
       try {
-        for (const id of managedModels) modelMetadataCache.delete(`${settings.upstream}|${id}`)
-        await syncProvider()
-        settings.lastError = null
+        runtimeCapabilities(ctx).invalidate(runtime.settings.upstream)
+        runtime.capabilityRetryAt = 0
+        await syncProvider(ctx)
+        runtime.settings.lastError = null
       } catch (error) {
-        settings.lastError = String(error)
+        runtime.settings.lastError = userError(error)
       }
-      await persist()
-      return state()
+      await persistSettings()
+      return readState(ctx)
     },
     remove: async () => {
       invalidateState()
       try {
-        await deleteProvider(ctx, settings)
-        settings.managedProviderId = null
-        managedModels.clear()
-        visionModels.clear()
-        applyCapabilities()
-        modelRevision += 1
-        settings.lastError = null
+        await providerTask(async () => {
+          await deleteProvider(ctx, runtime.settings.managedProviderId)
+          runtime.settings.managedProviderId = null
+        })
+        runtime.advertisedModels = []
+        applyManagedProvider(null)
+        if (applyCapabilities(new Map())) runtime.modelRevision += 1
+        runtime.settings.lastError = null
       } catch (error) {
-        settings.lastError = String(error)
+        runtime.settings.lastError = userError(error)
       }
-      await persist()
-      return state()
+      await persistSettings()
+      return readState(ctx)
     },
   }
+  return api
+}
 
-  let mutationQueue = Promise.resolve()
-  const mutate = (operation) => {
-    const result = mutationQueue.then(operation, operation)
-    mutationQueue = result.catch(() => {})
-    return result
+/** Serialize settings writes. */
+function persistSettings() {
+  const run = async () => {
+    const settings = runtime.settings
+    await mkdir(runtime.profileDir, { recursive: true })
+    const payload = { ...settings }
+    delete payload.lastError
+    const body = `${JSON.stringify(payload, null, 2)}\n`
+    const temporary = `${runtime.storePath}.${process.pid}.${Date.now()}.tmp`
+    await writeFile(temporary, body, 'utf8')
+    try {
+      await rename(temporary, runtime.storePath)
+    } catch {
+      await writeFile(runtime.storePath, body, 'utf8')
+      try {
+        await unlink(temporary)
+      } catch {
+        // A leftover temporary file is harmless.
+      }
+    }
   }
-  for (const method of ['setMode', 'save', 'apply', 'remove', 'permissionLabel']) {
-    const operation = api[method]
-    api[method] = (payload) => mutate(() => operation(payload))
-  }
+  const next = persistChain.then(run, run)
+  persistChain = next.then(() => undefined, () => undefined)
+  return next
+}
 
-  ctx.effect(() => ctx.webServer.register({
+/** Bind the loopback proxy, sliding to the next port when one is taken. */
+async function startProxy() {
+  const server = http.createServer((req, res) => handleProxyRequest(req, res))
+  const preferred = runtime.settings.proxyPort
+  let bound = null
+  for (let offset = 0; offset <= PROXY_PORT_ATTEMPTS; offset += 1) {
+    const port = preferred + offset
+    if (port <= 0 || port > 65535) break
+    try {
+      await new Promise((resolve, reject) => {
+        const onError = (error) => {
+          server.off('listening', onListening)
+          reject(error)
+        }
+        const onListening = () => {
+          server.off('error', onError)
+          resolve()
+        }
+        server.once('error', onError)
+        server.once('listening', onListening)
+        server.listen(port, '127.0.0.1')
+      })
+      bound = port
+      break
+    } catch (error) {
+      if (error?.code !== 'EADDRINUSE' && error?.code !== 'EACCES') {
+        runtime.logger.warn(`[${SCOPE}] cannot bind proxy on ${port}: ${userError(error)}`)
+        break
+      }
+    }
+  }
+  if (bound === null) {
+    runtime.bindError = `Cannot bind the Qwen mode proxy near port ${preferred}`
+    invalidateState()
+    return null
+  }
+  runtime.bindError = null
+  if (runtime.settings.proxyPort !== bound) {
+    runtime.settings.proxyPort = bound
+    invalidateState()
+    await persistSettings().catch(() => {})
+  }
+  return server
+}
+
+/** Keep the settings page and tool guard wired to the reply-only preset. */
+function applyReplyOnly(ctx, agent) {
+  const session = ctx.sessions.get(agent.id)
+  if (session === undefined) return
+  let reply = false
+  try {
+    reply = ctx.permissionPresets.current(session) === REPLY_ONLY_KEY
+  } catch {
+    return
+  }
+  const active = runtime.replyRestrictions.get(agent.id)
+  if (!reply) {
+    if (active !== undefined) {
+      active()
+      runtime.replyRestrictions.delete(agent.id)
+    }
+    return
+  }
+  if (active !== undefined) return
+  try {
+    const scoped = agent.ctx
+    if (scoped?.tools?.restrict !== undefined) {
+      runtime.replyRestrictions.set(agent.id, scoped.tools.restrict({ allow: [] }))
+    }
+  } catch (error) {
+    runtime.logger.warn(`[${SCOPE}] cannot hide tools for reply-only session: ${userError(error)}`)
+  }
+}
+
+function registerWebApi(ctx, api) {
+  return ctx.webServer.register({
     kind: 'prefix',
     path: API_PREFIX,
     handler: async (req, res) => {
@@ -1863,13 +1513,78 @@ export async function apply(ctx) {
       const method = pathname.startsWith(`${API_PREFIX}/`) ? pathname.slice(API_PREFIX.length + 1) : ''
       try {
         if (method === '' || !Object.hasOwn(api, method)) throw httpError(404, 'unknown method')
-        const payload = await readJson(req)
+        const payload = await readJson(req, MAX_API_BODY)
         sendJson(res, 200, { ok: true, value: await api[method](payload) })
       } catch (error) {
-        sendJson(res, error?.status ?? 500, { ok: false, error: { message: error instanceof Error ? error.message : String(error) } })
+        sendJson(res, error?.status ?? 500, { ok: false, error: { message: userError(error) } })
       }
     },
-  }), `${SCOPE}: settings API`)
+  })
+}
+
+/** Serialize mutating API calls so settings writes cannot interleave. */
+function serializeMutations(api) {
+  let queue = Promise.resolve()
+  for (const method of ['setMode', 'save', 'apply', 'remove', 'permissionLabel']) {
+    const operation = api[method]
+    api[method] = (payload) => {
+      const run = queue.then(() => operation(payload), () => operation(payload))
+      queue = run.then(() => undefined, () => undefined)
+      return run
+    }
+  }
+}
+
+export async function apply(ctx) {
+  runtime = createRuntime()
+  const instance = runtime
+  providerChain = Promise.resolve()
+  persistChain = Promise.resolve()
+  runtime.logger = loggerFor(ctx, SCOPE)
+  runtime.profileDir = text(process.env.DSH_PROFILE_DIR) || process.cwd()
+  runtime.storePath = join(runtime.profileDir, STORE_FILE)
+
+  let loaded = normalizeSettings({})
+  try {
+    loaded = normalizeSettings(JSON.parse(await readFile(runtime.storePath, 'utf8')))
+  } catch (error) {
+    if (error?.code !== 'ENOENT') runtime.logger.warn(`[${SCOPE}] cannot read settings: ${userError(error)}`)
+  }
+  runtime.settings = loaded
+  runtime.settings.lastError = null
+  await persistSettings().catch((error) => runtime.logger.warn(`[${SCOPE}] cannot save settings: ${userError(error)}`))
+
+  applyManagedProvider(readManagedProvider(ctx, runtime.settings).provider)
+  const api = createApi(ctx)
+  serializeMutations(api)
+
+  ctx.effect(() => registerWebApi(ctx, api), `${SCOPE}: settings API`)
+
+  ctx.effect(() => ctx.on('session/event', (session, event) => {
+    const turn = event.data?.turn
+    const step = event.data?.step
+    if (!Number.isInteger(turn) || !Number.isInteger(step)) return
+    const key = `${session.id}:${turn}:${step}`
+    if (event.type === 'step/start') {
+      runtime.stepStarts.set(key, event.time)
+      trimMap(runtime.stepStarts, 2000)
+      return
+    }
+    if (event.type === 'assistant/attempt') {
+      const first = streamFirstTokenTime(event.data.stream)
+      if (first !== undefined) runtime.firstTokens.set(key, first)
+      trimMap(runtime.firstTokens, 2000)
+      return
+    }
+    if (event.type !== 'assistant/message') return
+    const first = runtime.firstTokens.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
+    const start = runtime.stepStarts.get(key) ?? first
+    runtime.stepStarts.delete(key)
+    runtime.firstTokens.delete(key)
+    const metric = buildTurnMetric(event, first, start)
+    if (metric === null) return
+    recordTurn(session.id, turn, metric)
+  }), `${SCOPE}: turn metrics`)
 
   ctx.effect(() => ctx.tools.guard((execution) => {
     const agent = execution.agent
@@ -1877,7 +1592,7 @@ export async function apply(ctx) {
     const session = ctx.sessions.get(agent.id)
     if (session === undefined) return undefined
     try {
-      return ctx.permissionPresets.current(session) === 'reply-only'
+      return ctx.permissionPresets.current(session) === REPLY_ONLY_KEY
         ? 'Reply-only mode: tool calls are disabled'
         : undefined
     } catch {
@@ -1885,90 +1600,53 @@ export async function apply(ctx) {
     }
   }), `${SCOPE}: reply-only tool guard`)
 
-  const replyRestrictions = new Map()
-  const applyReplyOnly = (agent) => {
-    const session = ctx.sessions.get(agent.id)
-    if (session === undefined) return
-    let reply = false
-    try {
-      reply = ctx.permissionPresets.current(session) === 'reply-only'
-    } catch {
-      return
-    }
-    const active = replyRestrictions.get(agent.id)
-    if (!reply) {
-      if (active !== undefined) {
-        active()
-        replyRestrictions.delete(agent.id)
-      }
-      return
-    }
-    if (active !== undefined) return
-    try {
-      const scoped = agent.ctx
-      if (scoped?.tools?.restrict !== undefined) {
-        replyRestrictions.set(agent.id, scoped.tools.restrict({ allow: [] }))
-      }
-    } catch (error) {
-      logger.warn(`[${SCOPE}] cannot hide tools for reply-only session: ${String(error)}`)
-    }
-  }
-
-  ctx.effect(() => ctx.on('agent/created', ({ agent }) => applyReplyOnly(agent)), `${SCOPE}: reply-only agent setup`)
+  ctx.effect(() => ctx.on('agent/created', ({ agent }) => applyReplyOnly(ctx, agent)), `${SCOPE}: reply-only agent setup`)
   ctx.effect(() => ctx.on('session/event', (session, event) => {
     if (event.type !== 'permission/preset' && event.type !== 'sandbox/mode' && event.type !== 'approval/policy') return
     queueMicrotask(() => {
       const agent = ctx.agents.get(session.id)
-      if (agent !== undefined) applyReplyOnly(agent)
+      if (agent !== undefined) applyReplyOnly(ctx, agent)
     })
   }), `${SCOPE}: reply-only permission changes`)
   ctx.effect(() => () => {
-    for (const dispose of replyRestrictions.values()) dispose()
-    replyRestrictions.clear()
+    for (const dispose of instance.replyRestrictions.values()) dispose()
+    instance.replyRestrictions.clear()
   }, `${SCOPE}: reply-only restrictions`)
-  for (const agent of ctx.agents.list()) applyReplyOnly(agent)
-  try {
-    ctx.emit('permission-presets/catalog-changed')
-  } catch {
-    // The permission catalog refresh is best-effort.
+  for (const agent of ctx.agents.list()) applyReplyOnly(ctx, agent)
+
+  const server = await startProxy()
+  if (server !== null) {
+    ctx.effect(() => () => new Promise((resolve) => {
+      server.close(() => resolve())
+      server.closeAllConnections?.()
+    }), `${SCOPE}: proxy server`)
   }
 
-  const server = http.createServer((req, res) => forward(
-    req,
-    res,
-    settings,
-    logger,
-    ownsModel,
-    (model) => visionModels.has(model),
-    modelLoadContext,
-    useMtp,
-    canMtp,
-    mtpApprovedFor,
-    mtpFileFor,
-    consumeMtpChoice,
-    recordMtpUsage,
-  ))
-  for (let attempt = 0; ; attempt += 1) {
+  // Provider discovery talks to the upstream, so it must never delay activation:
+  // a stopped GenieX would otherwise stall the plugin (and its settings page)
+  // for the full discovery timeout.
+  const startupSync = async (attempt = 0) => {
+    if (runtime !== instance) return
     try {
-      await new Promise((resolve, reject) => {
-        server.once('error', reject)
-        server.listen(settings.proxyPort, '127.0.0.1', resolve)
-      })
-      break
+      await refreshManagedModels(ctx, true)
+      await syncProvider(ctx)
+      if (runtime !== instance) return
+      runtime.settings.lastError = null
+      invalidateState()
+      await persistSettings()
     } catch (error) {
-      if (error?.code !== 'EADDRINUSE' || attempt >= 4) throw error
-      await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)))
+      if (runtime !== instance) return
+      runtime.settings.lastError = userError(error)
+      invalidateState()
+      runtime.logger.warn(`[${SCOPE}] cannot refresh managed provider: ${userError(error)}`)
+      if (attempt < 2 && userError(error).includes('llm-pi-ai entry not found')) {
+        instance.startupTimer = setTimeout(() => { void startupSync(attempt + 1) }, 2000)
+      }
     }
   }
-  ctx.effect(() => () => new Promise((resolve) => {
-    server.close(() => resolve())
-    server.closeAllConnections?.()
-  }), `${SCOPE}: proxy server`)
+  void startupSync()
 
-  const labelTimer = setTimeout(() => {
-    void api.permissionLabel({ locale: 'zh' }).catch((error) => {
-      logger.warn(`[${SCOPE}] cannot ensure reply-only permission preset: ${String(error)}`)
-    })
-  }, 1500)
-  ctx.effect(() => () => clearTimeout(labelTimer), `${SCOPE}: permission preset bootstrap`)
+  ctx.effect(() => () => {
+    if (instance.startupTimer !== null) clearTimeout(instance.startupTimer)
+  }, `${SCOPE}: startup timer`)
 }
