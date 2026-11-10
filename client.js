@@ -63,7 +63,7 @@ window.__ModuleLoader__.load({
       'compute.label': 'Compute',
       'compute.placeholder': '由 GenieX 决定',
       'vit.label': 'Vision Encoder',
-      'vit.default': '默认',
+      'vit.default': '由 GenieX 决定',
       'vit.cpu': 'CPU',
       'vit.gpu': 'GPU',
       'vit.npu': 'NPU',
@@ -147,7 +147,7 @@ window.__ModuleLoader__.load({
       'compute.label': 'Compute',
       'compute.placeholder': 'Determined by GenieX',
       'vit.label': 'Vision Encoder',
-      'vit.default': 'Default',
+      'vit.default': 'Determined by GenieX',
       'vit.cpu': 'CPU',
       'vit.gpu': 'GPU',
       'vit.npu': 'NPU',
@@ -1026,7 +1026,7 @@ window.__ModuleLoader__.load({
       title: { margin: 0, fontSize: '20px', lineHeight: 1.25, fontWeight: 600 },
       subtitle: { color: 'var(--dsw-alias-label-secondary)', fontSize: '12px', marginTop: '4px', lineHeight: 1.5 },
       modeGroup: { display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '5px', flex: '0 0 auto' },
-      segments: { display: 'inline-flex', padding: '2px', gap: '2px', borderRadius: '8px', border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-1)' },
+      segments: { display: 'inline-flex', flexWrap: 'wrap', maxWidth: '100%', boxSizing: 'border-box', padding: '2px', gap: '2px', borderRadius: '8px', border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-1)' },
       segment: { border: 'none', background: 'transparent', color: 'var(--dsw-alias-label-secondary)', borderRadius: '6px', padding: '5px 9px', fontSize: '11px', cursor: 'pointer', whiteSpace: 'nowrap' },
       segmentActive: { border: 'none', background: 'var(--dsw-alias-brand-primary)', color: 'var(--dsw-alias-label-primary-inverted)', borderRadius: '6px', padding: '5px 9px', fontSize: '11px', cursor: 'pointer', whiteSpace: 'nowrap' },
       modelLabel: { display: 'inline-flex', alignItems: 'center', gap: '4px', minWidth: 0, maxWidth: '100%', height: '20px', verticalAlign: 'middle' },
@@ -1937,7 +1937,7 @@ window.__ModuleLoader__.load({
             h('div', { key: 'divider-inference', style: S.divider }),
             h('div', { key: 'inference', style: S.configSection }, [
               h('div', { key: 'heading', style: { ...S.configHeading, marginTop: '6px' } }, t('inference.title')),
-              h('div', { key: 'grid', style: S.grid }, [
+              h('div', { key: 'grid', style: { ...S.grid, gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))' } }, [
                 h(Field, { key: 'compute', label: t('compute.label') }, h('input', {
                   key: 'input',
                   style: S.input,
