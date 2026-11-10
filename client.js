@@ -68,7 +68,6 @@ window.__ModuleLoader__.load({
       'mtp.cancel': '取消',
       'sampling.title': '采样默认值',
       'sampling.hint': '仅在请求未携带该字段时填充；留空则不注入。',
-      'sampling.recommend': '元数据推荐',
       'sampling.fill': '读取推荐值',
       'sampling.none': '当前没有带推荐采样值的模型',
       'temperature.label': 'temperature',
@@ -142,7 +141,6 @@ window.__ModuleLoader__.load({
       'mtp.cancel': 'Cancel',
       'sampling.title': 'Sampling Defaults',
       'sampling.hint': 'Filled only when the request does not already carry the field; empty omits it.',
-      'sampling.recommend': 'Metadata recommendation',
       'sampling.fill': 'Read recommended',
       'sampling.none': 'No model currently exposes recommended sampling',
       'temperature.label': 'temperature',
@@ -519,7 +517,7 @@ window.__ModuleLoader__.load({
         name,
         marquee: placement === 'option',
         color: abliterated
-          ? darkTheme ? '#FFFF00' : 'var(--dsw-alias-state-warn-primary)'
+          ? darkTheme ? '#FFC94D' : 'var(--dsw-alias-state-warn-primary)'
           : undefined,
       })
       const parts = placement === 'trigger'
@@ -1336,7 +1334,7 @@ window.__ModuleLoader__.load({
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
             ]),
-            samplingEntries.length === 0 ? h('div', { key: 'recommend-none', style: S.hint }, t('sampling.none')) : h('div', { key: 'recommend-row', style: S.row }, [
+            samplingEntries.length === 0 ? h('div', { key: 'recommend-none', style: { ...S.hint, marginTop: '3px' } }, t('sampling.none')) : h('div', { key: 'recommend-row', style: { ...S.row, marginTop: '3px' } }, [
               h('select', {
                 key: 'recommend-select',
                 style: { ...S.select, maxWidth: '320px' },
@@ -1504,18 +1502,3 @@ window.__ModuleLoader__.load({
     }
   },
 })
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

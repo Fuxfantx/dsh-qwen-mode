@@ -529,6 +529,11 @@ function applyRequestDefaults(body, settings, vision = false, context = null, mt
   }
   if (settings.protocol === 'geniex') delete output.nctx
   Object.assign(output, loadFields(settings, context, mtp, mtpFile))
+  if (settings.protocol === 'geniex' && typeof context === 'number' && context > 0) {
+    for (const key of ['max_completion_tokens', 'max_tokens']) {
+      if (typeof output[key] === 'number' && output[key] > context) output[key] = context
+    }
+  }
   const fill = (key, value) => {
     if (value !== null && output[key] === undefined) output[key] = value
   }
@@ -868,7 +873,7 @@ function bodyHasImages(body) {
   })
 }
 
-function forward(req, res, settings, logger, ownsModel, isVision, modelContext, useMtp, canMtp, mtpApprovedFor, mtpFileFor, consumeMtpChoice, onUsageFor) {
+function forward(req, res, settings, logger, ownsModel, isVision, modelLoadContext, useMtp, canMtp, mtpApprovedFor, mtpFileFor, consumeMtpChoice, onUsageFor) {
   let upstreamUrl
   try {
     const requestUrl = new URL(req.url ?? '/', 'http://qwen.invalid')
@@ -922,7 +927,7 @@ function forward(req, res, settings, logger, ownsModel, isVision, modelContext, 
             parsed,
             settings,
             vision,
-            modelContext(model),
+            modelLoadContext(model),
             mtp,
             mtpFileFor(model),
           )), 'utf8')
@@ -1341,9 +1346,11 @@ export async function apply(ctx) {
     applyCapabilities(new Map(entries))
   }
   await refreshManagedModels()
-  const modelContext = (model) => {
-    if (!settings.autoNctx) return null
-    const context = modelContexts.get(model) ?? settings.contextWindow
+  const modelLoadContext = (model) => {
+    const contextual = settings.autoNctx
+      ? modelContexts.get(model) ?? settings.contextWindow
+      : settings.contextWindow
+    const context = contextual ?? settings.maxOutputTokens
     return typeof context === 'number' && context > 0 ? context : null
   }
   const canMtp = (model) => {
@@ -1638,7 +1645,7 @@ export async function apply(ctx) {
           settings,
           model,
           visionModels.has(model),
-          modelContext(model),
+          modelLoadContext(model),
           useMtp(model),
           mtpFileFor(model),
         )
@@ -1825,7 +1832,7 @@ export async function apply(ctx) {
     logger,
     ownsModel,
     (model) => visionModels.has(model),
-    modelContext,
+    modelLoadContext,
     useMtp,
     canMtp,
     mtpApprovedFor,
