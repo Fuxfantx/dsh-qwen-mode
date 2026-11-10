@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Qwen mode",
-    "description": "Maintains Qwen / GenieX providers through a local OpenAI-compatible proxy, normalizes thinking parameters, and adds model limits, warmup, MTP, and stats."
+    "description": "Connect DSH to Qwen, GenieX, and QwenCloud with automatic provider management plus thinking, sampling, warmup, MTP, and usage views."
   }
 }

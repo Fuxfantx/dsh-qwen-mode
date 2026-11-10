@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Qwen 模式",
-    "description": "通过本地 OpenAI 兼容代理维护 Qwen / GenieX Provider，规范化思考参数，并在设置面板提供模型限制、预热、MTP 与统计选项。"
+    "description": "在 DSH 中接入 Qwen、GenieX 与 QwenCloud，自动维护 Provider，并提供思考模式、采样、预热、MTP 与用量统计。"
   }
 }

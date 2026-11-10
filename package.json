@@ -1,12 +1,9 @@
 {
   "name": "dsh-qwen-mode",
-  "version": "1.7.5",
-  "description": "Qwen mode for DSH: managed Qwen/GenieX/QwenCloud providers, thinking normalization, local model capabilities, warmup, MTP and per-turn stats through a loopback OpenAI-compatible proxy.",
+  "version": "1.8.0",
+  "description": "Qwen mode for DSH: managed Qwen/GenieX/QwenCloud providers, thinking normalization, local model capabilities, warmup, MTP and per-turn stats.",
   "type": "module",
   "main": "index.js",
-  "scripts": {
-    "test": "node --test"
-  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -21,6 +18,7 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
+    "INSTALL.md",
     "LICENSE"
   ],
   "engines": {
