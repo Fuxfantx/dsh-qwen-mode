@@ -1937,7 +1937,7 @@ window.__ModuleLoader__.load({
             h('div', { key: 'divider-inference', style: S.divider }),
             h('div', { key: 'inference', style: S.configSection }, [
               h('div', { key: 'heading', style: { ...S.configHeading, marginTop: '6px' } }, t('inference.title')),
-              h('div', { key: 'grid', style: { ...S.grid, gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))' } }, [
+              h('div', { key: 'grid', style: { ...S.grid, gridTemplateColumns: 'repeat(2, minmax(0, 1fr))' } }, [
                 h(Field, { key: 'compute', label: t('compute.label') }, h('input', {
                   key: 'input',
                   style: S.input,
