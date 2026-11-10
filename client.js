@@ -54,6 +54,7 @@ window.__ModuleLoader__.load({
       'provider.baseURL': 'baseURL',
       'provider.exists': '已创建',
       'provider.missing': '未创建',
+      'provider.syncing': '同步中…',
       'provider.rebuild': '重建 Provider',
       'provider.remove': '移除 Provider',
       'provider.modelsFound': '自 /models 处发现 {count} 个模型：{models}',
@@ -136,6 +137,7 @@ window.__ModuleLoader__.load({
       'provider.baseURL': 'baseURL',
       'provider.exists': 'Created',
       'provider.missing': 'Missing',
+      'provider.syncing': 'Syncing…',
       'provider.rebuild': 'Rebuild provider',
       'provider.remove': 'Remove provider',
       'provider.modelsFound': 'Found {count} models from /models: {models}',
@@ -1418,6 +1420,37 @@ window.__ModuleLoader__.load({
         setError(format(tRef.current('loadFailed'), { message: String(lastError?.message ?? lastError) }))
       }, [refreshModelInfo])
 
+      const syncFollow = React.useRef(0)
+      const followPendingSync = React.useCallback(async () => {
+        const token = ++syncFollow.current
+        for (let attempt = 0; attempt < 120; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 500))
+          if (syncFollow.current !== token) return
+          let next
+          try {
+            next = await call('state', undefined, { signal: AbortSignal.timeout(5000) })
+          } catch {
+            return
+          }
+          if (syncFollow.current !== token) return
+          stateStore.generation += 1
+          stateStore.value = next
+          setSettings(next)
+          if (next?.pendingSync !== true) {
+            void refreshModelInfo(next?.protocol)
+            void modelMetaState.refresh()
+            void warmState.refresh()
+            return
+          }
+        }
+      }, [refreshModelInfo])
+      React.useEffect(() => () => {
+        syncFollow.current += 1
+      }, [])
+      React.useEffect(() => {
+        if (settings?.pendingSync === true) void followPendingSync()
+      }, [settings?.pendingSync, followPendingSync])
+
       React.useEffect(() => {
         void load()
       }, [load])
@@ -1640,7 +1673,9 @@ window.__ModuleLoader__.load({
         h('div', { key: 'provider', style: S.card }, [
           h('div', { key: 'header', style: S.cardHeader }, [
             h('span', { key: 'title', style: S.cardTitle }, t('provider.title')),
-            h('span', { key: 'badge', style: providerExists ? S.badgeOn : S.badge }, providerExists ? t('provider.exists') : t('provider.missing')),
+            settings.pendingSync === true && settings.mode === 'auto'
+              ? h('span', { key: 'badge', style: S.badge }, t('provider.syncing'))
+              : h('span', { key: 'badge', style: providerExists ? S.badgeOn : S.badge }, providerExists ? t('provider.exists') : t('provider.missing')),
           ]),
           h('div', { key: 'divider', style: S.divider }),
           h('div', { key: 'grid', style: S.grid }, [
@@ -1655,14 +1690,14 @@ window.__ModuleLoader__.load({
               key: 'rebuild',
               type: 'button',
               style: S.button,
-              disabled: busy !== '' || mode === 'off',
+              disabled: busy !== '' || mode === 'off' || settings.pendingSync === true,
               onClick: () => void action('apply', () => call('apply', undefined, { signal: AbortSignal.timeout(30000) })),
             }, t('provider.rebuild')),
             providerExists ? h('button', {
               key: 'remove',
               type: 'button',
               style: S.button,
-              disabled: busy !== '',
+              disabled: busy !== '' || settings.pendingSync === true,
               onClick: () => void action('remove', () => call('remove', undefined, { signal: AbortSignal.timeout(30000) })),
             }, t('provider.remove')) : null,
           ]),

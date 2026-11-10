@@ -52,6 +52,7 @@
 - **模型高亮**：破限 / 无审查模型使用明亮橙黄色名称。
 - **会话用量**：含 From GenieX 回复的会话只显示累计 token；点击后显示输入与输出。
 - **仅回复**：隐藏并拒绝工具调用。
+- **模式开关**：切换会立即保存并返回；Provider 的创建/删除在后台完成，卡片显示「同步中…」，完成后自动刷新。上游拥塞时代理仍可用。
 
 ### 限制
 
@@ -113,6 +114,7 @@ Connect DSH to Qwen, GenieX, and QwenCloud. Qwen Mode maintains the provider aut
 - **Model highlight**: abliterated / uncensored models use a bright orange-yellow name.
 - **Session usage**: sessions containing From GenieX replies show cumulative tokens only; click to see input and output.
 - **Reply Only**: hides and denies tools.
+- **Mode switch**: toggling saves and answers immediately; provider creation/removal runs in the background, the card shows **Syncing…**, and the view refreshes when it settles.
 
 ### Limitations
 

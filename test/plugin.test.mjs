@@ -77,14 +77,17 @@ for (const directory of [qairtDir, qairtAssistantDir]) {
 
 const upstreamRequests = []
 const qwenRequests = []
+let modelsGate = null
+let releaseModels = null
 
 function geniexUpstream() {
   const server = http.createServer((req, res) => {
     const chunks = []
     req.on('data', (chunk) => chunks.push(chunk))
-    req.on('end', () => {
+    req.on('end', async () => {
       upstreamRequests.push({ url: req.url, headers: req.headers, body: Buffer.concat(chunks).toString('utf8') })
       if (req.url === '/v1/models') {
+        if (modelsGate !== null) await modelsGate
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({
           object: 'list',
@@ -501,6 +504,63 @@ try {
     assert.equal(permission.updated, false)
   })
 
+  // ---- Toggle responsiveness -------------------------------------------
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const waitForSync = async () => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const current = (await callApi(ctx, 'state')).body.value
+      if (current.pendingSync !== true) return current
+      await sleep(100)
+    }
+    return (await callApi(ctx, 'state')).body.value
+  }
+
+  const offStarted = Date.now()
+  const offState = (await callApi(ctx, 'setMode', { mode: 'off' })).body.value
+  check('mode off answers immediately and removes the provider', () => {
+    assert.ok(Date.now() - offStarted < 2000, 'mode off waited too long')
+    assert.equal(offState.mode, 'off')
+    assert.equal(ctx.config.providers['from-geniex'], undefined)
+  })
+
+  modelsGate = new Promise((resolve) => { releaseModels = resolve })
+  const onStarted = Date.now()
+  const onState = (await callApi(ctx, 'setMode', { mode: 'auto' })).body.value
+  const onElapsed = Date.now() - onStarted
+  check('mode on answers before discovery finishes', () => {
+    assert.ok(onElapsed < 2000, `mode on took ${onElapsed}ms`)
+    assert.equal(onState.mode, 'auto')
+    assert.equal(onState.pendingSync, true)
+  })
+  releaseModels()
+  modelsGate = null
+  releaseModels = null
+  const settled = await waitForSync()
+  check('the background sync finishes and creates the provider', () => {
+    assert.equal(settled.pendingSync, false)
+    assert.equal(settled.provider.exists, true)
+    assert.ok(ctx.config.providers['from-geniex'] !== undefined)
+  })
+
+  modelsGate = new Promise((resolve) => { releaseModels = resolve })
+  await callApi(ctx, 'setMode', { mode: 'off' })
+  const racing = (await callApi(ctx, 'setMode', { mode: 'auto' })).body.value
+  const offWhileDiscovering = (await callApi(ctx, 'setMode', { mode: 'off' })).body.value
+  check('switching off during discovery answers immediately', () => {
+    assert.equal(racing.mode, 'auto')
+    assert.equal(offWhileDiscovering.mode, 'off')
+    assert.equal(ctx.config.providers['from-geniex'], undefined)
+  })
+  releaseModels()
+  modelsGate = null
+  releaseModels = null
+  const afterRace = await waitForSync()
+  check('an in-flight discovery cannot resurrect the provider after off', () => {
+    assert.equal(afterRace.mode, 'off')
+    assert.equal(afterRace.pendingSync, false)
+    assert.equal(ctx.config.providers['from-geniex'], undefined)
+  })
+
   // ---- QwenCloud --------------------------------------------------------
   const switched = (await callApi(ctx, 'save', {
     mode: 'auto',
@@ -593,6 +653,7 @@ try {
     }
   }
 } finally {
+  releaseModels?.()
   await new Promise((resolve) => upstream.close(() => resolve()))
   await new Promise((resolve) => qwen.close(() => resolve()))
   process.env.PATH = savedEnv.PATH

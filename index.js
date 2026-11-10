@@ -497,13 +497,24 @@ async function upsertProvider(ctx, settings) {
     },
     models,
   }
-  const previous = settings.managedProviderId
+  // Commit only if the settings that asked for this provider are still current.
+  // A mode switch to Off runs its delete immediately, and this guard keeps a
+  // slow in-flight discovery from resurrecting the provider afterwards.
+  let committed = false
   await editProviders(ctx, (providers) => {
+    if (runtime.settings.mode !== 'auto'
+      || runtime.settings.protocol !== settings.protocol
+      || runtime.settings.upstream !== settings.upstream) return
+    const previous = runtime.settings.managedProviderId
     if (previous !== null && previous !== id) delete providers[previous]
     providers[id] = desired
+    committed = true
   })
-  settings.managedProviderId = id
-  settings.lastError = null
+  if (!committed) return null
+  if (runtime.settings.mode === 'auto') {
+    runtime.settings.managedProviderId = id
+    runtime.settings.lastError = null
+  }
   try {
     ctx.emit('llm/models-updated', id)
     ctx.emit('llm/adapters-updated')
@@ -579,6 +590,7 @@ function createRuntime() {
     capabilityRetryAt: 0,
     managedRefresh: null,
     managedRefreshKey: '',
+    pendingSync: 0,
     stateCache: null,
     statusCache: { key: '', at: 0, value: null },
     turnMetrics: new Map(),
@@ -714,7 +726,9 @@ function providerTask(operation) {
 
 /** Rebuild or remove the managed provider for the current settings. */
 function syncProvider(ctx) {
-  return providerTask(async () => {
+  runtime.pendingSync += 1
+  invalidateState()
+  const run = providerTask(async () => {
     invalidateState()
     const settings = runtime.settings
     if (settings.mode === 'off') {
@@ -728,10 +742,19 @@ function syncProvider(ctx) {
       return
     }
     const provider = await upsertProvider(ctx, settings)
+    if (provider === null) return
+    // The mode may have changed while the provider table was being written.
+    if (runtime.settings.mode !== 'auto'
+      || runtime.settings.protocol !== settings.protocol
+      || runtime.settings.upstream !== settings.upstream) return
     runtime.qairtDrafts = provider.qairtDrafts ?? new Map()
-    runtime.qairtDraftsKey = `${settings.protocol}|${settings.upstream}`
+    runtime.qairtDraftsKey = `${runtime.settings.protocol}|${runtime.settings.upstream}`
     applyManagedProvider(provider)
     if (applyCapabilities(provider.capabilities)) runtime.modelRevision += 1
+    invalidateState()
+  })
+  return run.finally(() => {
+    runtime.pendingSync -= 1
     invalidateState()
   })
 }
@@ -1173,6 +1196,7 @@ function readState(ctx) {
   runtime.stateCache = {
     ...settings,
     lastError: runtime.bindError ?? settings.lastError,
+    pendingSync: runtime.pendingSync > 0,
     proxyBaseURL: proxyBaseURL(settings.proxyPort),
     ...readManagedProvider(ctx, settings),
   }
@@ -1246,16 +1270,38 @@ function createApi(ctx) {
       runtime.statusCache.at = 0
       invalidateState()
       try {
-        await syncProvider(ctx)
-        runtime.settings.lastError = null
+        await persistSettings()
       } catch (error) {
         runtime.settings.mode = previous
         runtime.settings.lastError = userError(error)
         invalidateState()
-        await persistSettings()
         throw httpError(500, userError(error))
       }
-      await persistSettings()
+      if (mode === 'off') {
+        // Removal is local config work; do not sit behind a slow discovery.
+        // An in-flight discovery sees the new mode at commit time and skips.
+        try {
+          await deleteProvider(ctx, runtime.settings.managedProviderId)
+          runtime.settings.managedProviderId = null
+          runtime.qairtDrafts = new Map()
+          runtime.qairtDraftsKey = ''
+          applyManagedProvider(null)
+          if (applyCapabilities(new Map())) runtime.modelRevision += 1
+          runtime.settings.lastError = null
+        } catch (error) {
+          runtime.settings.lastError = userError(error)
+        }
+        invalidateState()
+        await persistSettings().catch(() => {})
+        return readState(ctx)
+      }
+      // Turning on needs upstream discovery, which can take seconds (or time
+      // out) on a congested link. Persist and answer first, then build the
+      // provider in the background; `pendingSync` lets the page follow it.
+      void syncProvider(ctx).catch((error) => {
+        runtime.settings.lastError = userError(error)
+        invalidateState()
+      })
       return readState(ctx)
     },
     turnStats: async (payload) => {
