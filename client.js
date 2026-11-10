@@ -95,7 +95,7 @@ window.__ModuleLoader__.load({
       'loadFailed': '读取设置失败：{message}',
       'saveFailed': '操作失败：{message}',
       'numberInvalid': '{field} 需要是数字或留空',
-      'footer.hint': '保存设置；修改来源、上下文或输出上限时自动重建 Provider 与模型目录。',
+      'footer.hint': '修改来源、上下文或输出上限时，Provider 与模型目录会自动重建。',
       'stats.ttft': 'TTFT: {value}',
       'stats.tps': '{value} tok/s',
       'stats.ms': '{value} ms',
@@ -174,7 +174,7 @@ window.__ModuleLoader__.load({
       'loadFailed': 'Cannot read settings: {message}',
       'saveFailed': 'Action failed: {message}',
       'numberInvalid': '{field} must be a number or empty',
-      'footer.hint': 'Saving persists settings; changing the source, context, or output limit rebuilds the provider and model catalog.',
+      'footer.hint': 'The provider and model catalog rebuild automatically when the source, context, or output limit changes.',
       'stats.ttft': 'TTFT: {value}',
       'stats.tps': '{value} tok/s',
       'stats.ms': '{value} ms',
@@ -208,6 +208,24 @@ window.__ModuleLoader__.load({
       const body = await response.json().catch(() => undefined)
       if (!response.ok || body?.ok !== true) throw new Error(body?.error?.message ?? `HTTP ${response.status}`)
       return body.value
+    }
+
+    const stateStore = {
+      value: null,
+      pending: null,
+    }
+    async function readState() {
+      if (stateStore.pending !== null) return stateStore.pending
+      const pending = call('state', undefined, { signal: AbortSignal.timeout(15000) })
+        .then((next) => {
+          stateStore.value = next
+          return next
+        })
+        .finally(() => {
+          if (stateStore.pending === pending) stateStore.pending = null
+        })
+      stateStore.pending = pending
+      return pending
     }
 
     const warmState = {
@@ -1234,7 +1252,7 @@ window.__ModuleLoader__.load({
     preheat.ready = (async () => {
       for (let attempt = 0; attempt < 3; attempt += 1) {
         try {
-          const next = await call('state', undefined, { signal: AbortSignal.timeout(10000) })
+          const next = await readState()
           preheat.setEnabled(next?.mode === 'auto' && next?.warm === true)
           return
         } catch {
@@ -1283,7 +1301,7 @@ window.__ModuleLoader__.load({
       const t = typeof props.t === 'function' ? props.t : (key) => key
       const tRef = React.useRef(t)
       tRef.current = t
-      const [settings, setSettings] = React.useState(null)
+      const [settings, setSettings] = React.useState(() => stateStore.value)
       const [modelInfo, setModelInfo] = React.useState(null)
       const [samplingModel, setSamplingModel] = React.useState('')
       const [error, setError] = React.useState('')
@@ -1305,7 +1323,7 @@ window.__ModuleLoader__.load({
         let lastError
         for (let attempt = 0; attempt < 2; attempt += 1) {
           try {
-            const next = await call('state', undefined, { signal: AbortSignal.timeout(15000) })
+            const next = await readState()
             setSettings(next)
             setError('')
             if (next.protocol === 'geniex') void refreshModelInfo('geniex')
@@ -1315,6 +1333,11 @@ window.__ModuleLoader__.load({
             lastError = reason
             if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 400))
           }
+        }
+        if (stateStore.value !== null) {
+          setSettings(stateStore.value)
+          setError('')
+          return
         }
         setError(format(tRef.current('loadFailed'), { message: String(lastError?.message ?? lastError) }))
       }, [refreshModelInfo])
@@ -1345,6 +1368,7 @@ window.__ModuleLoader__.load({
         try {
           const next = await operation()
           if (next !== undefined) {
+            stateStore.value = next
             setSettings(next)
             void refreshModelInfo(next.protocol)
             void modelMetaState.refresh()
@@ -1363,7 +1387,7 @@ window.__ModuleLoader__.load({
         update('mode', value)
         void action('mode', async () => {
           try {
-            return await call('setMode', { mode: value })
+            return await call('setMode', { mode: value }, { signal: AbortSignal.timeout(15000) })
           } catch (reason) {
             update('mode', previous)
             throw reason
@@ -1421,7 +1445,7 @@ window.__ModuleLoader__.load({
             vitCompute: settings.vitCompute ?? 'npu',
           })
         }
-        void action('save', () => call('save', payload))
+        void action('save', () => call('save', payload, { signal: AbortSignal.timeout(30000) }))
       }
 
       const samplingEntries = Object.entries(modelInfo?.models ?? {})
@@ -1514,14 +1538,14 @@ window.__ModuleLoader__.load({
               type: 'button',
               style: S.button,
               disabled: busy !== '' || mode === 'off',
-              onClick: () => void action('apply', () => call('apply')),
+              onClick: () => void action('apply', () => call('apply', undefined, { signal: AbortSignal.timeout(30000) })),
             }, t('provider.rebuild')),
             providerExists ? h('button', {
               key: 'remove',
               type: 'button',
               style: S.button,
               disabled: busy !== '',
-              onClick: () => void action('remove', () => call('remove')),
+              onClick: () => void action('remove', () => call('remove', undefined, { signal: AbortSignal.timeout(30000) })),
             }, t('provider.remove')) : null,
           ]),
         ]),
