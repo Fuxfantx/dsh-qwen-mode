@@ -10,8 +10,11 @@ const home = join(root, 'home')
 const cacheRoot = join(home, '.cache', 'geniex', 'models')
 const modelDir = join(cacheRoot, 'org', 'qwen3.8-27b')
 const draftDir = join(cacheRoot, 'org', 'qwen3.8-27b-assistant')
-await mkdir(modelDir, { recursive: true })
-await mkdir(draftDir, { recursive: true })
+const qairtDir = join(cacheRoot, 'qnn', 'qwen3-8b')
+const qairtAssistantDir = join(cacheRoot, 'qnn', 'qwen3-8b-assistant')
+for (const directory of [modelDir, draftDir, qairtDir, qairtAssistantDir]) {
+  await mkdir(directory, { recursive: true })
+}
 
 // Isolate the GenieX CLI lookup (none on PATH) and the cache fallback.
 const emptyPath = join(root, 'bin')
@@ -36,21 +39,27 @@ function str(value) {
   const body = Buffer.from(value, 'utf8')
   return Buffer.concat([u64(body.length), body])
 }
-function gguf({ context, template, name }) {
+function gguf({ context, template, name, mtp = false }) {
   const entries = [
     Buffer.concat([str('general.architecture'), u32(8), str('qwen3')]),
     Buffer.concat([str('general.name'), u32(8), str(name)]),
     Buffer.concat([str('qwen3.context_length'), u32(4), u32(context)]),
     Buffer.concat([str('tokenizer.chat_template'), u32(8), str(template)]),
   ]
-  return Buffer.concat([Buffer.from('GGUF', 'ascii'), u32(3), u64(0), u64(entries.length), ...entries])
+  const tensors = mtp
+    ? [Buffer.concat([str('blk.0.nextn.eh_proj.weight'), u32(1), u64(16), u32(0), u64(0)])]
+    : []
+  return Buffer.concat([Buffer.from('GGUF', 'ascii'), u32(3), u64(tensors.length), u64(entries.length), ...entries, ...tensors])
 }
 
 await writeFile(join(modelDir, 'model.gguf'), gguf({
   context: 40960,
   template: '{% if reasoning_effort %}"low" "high"{% endif %}',
   name: 'Qwen3.8-27B',
+  mtp: true,
 }))
+await writeFile(join(modelDir, 'mtp-Q4_0.gguf'), Buffer.from('draft weights placeholder'))
+const sidecarPath = join(modelDir, 'mtp-Q4_0.gguf')
 await writeFile(join(modelDir, 'geniex.json'), JSON.stringify({
   ModelType: 'vlm',
   PluginId: 'llama_cpp',
@@ -62,6 +71,9 @@ await writeFile(join(draftDir, 'geniex.json'), JSON.stringify({
   PluginId: 'llama_cpp',
   ModelFile: { Q4_0: { Name: 'draft.gguf', Downloaded: true } },
 }))
+for (const directory of [qairtDir, qairtAssistantDir]) {
+  await writeFile(join(directory, 'geniex.json'), JSON.stringify({ ModelType: 'llm', PluginId: 'qairt' }))
+}
 
 const upstreamRequests = []
 const qwenRequests = []
@@ -76,7 +88,12 @@ function geniexUpstream() {
         res.writeHead(200, { 'content-type': 'application/json' })
         res.end(JSON.stringify({
           object: 'list',
-          data: [{ id: 'org/qwen3.8-27b:Q4_0' }, { id: 'org/qwen3.8-27b-assistant:Q4_0' }],
+          data: [
+            { id: 'org/qwen3.8-27b:Q4_0' },
+            { id: 'org/qwen3.8-27b-assistant:Q4_0' },
+            { id: 'qnn/qwen3-8b' },
+            { id: 'qnn/qwen3-8b-assistant' },
+          ],
         }))
         return
       }
@@ -320,15 +337,20 @@ try {
   const port = state.proxyPort
 
   const provider = ctx.config['providers']['from-geniex']
-  check('provider has the chat model only', () => {
-    assert.deepEqual(provider.models.map((model) => model.id), ['org/qwen3.8-27b:Q4_0'])
+  const modelById = (id) => ctx.config['providers']['from-geniex']?.models.find((model) => model.id === id)
+  check('provider keeps GGUF chats and hides the paired QAIRT draft', () => {
+    assert.deepEqual(provider.models.map((model) => model.id), [
+      'org/qwen3.8-27b:Q4_0',
+      'org/qwen3.8-27b-assistant:Q4_0',
+      'qnn/qwen3-8b',
+    ])
     assert.equal(provider.baseURL, `http://127.0.0.1:${port}/v1`)
     assert.equal(provider.apiKeyEnv, 'local')
     assert.equal(provider.compat.thinkingFormat, 'qwen')
     assert.equal(provider.compat.maxTokensField, 'max_completion_tokens')
   })
   check('model metadata comes from the local cache', () => {
-    const model = provider.models[0]
+    const model = modelById('org/qwen3.8-27b:Q4_0')
     assert.equal(model.contextWindow, 40960)
     assert.equal(model.maxTokens, 4096)
     assert.deepEqual(model.input, ['text', 'image'])
@@ -337,7 +359,7 @@ try {
   check('a missing local credential is created for GenieX', () => {
     assert.equal(ctx.credentials.has('local'), true)
   })
-  const contextOf = () => ctx.config.providers['from-geniex'].models[0].contextWindow
+  const contextOf = () => modelById('org/qwen3.8-27b:Q4_0').contextWindow
   await callApi(ctx, 'save', { contextWindow: 8192 })
   check('an explicit context window overrides model metadata', () => {
     assert.equal(contextOf(), 8192)
@@ -360,16 +382,25 @@ try {
   })
 
   const info = (await callApi(ctx, 'modelInfo')).body.value
-  check('model info reports the paired MTP draft', () => {
+  check('GGUF MTP needs its tensors and an injected sidecar', () => {
     const entry = info.models['org/qwen3.8-27b:Q4_0']
     assert.equal(entry.vision, true)
     assert.equal(entry.mtpReady, true)
     assert.equal(entry.contextLength, 40960)
     assert.equal(entry.abliterated, false)
+    assert.equal(info.models['org/qwen3.8-27b-assistant:Q4_0'].mtpReady, false)
+  })
+  check('QAIRT MTP uses the paired assistant and stays hidden', () => {
+    assert.equal(info.models['qnn/qwen3-8b'].mtpReady, true)
+    assert.equal(info.models['qnn/qwen3-8b-assistant'], undefined)
   })
   check('state exposes the managed provider', () => {
     assert.equal(state.provider.exists, true)
-    assert.deepEqual(state.provider.models, ['org/qwen3.8-27b:Q4_0'])
+    assert.deepEqual(state.provider.models, [
+      'org/qwen3.8-27b:Q4_0',
+      'org/qwen3.8-27b-assistant:Q4_0',
+      'qnn/qwen3-8b',
+    ])
   })
 
   const media = [{ type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } }]
@@ -409,9 +440,9 @@ try {
     stream: false,
   })
   const mtpBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
-  check('approved MTP attaches the draft model', () => {
+  check('approved MTP attaches the injected sidecar path', () => {
     assert.equal(mtpBody.spec_type, 'draft-mtp')
-    assert.equal(mtpBody.spec_draft_model, 'org/qwen3.8-27b-assistant:Q4_0')
+    assert.equal(mtpBody.spec_draft_model, sidecarPath)
     assert.equal(mtpBody.spec_n_max, 3)
   })
   await callProxy(port, {
@@ -431,6 +462,16 @@ try {
   const textBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
   check('text-only requests keep MTP enabled', () => {
     assert.equal(textBody.spec_type, 'draft-mtp')
+  })
+  await callProxy(port, {
+    model: 'qnn/qwen3-8b',
+    messages: [{ role: 'user', content: 'qairt text' }],
+    stream: false,
+  })
+  const qairtBody = JSON.parse(upstreamRequests.filter((request) => request.url === '/v1/chat/completions').at(-1).body)
+  check('QAIRT MTP names the paired assistant model', () => {
+    assert.equal(qairtBody.spec_type, 'draft-mtp')
+    assert.equal(qairtBody.spec_draft_model, 'qnn/qwen3-8b-assistant')
   })
 
   const warm = (await callApi(ctx, 'warm', { model: 'org/qwen3.8-27b:Q4_0' })).body

@@ -17,7 +17,7 @@
 - 显示每轮模型名、TTFT、Decode TPS 与耗时。
 - 可选模型预热（使用 GenieX 原生预热请求，不产生 token），并用圆点显示驻留状态。
 - 从模型元数据读取推荐采样值。
-- 可选 MTP 投机解码；草稿模型可以是同目录 `mtp*.gguf`，也可以是 GenieX 文档中的独立 assistant 草稿模型（会自动配对并从聊天目录隐藏）。生效时显示接受率。
+- 可选 MTP 投机解码；GGUF 模型需要内含 mtp / nextn 张量并在模型目录注入 `mtp-*.gguf`，QAIRT 模型使用配对的 assistant 草稿模型。生效时显示接受率。
 - 破限 / 无审查模型名称高亮。
 - 可选「仅回复」权限（中英文名称/描述按界面语言同步，内容未变时不重写配置）。
 - 为 From GenieX 会话提供精简的累计 token 用量视图。
@@ -47,7 +47,7 @@
 - **API Key**：填写保存 Key 的**环境变量名或 DSH 凭据名**（如 `DASHSCOPE_API_KEY`），不是 Key 本身；GenieX 不校验，留空即可。
 - **预热**：选中 GenieX 模型时提前加载权重。圆点状态：黄色预热中、绿色已驻留、红色未驻留、蓝色其它 Provider。
 - **采样默认值**：可手动填写，也可用「读取推荐值」填入模型推荐参数；之后仍需保存。数值会按上游合法范围校验/收敛。`min_p` 仅对 GenieX 生效。
-- **MTP**：仅对支持的 GenieX 模型生效。草稿模型有两种来源：模型目录下的 `mtp*.gguf`，或与目标同名的 assistant 草稿模型（按名称配对）。图片模型启用 MTP 时，发送图片会要求选择直接发送或关闭本次 MTP。
+- **MTP**：仅对支持的 GenieX 模型生效。GGUF 模型需要模型主体包含 mtp / nextn 张量，并在模型目录注入 `mtp-*.gguf`；请求会以该文件的绝对路径作为草稿模型（等价于 `--draft-model C:\my\mtp-model.gguf`）。QAIRT 模型使用名称配对的 assistant 草稿模型（会从聊天目录隐藏）。图片模型启用 MTP 时，发送图片会要求选择直接发送或关闭本次 MTP。
 - **推理后端**：GenieX 可设置 Compute 与 Vision Encoder；留空使用上游默认值。
 - **模型高亮**：破限 / 无审查模型使用明亮橙黄色名称。
 - **会话用量**：含 From GenieX 回复的会话只显示累计 token；点击后显示输入与输出。
@@ -78,7 +78,7 @@ Connect DSH to Qwen, GenieX, and QwenCloud. Qwen Mode maintains the provider aut
 - Shows model name, TTFT, Decode TPS, and elapsed time per turn.
 - Optional model warmup through GenieX's native warm-up request (no token generation) with residency dots.
 - Reads recommended sampling values from model metadata.
-- Optional MTP speculative decoding; the draft is either a same-directory `mtp*.gguf` or GenieX's separate assistant draft model (paired automatically and hidden from the chat catalog). Shows the acceptance rate while active.
+- Optional MTP speculative decoding; GGUF models need their own mtp / nextn tensors plus an injected `mtp-*.gguf`, while QAIRT models use a paired assistant draft. Shows the acceptance rate while active.
 - Highlights abliterated / uncensored model names.
 - Optional **Reply Only** permission, with the preset label/description kept in sync with the UI language and no config rewrite when nothing changed.
 - Provides a compact cumulative token view for sessions containing From GenieX replies.
@@ -108,7 +108,7 @@ Connect DSH to Qwen, GenieX, and QwenCloud. Qwen Mode maintains the provider aut
 - **API key**: enter the **environment variable or DSH credential name** that stores the key (for example `DASHSCOPE_API_KEY`), not the key itself; GenieX ignores it.
 - **Warmup**: loads GenieX model weights when selected. Dots: yellow warming, green resident, red not resident, blue another provider.
 - **Sampling defaults**: enter values manually, or use **Read recommended** and then save. Values are validated/clamped to the upstream's accepted ranges. `min_p` applies to GenieX only.
-- **MTP**: available only on supported GenieX models. The draft comes either from an `mtp*.gguf` file in the model directory or from a paired assistant draft model. With an image model, an image send asks whether to send directly or disable MTP for that send.
+- **MTP**: available only on supported GenieX models. A GGUF model needs mtp / nextn tensors in the weights plus an injected `mtp-*.gguf` in the model directory; the request names that file's absolute path as the draft (equivalent to `--draft-model C:\my\mtp-model.gguf`). A QAIRT model uses a name-paired assistant draft, which is hidden from the chat catalog. With an image model, an image send asks whether to send directly or disable MTP for that send.
 - **Inference backend**: GenieX Compute and Vision Encoder; empty uses upstream defaults.
 - **Model highlight**: abliterated / uncensored models use a bright orange-yellow name.
 - **Session usage**: sessions containing From GenieX replies show cumulative tokens only; click to see input and output.

@@ -74,7 +74,7 @@ window.__ModuleLoader__.load({
       'autoNctx.sublabel': '( GGUF context_length )',
       'maxOutputTokens.label': '最大输出长度',
       'mtp.label': 'MTP 投机解码',
-      'mtp.hint': '仅对内含 mtp / nextn 张量、目录下存在 mtp-*.gguf 文件的 GGUF 模型生效；MTP 启用时暂不支持添加图片。',
+      'mtp.hint': 'GGUF 模型需内含 mtp / nextn 张量，并在模型目录注入 mtp-*.gguf；QAIRT 模型使用配对 assistant 草稿模型。MTP 启用时暂不支持添加图片。',
       'mtp.tokens': 'spec_n_max',
       'mtp.min': 'spec_n_min',
       'mtp.pmin': 'spec_p_min',
@@ -156,7 +156,7 @@ window.__ModuleLoader__.load({
       'autoNctx.sublabel': '( GGUF context_length )',
       'maxOutputTokens.label': 'Max output tokens',
       'mtp.label': 'MTP speculative decoding',
-      'mtp.hint': 'Applies only to GGUF models containing mtp / nextn tensors and an mtp-*.gguf file in the model directory; images are not supported while MTP is enabled.',
+      'mtp.hint': 'GGUF models need mtp / nextn tensors plus an injected mtp-*.gguf in the model directory; QAIRT models use a paired assistant draft model. Images are not supported while MTP is enabled.',
       'mtp.tokens': 'spec_n_max',
       'mtp.min': 'spec_n_min',
       'mtp.pmin': 'spec_p_min',
@@ -1765,14 +1765,23 @@ window.__ModuleLoader__.load({
               }, [
                 h('span', { key: 'threshold' }, `${t('compaction.dsh')}: ${formatTokens(compactionThreshold)}`),
                 h('span', { key: 'gate' }, `${t('compaction.gate')}: ${formatTokens(recommendedGate)}`),
-                compactionThreshold === null
-                  ? h('span', {
-                      key: 'unavailable',
-                      style: { maxWidth: '320px', color: 'var(--dsw-alias-state-warn-primary)' },
-                    }, t('compaction.unavailable'))
-                  : null,
               ]),
             ]),
+            // Keep the warning outside the metrics row: inside it, its width
+            // made the row wrap and the threshold lines drop below the checkbox.
+            compactionThreshold === null
+              ? h('div', {
+                  key: 'compaction-warning',
+                  style: {
+                    display: 'flex',
+                    justifyContent: 'flex-end',
+                    color: 'var(--dsw-alias-state-warn-primary)',
+                    fontSize: '11px',
+                    lineHeight: 1.5,
+                    textAlign: 'right',
+                  },
+                }, t('compaction.unavailable'))
+              : null,
           ]),
           h('div', { key: 'divider-sampling', style: S.divider }),
           h('div', { key: 'sampling', style: S.configSection }, [

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { parseGgufHeader, readGgufHeader, reasoningEffortsFromChatTemplate } from '../lib/gguf.js'
 import { createThinkState, feedReasoning, flushReasoning, rewriteChunk, rewriteMessage, transformSseEvent } from '../lib/reasoning.js'
-import { knownReasoningEfforts, looksLikeVisionModel, pairMtpDrafts } from '../lib/capabilities.js'
+import { knownReasoningEfforts, looksLikeVisionModel, pairAssistantDrafts, pairQairtDrafts } from '../lib/capabilities.js'
 import { isSafeRelativePath, splitModelId, shortModelName, trimMap } from '../lib/util.js'
 
 const results = []
@@ -228,18 +228,30 @@ test('SSE transform preserves malformed events', () => {
 
 // ---- capabilities ---------------------------------------------------------
 
-test('draft pairing follows GenieX assistant models', () => {
-  const pairs = pairMtpDrafts([
+test('assistant pairing is token based and assistant-only', () => {
+  const pairs = pairAssistantDrafts([
     'google/gemma-4-26B-A4B-it-qat-q4_0-gguf:Q4_0',
     'RachidAR/gemma-4-26B-A4B-it-qat-assistant-q4_0-gguf:Q4_0',
     'google/gemma-4-26B-A4B-it-qat-q4_0-gguf:Q8_0',
+    'org/qwen3-8b-mtp:Q4_0',
   ])
   assert.equal(pairs.get('RachidAR/gemma-4-26B-A4B-it-qat-assistant-q4_0-gguf:Q4_0'), 'google/gemma-4-26B-A4B-it-qat-q4_0-gguf:Q4_0')
   assert.equal(pairs.size, 1)
 })
 
 test('unrelated assistant-named models are not paired', () => {
-  assert.equal(pairMtpDrafts(['org/assistant-model:Q4_0', 'org/other-model:Q4_0']).size, 0)
+  assert.equal(pairAssistantDrafts(['org/assistant-model:Q4_0', 'org/other-model:Q4_0']).size, 0)
+})
+
+test('QAIRT pairing ignores GGUF and QAIRT-free targets', () => {
+  const capabilities = new Map([
+    ['qnn/qwen3-8b', { runtime: 'qairt' }],
+    ['qnn/qwen3-8b-assistant', { runtime: 'qairt' }],
+    ['org/qwen3-8b', { runtime: 'llama_cpp' }],
+    ['org/qwen3-8b-assistant', { runtime: 'llama_cpp' }],
+  ])
+  const pairs = pairQairtDrafts(['qnn/qwen3-8b', 'qnn/qwen3-8b-assistant', 'org/qwen3-8b', 'org/qwen3-8b-assistant'], capabilities)
+  assert.deepEqual([...pairs], [['qnn/qwen3-8b-assistant', 'qnn/qwen3-8b']])
 })
 
 test('known thinking families', () => {

@@ -15,7 +15,7 @@ import http from 'node:http'
 import https from 'node:https'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
-import { attachMtpDrafts, createCapabilityResolver } from './lib/capabilities.js'
+import { createCapabilityResolver, pairQairtDrafts } from './lib/capabilities.js'
 import { createThinkState, rewriteMessage, transformSseEvent } from './lib/reasoning.js'
 import {
   clampedNumber,
@@ -444,7 +444,7 @@ async function discoverModels(ctx, settings, capabilities) {
     const listed = await capabilities.listQwenModels(settings)
     if (listed.size > 0) {
       const models = [...listed].map(([id, capability]) => buildModelSpec(settings, id, capability))
-      return { models, capabilities: listed, advertised: [...listed.keys()] }
+      return { models, capabilities: listed, qairtDrafts: new Map() }
     }
   }
   const url = upstreamURL(settings, 'models')
@@ -459,22 +459,30 @@ async function discoverModels(ctx, settings, capabilities) {
   await mapLimit(ids, 4, async (id) => {
     resolved.set(id, await capabilities.resolve(settings, id))
   })
-  const drafts = attachMtpDrafts(ids, resolved)
+  // Only QAIRT models pair with a separately cached assistant companion; a
+  // GGUF model's draft is its own injected `mtp-*.gguf` file.
+  const qairtDrafts = pairQairtDrafts(ids, resolved)
+  for (const [draftId, targetId] of qairtDrafts) {
+    const target = resolved.get(targetId)
+    if (target === undefined || target === null) continue
+    resolved.set(targetId, { ...target, mtpDraft: draftId, mtpReady: true })
+  }
   const models = []
   const kept = new Map()
   for (const id of ids) {
-    if (drafts.has(id)) continue
+    // A paired assistant is a draft, not a chat model.
+    if (qairtDrafts.has(id)) continue
     const capability = resolved.get(id) ?? null
     models.push(buildModelSpec(settings, id, capability))
     kept.set(id, capability)
   }
-  return { models, capabilities: kept, advertised: ids }
+  return { models, capabilities: kept, qairtDrafts }
 }
 
 async function upsertProvider(ctx, settings) {
   const keyRef = apiKeyRef(settings)
   if (keyRef === 'local') await ensureLocalCredential(ctx)
-  const { models, capabilities, advertised } = await discoverModels(ctx, settings, runtimeCapabilities(ctx))
+  const { models, capabilities, qairtDrafts } = await discoverModels(ctx, settings, runtimeCapabilities(ctx))
   const id = providerIdFor(settings.protocol)
   const desired = {
     displayName: providerNameFor(settings.protocol),
@@ -509,7 +517,7 @@ async function upsertProvider(ctx, settings) {
     models: models.map((model) => model.id),
     visionModels: models.filter((model) => model.input.includes('image')).map((model) => model.id),
     capabilities,
-    advertised,
+    qairtDrafts,
     entries: models,
   }
 }
@@ -559,7 +567,8 @@ function createRuntime() {
     capabilities: null,
     managedModels: new Set(),
     visionModels: new Set(),
-    advertisedModels: [],
+    qairtDrafts: new Map(),
+    qairtDraftsKey: '',
     mtpModels: new Set(),
     mtpDrafts: new Map(),
     modelContexts: new Map(),
@@ -616,6 +625,15 @@ function applyManagedProvider(provider) {
 
 /** Rebuild the capability-derived sets; returns whether anything changed. */
 function applyCapabilities(capabilities) {
+  // QAIRT assistant pairs are discovered from the upstream catalog, so they are
+  // re-applied here; a refresh from local metadata must not lose them.
+  if (runtime.qairtDraftsKey === `${runtime.settings.protocol}|${runtime.settings.upstream}`) {
+    for (const [draftId, targetId] of runtime.qairtDrafts) {
+      const target = capabilities.get(targetId)
+      if (target === undefined || target === null) continue
+      capabilities.set(targetId, { ...target, mtpDraft: draftId, mtpReady: true })
+    }
+  }
   const signature = JSON.stringify([...capabilities]
     .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
     .map(([id, capability]) => [
@@ -625,6 +643,7 @@ function applyCapabilities(capabilities) {
       capability?.vision ?? null,
       capability?.reasoningEfforts ?? null,
       capability?.mtpDraft ?? null,
+      capability?.mtpReady ?? null,
       capability?.hasMtp ?? null,
       capability?.tags ?? null,
       capability?.sampling ?? null,
@@ -635,7 +654,7 @@ function applyCapabilities(capabilities) {
   runtime.modelCapabilities.clear()
   for (const [id, capability] of capabilities) {
     runtime.modelCapabilities.set(id, capability)
-    if (typeof capability?.mtpDraft === 'string' && capability.mtpDraft !== '') {
+    if (capability?.mtpReady === true && typeof capability?.mtpDraft === 'string' && capability.mtpDraft !== '') {
       runtime.mtpModels.add(id)
       runtime.mtpDrafts.set(id, capability.mtpDraft)
     }
@@ -656,11 +675,6 @@ function runtimeCapabilities(ctx) {
   return runtime.capabilities
 }
 
-/** The ids the upstream advertised; drafts stay addressable for pairing. */
-function advertisedModels(fallback) {
-  return runtime.advertisedModels.length > 0 ? runtime.advertisedModels : fallback
-}
-
 /** Resolve capabilities for every managed model and refresh both catalogs. */
 function refreshManagedModels(ctx, force = false) {
   const snapshot = { ...runtime.settings }
@@ -674,7 +688,6 @@ function refreshManagedModels(ctx, force = false) {
       await mapLimit(ids, 4, async (id) => {
         capabilities.set(id, await runtimeCapabilities(ctx).resolve(snapshot, id))
       })
-      attachMtpDrafts(advertisedModels(ids), capabilities)
     }
     const current = [runtime.settings.mode, runtime.settings.protocol, runtime.settings.upstream, runtime.settings.managedProviderId].join('|')
     if (current !== key) return
@@ -707,14 +720,16 @@ function syncProvider(ctx) {
     if (settings.mode === 'off') {
       await deleteProvider(ctx, settings.managedProviderId)
       settings.managedProviderId = null
-      runtime.advertisedModels = []
+      runtime.qairtDrafts = new Map()
+      runtime.qairtDraftsKey = ''
       applyManagedProvider(null)
       if (applyCapabilities(new Map())) runtime.modelRevision += 1
       invalidateState()
       return
     }
     const provider = await upsertProvider(ctx, settings)
-    runtime.advertisedModels = provider.advertised
+    runtime.qairtDrafts = provider.qairtDrafts ?? new Map()
+    runtime.qairtDraftsKey = `${settings.protocol}|${settings.upstream}`
     applyManagedProvider(provider)
     if (applyCapabilities(provider.capabilities)) runtime.modelRevision += 1
     invalidateState()
@@ -1180,7 +1195,6 @@ async function ensureCapabilities(ctx) {
     if (capability !== undefined) merged.set(id, capability)
   }
   for (const [id, capability] of entries) merged.set(id, capability)
-  attachMtpDrafts(advertisedModels([...runtime.managedModels]), merged)
   if (applyCapabilities(merged)) runtime.modelRevision += 1
 }
 
@@ -1199,7 +1213,7 @@ function createApi(ctx) {
           return [id, {
             abliterated: capability?.abliterated === true,
             hasMtp: capability?.hasMtp === true,
-            mtpReady: runtime.mtpModels.has(id) && runtime.mtpDrafts.has(id),
+            mtpReady: capability?.mtpReady === true && runtime.mtpDrafts.has(id),
             mtpEnabled: runtime.settings.mtp === true,
             vision: runtime.visionModels.has(id),
             contextLength: positiveIntOrNull(capability?.contextLength),
@@ -1382,7 +1396,8 @@ function createApi(ctx) {
           await deleteProvider(ctx, runtime.settings.managedProviderId)
           runtime.settings.managedProviderId = null
         })
-        runtime.advertisedModels = []
+        runtime.qairtDrafts = new Map()
+        runtime.qairtDraftsKey = ''
         applyManagedProvider(null)
         if (applyCapabilities(new Map())) runtime.modelRevision += 1
         runtime.settings.lastError = null
