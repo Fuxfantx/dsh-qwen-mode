@@ -1393,6 +1393,7 @@ export async function apply(ctx) {
   const stepStarts = new Map()
   const firstTokens = new Map()
   const derivedSessions = new Set()
+  const derivingSessions = new Set()
   const trimMap = (map, max) => {
     while (map.size > max) {
       const oldest = map.keys().next().value
@@ -1632,12 +1633,23 @@ export async function apply(ctx) {
     },
     sessionProvider: (payload) => {
       const sessionId = text(payload?.sessionId)
-      if (sessionId === '') return { geniex: false }
-      if (sessionProviders.get(sessionId) !== true) {
-        const session = ctx.sessions.get(sessionId)
-        if (session !== undefined) deriveSessionMetrics(session)
+      if (sessionId === '') return { geniex: false, pending: false }
+      if (sessionProviders.get(sessionId) === true) return { geniex: true, pending: false }
+      const session = ctx.sessions.get(sessionId)
+      if (session === undefined) return { geniex: false, pending: true }
+      if (!derivedSessions.has(sessionId) && !derivingSessions.has(sessionId)) {
+        derivingSessions.add(sessionId)
+        setTimeout(() => {
+          try {
+            deriveSessionMetrics(session)
+          } finally {
+            derivingSessions.delete(sessionId)
+          }
+        }, 0)
+        return { geniex: false, pending: true }
       }
-      return { geniex: sessionProviders.get(sessionId) === true }
+      if (!derivedSessions.has(sessionId)) return { geniex: false, pending: true }
+      return { geniex: sessionProviders.get(sessionId) === true, pending: false }
     },
     clientError: async (payload) => {
       const message = text(payload?.message)

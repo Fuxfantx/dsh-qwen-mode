@@ -636,8 +636,9 @@ window.__ModuleLoader__.load({
       if (value >= 1000) return `${Math.round(value / 1000)}K`
       return String(value)
     }
-    const QwenUsagePill = React.memo(function QwenUsagePill({ sessionId, useProjection, getLocale }) {
+    const QwenUsagePill = React.memo(function QwenUsagePill({ sessionId, useProjection, useChat, getLocale }) {
       const usage = useProjection('tokenUsage')
+      const nodeCount = useChat((state) => state.legacy.nodes.length)
       const [providerState, setProviderState] = React.useState(() => ({
         sessionId,
         geniex: sessionProviderCache.get(sessionId) === true,
@@ -662,20 +663,35 @@ window.__ModuleLoader__.load({
             : { sessionId, geniex: true })
           return undefined
         }
-        let alive = true
-        void call('sessionProvider', { sessionId }, { signal: AbortSignal.timeout(3000) }).then((value) => {
-          if (!alive) return
-          const geniex = value?.geniex === true
-          if (geniex) sessionProviderCache.set(sessionId, true)
-          if (sessionProviderCache.size > 500) sessionProviderCache.delete(sessionProviderCache.keys().next().value)
-          setProviderState((current) => current.sessionId === sessionId && current.geniex === geniex
-            ? current
-            : { sessionId, geniex })
-        }).catch(() => {})
-        return () => {
-          alive = false
+        let cancelled = false
+        let timer = null
+        let attempt = 0
+        const check = async () => {
+          try {
+            const value = await call('sessionProvider', { sessionId }, { signal: AbortSignal.timeout(3000) })
+            if (cancelled) return
+            const geniex = value?.geniex === true
+            if (geniex) sessionProviderCache.set(sessionId, true)
+            if (sessionProviderCache.size > 500) sessionProviderCache.delete(sessionProviderCache.keys().next().value)
+            setProviderState((current) => current.sessionId === sessionId && current.geniex === geniex
+              ? current
+              : { sessionId, geniex })
+            if (!geniex && value?.pending === true && attempt < 8) {
+              attempt += 1
+              timer = setTimeout(() => void check(), 300 * attempt)
+            }
+          } catch {
+            if (cancelled || attempt >= 2) return
+            attempt += 1
+            timer = setTimeout(() => void check(), 500 * attempt)
+          }
         }
-      }, [sessionId, signature])
+        void check()
+        return () => {
+          cancelled = true
+          if (timer !== null) clearTimeout(timer)
+        }
+      }, [sessionId, signature, nodeCount])
 
       React.useEffect(() => {
         if (!open) return undefined
