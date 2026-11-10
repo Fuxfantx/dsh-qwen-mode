@@ -503,7 +503,7 @@ window.__ModuleLoader__.load({
         key: 'name',
         name,
         marquee: placement === 'option',
-        color: abliterated ? '#FFC94D' : undefined,
+        color: abliterated ? '#FFBB44' : undefined,
       })
       const parts = placement === 'trigger'
         ? [...badges, nameNode]
@@ -1046,7 +1046,11 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState('')
       const [busy, setBusy] = React.useState('')
 
-      const refreshModelInfo = React.useCallback(async () => {
+      const refreshModelInfo = React.useCallback(async (protocol) => {
+        if (protocol !== 'geniex') {
+          setModelInfo({ revision: 0, models: {} })
+          return
+        }
         try {
           setModelInfo(await call('modelInfo', undefined, { signal: AbortSignal.timeout(10000) }))
         } catch {
@@ -1056,9 +1060,11 @@ window.__ModuleLoader__.load({
 
       const load = React.useCallback(async () => {
         try {
-          setSettings(await call('state', undefined, { signal: AbortSignal.timeout(15000) }))
+          const next = await call('state', undefined, { signal: AbortSignal.timeout(15000) })
+          setSettings(next)
           setError('')
-          void refreshModelInfo()
+          if (next.protocol === 'geniex') void refreshModelInfo('geniex')
+          else setModelInfo({ revision: 0, models: {} })
         } catch (reason) {
           setError(format(t('loadFailed'), { message: String(reason?.message ?? reason) }))
         }
@@ -1069,11 +1075,12 @@ window.__ModuleLoader__.load({
       }, [load])
 
       React.useEffect(() => {
+        if (settings?.protocol !== 'geniex') return undefined
         const hasModels = modelInfo !== null && Object.keys(modelInfo.models ?? {}).length > 0
         if (hasModels) return undefined
-        const timer = window.setInterval(() => void refreshModelInfo(), 3000)
+        const timer = window.setInterval(() => void refreshModelInfo('geniex'), 3000)
         return () => window.clearInterval(timer)
-      }, [modelInfo, refreshModelInfo])
+      }, [modelInfo, refreshModelInfo, settings?.protocol])
 
       React.useEffect(() => {
         preheat.enabled = settings?.mode === 'auto' && settings?.warm === true
@@ -1090,7 +1097,7 @@ window.__ModuleLoader__.load({
           const next = await operation()
           if (next !== undefined) {
             setSettings(next)
-            void refreshModelInfo()
+            void refreshModelInfo(settings?.protocol)
             void modelMetaState.refresh()
             void warmState.refresh()
           }
@@ -1151,15 +1158,15 @@ window.__ModuleLoader__.load({
         }
         const payload = {
           mode: settings.mode,
-          warm: settings.warm === true,
           protocol: settings.protocol,
           upstream: settings.upstream,
           apiKeyEnv: settings.apiKeyEnv,
-          autoNctx: settings.autoNctx === true,
           ...numeric,
         }
         if (settings.protocol === 'geniex') {
           Object.assign(payload, {
+            warm: settings.warm === true,
+            autoNctx: settings.autoNctx === true,
             mtp: settings.mtp === true,
             compute: String(settings.compute ?? '').trim(),
             vitCompute: settings.vitCompute ?? 'npu',
@@ -1278,7 +1285,7 @@ window.__ModuleLoader__.load({
                 placeholder: t('apiKeyEnv.placeholder'),
                 onChange: (event) => update('apiKeyEnv', event.target.value),
               })),
-              h('label', { key: 'warm', style: S.checkRow }, [
+              settings.protocol === 'geniex' ? h('label', { key: 'warm', style: S.checkRow }, [
                 h('input', {
                   key: 'checkbox',
                   type: 'checkbox',
@@ -1286,8 +1293,8 @@ window.__ModuleLoader__.load({
                   onChange: (event) => update('warm', event.target.checked),
                 }),
                 h('span', { key: 'label' }, t('warm.label')),
-              ]),
-              h('div', { key: 'warm-hint', style: S.hint }, t('warm.hint')),
+              ]) : null,
+              settings.protocol === 'geniex' ? h('div', { key: 'warm-hint', style: S.hint }, t('warm.hint')) : null,
             ]),
           ]),
         ]),
@@ -1310,7 +1317,7 @@ window.__ModuleLoader__.load({
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
             ]),
-            h('label', { key: 'auto-nctx', style: S.checkRow }, [
+            settings.protocol === 'geniex' ? h('label', { key: 'auto-nctx', style: S.checkRow }, [
               h('input', {
                 key: 'checkbox',
                 type: 'checkbox',
@@ -1318,7 +1325,7 @@ window.__ModuleLoader__.load({
                 onChange: (event) => update('autoNctx', event.target.checked),
               }),
               h('span', { key: 'label' }, t('autoNctx.label')),
-            ]),
+            ]) : null,
           ]),
           h('div', { key: 'divider-sampling', style: S.divider }),
           h('div', { key: 'sampling', style: S.configSection }, [

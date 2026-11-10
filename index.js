@@ -1011,15 +1011,16 @@ function buildModelSpec(id, settings, vision = false, reasoningEfforts, metadata
   const metadataContext = positiveIntOrNull(metadata?.contextLength)
   const contextWindow = settings.autoNctx
     ? metadataContext ?? settings.contextWindow
-    : settings.contextWindow ?? (settings.protocol === 'qwen' ? DEFAULTS.contextWindow : null)
+    : settings.contextWindow
+  const effectiveContext = contextWindow ?? (settings.protocol === 'qwen' ? DEFAULTS.contextWindow : settings.maxOutputTokens)
   const model = {
     id,
     name: shortName(id),
-    maxTokens: contextWindow === null ? settings.maxOutputTokens : Math.min(settings.maxOutputTokens, contextWindow),
+    maxTokens: Math.min(settings.maxOutputTokens, effectiveContext),
     reasoningEfforts: reasoningEfforts ?? known,
     input: vision ? ['text', 'image'] : ['text'],
   }
-  if (contextWindow !== null) model.contextWindow = contextWindow
+  model.contextWindow = effectiveContext
   return model
 }
 
@@ -1340,9 +1341,11 @@ export async function apply(ctx) {
     const provider = readManagedProvider(ctx, settings).provider
     for (const id of provider?.models ?? []) managedModels.add(id)
     for (const id of provider?.visionModels ?? []) visionModels.add(id)
-    const entries = await mapLimit([...managedModels], 4, async (id) => {
-      return [id, await readModelMetadata(settings, id)]
-    })
+    const entries = settings.protocol === 'geniex'
+      ? await mapLimit([...managedModels], 4, async (id) => {
+          return [id, await readModelMetadata(settings, id)]
+        })
+      : []
     applyCapabilities(new Map(entries))
   }
   await refreshManagedModels()
@@ -1480,6 +1483,14 @@ export async function apply(ctx) {
     modelRevision += 1
   }
 
+  try {
+    await syncProvider()
+    settings.lastError = null
+  } catch (error) {
+    settings.lastError = String(error)
+    logger.warn(`[${SCOPE}] cannot refresh managed provider: ${String(error)}`)
+  }
+
   const statusCache = { key: '', at: 0, value: null }
   const readGeniexStatus = async () => {
     const active = settings.mode === 'auto' && settings.protocol === 'geniex' && settings.warm === true
@@ -1526,6 +1537,7 @@ export async function apply(ctx) {
     state: () => state(),
     modelStatus: readGeniexStatus,
     modelInfo: async () => {
+      if (settings.protocol !== 'geniex') return { revision: modelRevision, models: {} }
       let capabilitiesChanged = false
       if (managedModels.size === 0) {
         await refreshManagedModels()
@@ -1565,6 +1577,7 @@ export async function apply(ctx) {
       }
     },
     mtpChoice: (payload) => {
+      if (settings.protocol !== 'geniex') throw httpError(409, 'MTP is GenieX-only')
       const model = text(payload?.model)
       if (!mtpModels.has(model) || !mtpFiles.has(model)) throw httpError(400, 'model has no MTP companion')
       if (payload?.allow === true) {
@@ -1639,9 +1652,14 @@ export async function apply(ctx) {
     },
     warm: (payload) => {
       const operation = async () => {
+        if (settings.protocol !== 'geniex') throw httpError(409, 'model warmup is GenieX-only')
         if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
         const model = text(payload?.model)
         if (model === '' || !managedModels.has(model)) throw httpError(400, 'unknown managed model')
+        if (settings.autoNctx && !modelContexts.has(model)) {
+          await refreshManagedModels()
+          if (!managedModels.has(model)) throw httpError(400, 'unknown managed model')
+        }
         warmingModels.add(model)
         statusCache.at = 0
         try {
@@ -1682,6 +1700,9 @@ export async function apply(ctx) {
       const providerRemoval = next.mode === 'off' && next.managedProviderId !== null
       const requiresSync = next.mode !== previous.mode || providerChanged || providerMissing || providerRemoval
       const loadChanged = requiresSync
+        || next.contextWindow !== previous.contextWindow
+        || next.autoNctx !== previous.autoNctx
+        || next.maxOutputTokens !== previous.maxOutputTokens
         || next.mtp !== previous.mtp
         || next.mtpDraftTokens !== previous.mtpDraftTokens
         || next.mtpDraftMin !== previous.mtpDraftMin
@@ -1848,11 +1869,22 @@ export async function apply(ctx) {
     consumeMtpChoice,
     recordMtpUsage,
   ))
-  await new Promise((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(settings.proxyPort, '127.0.0.1', resolve)
-  })
-  ctx.effect(() => () => new Promise((resolve) => server.close(() => resolve())), `${SCOPE}: proxy server`)
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await new Promise((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(settings.proxyPort, '127.0.0.1', resolve)
+      })
+      break
+    } catch (error) {
+      if (error?.code !== 'EADDRINUSE' || attempt >= 4) throw error
+      await new Promise((resolve) => setTimeout(resolve, 150 * (attempt + 1)))
+    }
+  }
+  ctx.effect(() => () => new Promise((resolve) => {
+    server.close(() => resolve())
+    server.closeAllConnections?.()
+  }), `${SCOPE}: proxy server`)
 
   const labelTimer = setTimeout(() => {
     void api.permissionLabel({ locale: 'zh' }).catch((error) => {
