@@ -341,30 +341,11 @@ window.__ModuleLoader__.load({
      * built-in name + badge, so render both; GenieX models gain a quantization
      * tag derived from their `:Q4_0` suffix.
      */
-    function ModelLabel({ provider, model, placement, selected, sessionId, getLocale, getTheme, subscribeTheme }) {
-      const [darkTheme, setDarkTheme] = React.useState(() => {
-        try {
-          return getTheme?.()?.active?.colorScheme !== 'light'
-        } catch {
-          return true
-        }
-      })
+    function ModelLabel({ provider, model, placement, selected, sessionId, getLocale }) {
       const [warmEnabled, setWarmEnabled] = React.useState(false)
       const [residentState, setResidentState] = React.useState('')
       const [warmRevision, setWarmRevision] = React.useState(warmState.revision)
       const [modelMeta, setModelMeta] = React.useState(null)
-      React.useEffect(() => {
-        if (typeof getTheme !== 'function' || typeof subscribeTheme !== 'function') return undefined
-        const read = () => {
-          try {
-            setDarkTheme(getTheme()?.active?.colorScheme !== 'light')
-          } catch {
-            // Keep the last known scheme.
-          }
-        }
-        read()
-        return subscribeTheme(read)
-      }, [getTheme, subscribeTheme])
       React.useEffect(() => {
         const update = () => {
           setWarmEnabled((current) => current === warmState.enabled ? current : warmState.enabled)
@@ -522,9 +503,7 @@ window.__ModuleLoader__.load({
         key: 'name',
         name,
         marquee: placement === 'option',
-        color: abliterated
-          ? darkTheme ? '#FFC94D' : 'var(--dsw-alias-state-warn-primary)'
-          : undefined,
+        color: abliterated ? '#FFC94D' : undefined,
       })
       const parts = placement === 'trigger'
         ? [...badges, nameNode]
@@ -1139,7 +1118,9 @@ window.__ModuleLoader__.load({
       const save = () => {
         if (settings === null) return
         const numeric = {}
-        for (const key of ['contextWindow', 'maxOutputTokens', 'temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty', 'mtpDraftTokens', 'mtpDraftMin', 'mtpDraftPMin']) {
+        const numericKeys = ['contextWindow', 'maxOutputTokens', 'temperature', 'topP', 'topK', 'minP', 'repetitionPenalty', 'presencePenalty', 'frequencyPenalty']
+        if (settings.protocol === 'geniex') numericKeys.push('mtpDraftTokens', 'mtpDraftMin', 'mtpDraftPMin')
+        for (const key of numericKeys) {
           const raw = settings[key]
           if (raw === null || raw === undefined || String(raw).trim() === '') {
             numeric[key] = null
@@ -1168,18 +1149,23 @@ window.__ModuleLoader__.load({
             return
           }
         }
-        void action('save', () => call('save', {
+        const payload = {
           mode: settings.mode,
           warm: settings.warm === true,
           protocol: settings.protocol,
           upstream: settings.upstream,
           apiKeyEnv: settings.apiKeyEnv,
           autoNctx: settings.autoNctx === true,
-          mtp: settings.mtp === true,
-          compute: settings.protocol === 'geniex' ? String(settings.compute ?? '').trim() : '',
-          vitCompute: settings.vitCompute ?? 'npu',
           ...numeric,
-        }))
+        }
+        if (settings.protocol === 'geniex') {
+          Object.assign(payload, {
+            mtp: settings.mtp === true,
+            compute: String(settings.compute ?? '').trim(),
+            vitCompute: settings.vitCompute ?? 'npu',
+          })
+        }
+        void action('save', () => call('save', payload))
       }
 
       const samplingEntries = Object.entries(modelInfo?.models ?? {})
@@ -1362,21 +1348,25 @@ window.__ModuleLoader__.load({
                 onChange: (event) => setNumber(key, event.target.value),
               }))),
             ]),
-            samplingEntries.length === 0 ? h('div', { key: 'recommend-none', style: { ...S.hint, marginTop: '3px' } }, t('sampling.none')) : h('div', { key: 'recommend-row', style: { ...S.row, marginTop: '3px' } }, [
-              h('select', {
-                key: 'recommend-select',
-                style: { ...S.select, maxWidth: '320px' },
-                value: selectedSamplingId,
-                onChange: (event) => setSamplingModel(event.target.value),
-              }, samplingEntries.map(([id]) => h('option', { key: id, value: id }, id))),
-              h('button', {
-                key: 'recommend-fill',
-                type: 'button',
-                style: S.button,
-                disabled: busy !== '' || selectedSampling === null,
-                onClick: fillRecommendedSampling,
-              }, t('sampling.fill')),
-            ]),
+            settings.protocol === 'geniex'
+              ? (samplingEntries.length === 0
+                  ? h('div', { key: 'recommend-none', style: { ...S.hint, marginTop: '3px' } }, t('sampling.none'))
+                  : h('div', { key: 'recommend-row', style: { ...S.row, marginTop: '3px' } }, [
+                      h('select', {
+                        key: 'recommend-select',
+                        style: { ...S.select, maxWidth: '320px' },
+                        value: selectedSamplingId,
+                        onChange: (event) => setSamplingModel(event.target.value),
+                      }, samplingEntries.map(([id]) => h('option', { key: id, value: id }, id))),
+                      h('button', {
+                        key: 'recommend-fill',
+                        type: 'button',
+                        style: S.button,
+                        disabled: busy !== '' || selectedSampling === null,
+                        onClick: fillRecommendedSampling,
+                      }, t('sampling.fill')),
+                    ]))
+              : null,
           ]),
           settings.protocol === 'geniex' ? h('div', { key: 'inference-wrap' }, [
             h('div', { key: 'divider-inference', style: S.divider }),
@@ -1441,7 +1431,7 @@ window.__ModuleLoader__.load({
     }
 
     return {
-      inject: ['slots', 'locale', 'theme'],
+      inject: ['slots', 'locale'],
       apply(ctx) {
         if (typeof document !== 'undefined') {
           const style = document.createElement('style')
@@ -1498,8 +1488,6 @@ window.__ModuleLoader__.load({
           name: 'conversation.input.model.label',
           inject: () => ({
             getLocale: () => ctx.locale.getLocale().active,
-            getTheme: () => ctx.theme.getTheme(),
-            subscribeTheme: (listener) => ctx.on('theme/change', listener),
           }),
         }, ModelLabel))
 
