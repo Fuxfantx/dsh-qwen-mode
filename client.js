@@ -17,6 +17,12 @@ window.__ModuleLoader__.load({
     } catch {
       // The fixed panel still renders inline when react-dom is unavailable.
     }
+    let primitives = null
+    try {
+      primitives = require('@deepseek-ai/dsh-client-ui-primitives')
+    } catch {
+      primitives = null
+    }
     const h = React.createElement
     const NS = 'qwenMode'
     const API = '/qwen-mode/api'
@@ -95,6 +101,11 @@ window.__ModuleLoader__.load({
       'stats.sec': '{value} s',
       'usage.input': '输入',
       'usage.output': '输出',
+      'usage.title': 'Token 用量',
+      'compaction.dsh': 'DSH 压缩阈值',
+      'compaction.gate': '推荐 bigGate',
+      'compaction.hint': '按当前上下文、输出预留与 65536 headroom 估算；修改上下文或最大输出后会即时更新。',
+      'compaction.invalid': '上下文不足以容纳输出预留与压缩 headroom',
     }
 
     const en = {
@@ -170,6 +181,11 @@ window.__ModuleLoader__.load({
       'stats.sec': '{value} s',
       'usage.input': 'Input',
       'usage.output': 'Output',
+      'usage.title': 'Token usage',
+      'compaction.dsh': 'DSH compaction threshold',
+      'compaction.gate': 'Recommended bigGate',
+      'compaction.hint': 'Estimated from the current context, output reservation, and 65536 headroom; updates as these fields change.',
+      'compaction.invalid': 'The context cannot fit the output reservation and compaction headroom',
     }
 
     function format(template, params) {
@@ -606,6 +622,15 @@ window.__ModuleLoader__.load({
 
     /** Whole-session token pill for sessions that contain From GenieX replies. */
     const sessionProviderCache = new Map()
+    const numberFormats = new Map()
+    const exactFormatter = (locale) => {
+      let formatter = numberFormats.get(locale)
+      if (formatter === undefined) {
+        formatter = new Intl.NumberFormat(locale)
+        numberFormats.set(locale, formatter)
+      }
+      return formatter
+    }
     const formatCompactTokens = (value) => {
       if (value >= 1000000) return `${(value / 1000000).toFixed(1).replace(/\.0$/u, '')}M`
       if (value >= 1000) return `${Math.round(value / 1000)}K`
@@ -661,17 +686,18 @@ window.__ModuleLoader__.load({
         const onKey = (event) => {
           if (event.key === 'Escape') setOpen(false)
         }
-        document.addEventListener('pointerdown', close, true)
+        document.addEventListener('click', close, true)
         document.addEventListener('keydown', onKey)
         return () => {
-          document.removeEventListener('pointerdown', close, true)
+          document.removeEventListener('click', close, true)
           document.removeEventListener('keydown', onKey)
         }
       }, [open])
 
       if (providerState.sessionId !== sessionId || !providerState.geniex || total <= 0) return null
       const locale = String(getLocale?.() ?? 'zh')
-      const exact = new Intl.NumberFormat(locale)
+      const exact = exactFormatter(locale)
+      const titleText = locale.startsWith('zh') ? 'Token 用量' : 'Token usage'
       const toggle = () => {
         if (open) {
           setOpen(false)
@@ -685,35 +711,53 @@ window.__ModuleLoader__.load({
         })
         setOpen(true)
       }
-      const row = (label, value) => h('div', {
-        key: label,
-        style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '24px', lineHeight: '22px' },
+      const Icon = primitives?.IconDatabaseOutlineRegular
+      const icon = typeof Icon === 'function'
+        ? h(Icon, { key: 'icon' })
+        : h('svg', {
+            key: 'icon',
+            viewBox: '0 0 16 16',
+            width: 14,
+            height: 14,
+            fill: 'none',
+            stroke: 'currentColor',
+            strokeWidth: 1.2,
+            'aria-hidden': true,
+          }, [
+            h('ellipse', { key: 'top', cx: 8, cy: 4, rx: 4.5, ry: 1.8 }),
+            h('path', { key: 'sides', d: 'M3.5 4v8c0 1 2 1.8 4.5 1.8s4.5-.8 4.5-1.8V4' }),
+            h('path', { key: 'middle', d: 'M3.5 8c0 1 2 1.8 4.5 1.8s4.5-.8 4.5-1.8' }),
+          ])
+      const details = h('dl', {
+        key: 'details',
+        className: 'qwen-usage-details',
       }, [
-        h('span', { key: 'label', style: { color: 'var(--dsw-alias-label-secondary)' } }, label),
-        h('span', { key: 'value', style: { color: 'var(--dsw-alias-label-primary)', fontVariantNumeric: 'tabular-nums' } }, exact.format(value)),
+        h('dt', { key: 'input-label' }, locale.startsWith('zh') ? '输入' : 'Input'),
+        h('dd', { key: 'input-value' }, exact.format(input)),
+        h('dt', { key: 'output-label' }, locale.startsWith('zh') ? '输出' : 'Output'),
+        h('dd', { key: 'output-value' }, exact.format(output)),
       ])
       const panel = open && position !== null ? h('div', {
         ref: panelRef,
         role: 'dialog',
+        'aria-label': titleText,
         'data-qwen-usage-panel': '',
+        className: 'qwen-usage-panel',
         style: {
-          position: 'fixed',
           right: `${position.right}px`,
           bottom: `${position.bottom}px`,
-          zIndex: 2147483000,
-          minWidth: '170px',
-          padding: '10px 12px',
-          borderRadius: '10px',
-          border: '1px solid var(--dsw-alias-border-l2)',
-          background: 'var(--dsw-alias-bg-overlay)',
-          color: 'var(--dsw-alias-label-primary)',
-          boxShadow: 'var(--dsw-elevation-prominent)',
-          fontSize: '12px',
         },
-      }, [row(locale.startsWith('zh') ? '输入' : 'Input', input), row(locale.startsWith('zh') ? '输出' : 'Output', output)]) : null
+      }, [
+        h('div', { key: 'title', className: 'qwen-usage-title' }, [
+          h('span', { key: 'label', className: 'qwen-usage-title-label' }, [icon, titleText]),
+          h('span', { key: 'value', className: 'qwen-usage-title-value' }, exact.format(total)),
+        ]),
+        h('div', { key: 'rule', className: 'qwen-usage-title-rule', 'aria-hidden': true }),
+        details,
+      ]) : null
       return h('span', {
         'data-composer-stat': 'qwen-usage',
-        style: { display: 'inline-flex', minWidth: 0, fontSize: 'calc(var(--dsh-content-font-size-secondary,13px) - 1px)', lineHeight: '20px' },
+        className: 'qwen-usage-anchor',
       }, [
         h('button', {
           key: 'button',
@@ -722,20 +766,13 @@ window.__ModuleLoader__.load({
           'data-qwen-usage': '',
           'aria-haspopup': 'dialog',
           'aria-expanded': open,
+          'aria-label': `${formatCompactTokens(total)} tok`,
           onClick: toggle,
-          style: {
-            border: 'none',
-            background: 'transparent',
-            color: 'var(--dsw-alias-label-tertiary)',
-            font: 'inherit',
-            fontVariantNumeric: 'tabular-nums',
-            lineHeight: 'inherit',
-            padding: '1px 8px',
-            borderRadius: 'var(--dsw-radius-sm)',
-            cursor: 'pointer',
-            whiteSpace: 'nowrap',
-          },
-        }, `${formatCompactTokens(total)} tok`),
+          className: 'qwen-usage-pill',
+        }, [
+          icon,
+          h('span', { key: 'label', className: 'qwen-usage-label' }, `${formatCompactTokens(total)} tok`),
+        ]),
         panel === null ? null : ReactDOM?.createPortal !== undefined ? ReactDOM.createPortal(panel, document.body) : panel,
       ])
     })
@@ -1353,6 +1390,27 @@ window.__ModuleLoader__.load({
         return h('div', { style: S.root }, h('div', { style: S.page }, error === '' ? '…' : h('div', { style: S.banner }, error)))
       }
 
+      const positiveSetting = (value) => {
+        const number = Number(value)
+        return Number.isFinite(number) && number > 0 ? number : null
+      }
+      const maxOutput = positiveSetting(settings.maxOutputTokens) ?? 131072
+      const inferredContexts = Object.values(modelInfo?.models ?? {})
+        .map((meta) => positiveSetting(meta?.contextLength))
+        .filter((value) => value !== null)
+      const inferredContext = inferredContexts.length === 0 ? null : Math.max(...inferredContexts)
+      const fallbackContext = settings.protocol === 'qwen' ? DEFAULT_CONTEXT_WINDOW : maxOutput
+      const contextWindow = positiveSetting(settings.contextWindow)
+        ?? (settings.autoNctx === true ? inferredContext : null)
+        ?? fallbackContext
+      const reservedOutput = Math.min(maxOutput, contextWindow)
+      const thresholdRaw = Math.floor(Math.min(contextWindow * 0.8, contextWindow - reservedOutput - 65536))
+      const compactionThreshold = thresholdRaw > 0 ? thresholdRaw : null
+      const recommendedGate = compactionThreshold === null
+        ? null
+        : Math.max(0, Math.floor((compactionThreshold - 5000) / 1000) * 1000)
+      const formatTokens = (value) => value === null ? '—' : new Intl.NumberFormat().format(value)
+
       const provider = settings.provider
       const providerExists = provider !== null && provider !== undefined && provider.exists === true
       const mode = settings.mode ?? 'off'
@@ -1480,6 +1538,15 @@ window.__ModuleLoader__.load({
               }),
               h('span', { key: 'label' }, t('autoNctx.label')),
             ]) : null,
+            h('div', {
+              key: 'compaction-metrics',
+              style: { display: 'flex', gap: '18px', flexWrap: 'wrap', color: 'var(--dsw-alias-label-secondary)', fontSize: '11px' },
+            }, [
+              h('span', { key: 'threshold' }, `${t('compaction.dsh')}: ${formatTokens(compactionThreshold)}`),
+              h('span', { key: 'gate' }, `${t('compaction.gate')}: ${formatTokens(recommendedGate)}`),
+            ]),
+            h('div', { key: 'compaction-hint', style: S.hint },
+              compactionThreshold === null ? t('compaction.invalid') : t('compaction.hint')),
           ]),
           h('div', { key: 'divider-sampling', style: S.divider }),
           h('div', { key: 'sampling', style: S.configSection }, [
@@ -1600,6 +1667,27 @@ window.__ModuleLoader__.load({
           style.textContent = 'button[role="option"] [data-provider-id]{display:flex!important;align-items:center!important;width:100%!important;min-width:0!important}@keyframes qwen-model-name-marquee{from{transform:translateX(0)}to{transform:translateX(calc(-1 * var(--qwen-model-name-distance,0px)))}}body:has([data-qwen-usage]) [data-composer-stat="usage"]{display:none!important}'
           document.head.appendChild(style)
           ctx.effect(() => () => style.remove(), 'qwen-mode: model option warm style')
+          const usageStyle = document.createElement('style')
+          usageStyle.id = 'qwen-usage-style'
+          usageStyle.textContent = [
+            '.qwen-usage-anchor{min-width:0;font-size:calc(var(--dsh-content-font-size-secondary,13px) - 1px);line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));display:inline-flex}',
+            '.qwen-usage-pill{box-sizing:border-box;border-radius:var(--dsw-radius-sm);max-width:100%;color:var(--dsw-alias-label-tertiary);font:inherit;font-variant-numeric:tabular-nums;line-height:inherit;white-space:nowrap;background:0 0;border:none;align-items:center;gap:6px;padding:1px 8px;display:inline-flex;cursor:pointer}',
+            '.qwen-usage-pill svg{flex:none;width:14px;height:14px}',
+            '.qwen-usage-pill[aria-expanded=true]{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}',
+            '@media (hover:hover){.qwen-usage-pill:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}}',
+            '.qwen-usage-label{text-overflow:ellipsis;min-width:0;overflow:hidden}',
+            '.qwen-usage-panel{z-index:1100;box-sizing:border-box;width:max-content;min-width:min(300px,calc(100vw - 24px),var(--dsh-anchored-max-width,100vw));max-width:min(440px,calc(100vw - 24px),var(--dsh-anchored-max-width,100vw));border-radius:var(--dsw-radius-lg);background:var(--dsw-specific-menu);backdrop-filter:var(--dsw-menu-backdrop-filter);--dsw-elevation-stroke-color:var(--dsw-alias-border-l1);box-shadow:var(--dsw-elevation-prominent);color:var(--dsw-alias-label-secondary);cursor:default;max-height:var(--dsh-anchored-max-height,none);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2);border:0;padding:16px;font-size:12px;line-height:18px;position:fixed;overflow:hidden auto}',
+            '.qwen-usage-title{color:var(--dsw-alias-label-primary);justify-content:space-between;gap:16px;margin-bottom:8px;font-weight:500;display:flex}',
+            '.qwen-usage-title-rule{border-top:.5px solid var(--dsw-alias-border-l2);margin-bottom:10px}',
+            '.qwen-usage-title-value{font-variant-numeric:tabular-nums}',
+            '.qwen-usage-title-label{align-items:center;gap:6px;min-width:0;display:inline-flex}',
+            '.qwen-usage-title-label svg{flex:none;width:14px;height:14px}',
+            '.qwen-usage-details{color:var(--dsw-alias-label-tertiary);grid-template-columns:minmax(76px,auto) minmax(0,1fr);gap:6px 16px;margin:0;display:grid}',
+            '.qwen-usage-details dt,.qwen-usage-details dd{min-width:0;margin:0}',
+            '.qwen-usage-details dd{color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums;text-align:right}',
+          ].join('\n')
+          document.head.appendChild(usageStyle)
+          ctx.effect(() => () => usageStyle.remove(), 'qwen-mode: usage pill style')
           ctx.effect(() => {
             const suppress = (event) => {
               const target = event.target
