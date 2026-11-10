@@ -188,6 +188,7 @@ window.__ModuleLoader__.load({
 
     const warmState = {
       states: new Map(),
+      warming: new Map(),
       enabled: false,
       revision: 0,
       listeners: new Set(),
@@ -366,7 +367,9 @@ window.__ModuleLoader__.load({
           setWarmEnabled((current) => current === warmState.enabled ? current : warmState.enabled)
           setWarmRevision((current) => current === warmState.revision ? current : warmState.revision)
           if (placement === 'option' && provider?.id === 'from-geniex' && typeof model?.id === 'string') {
-            const next = warmState.states.get(model.id) ?? ''
+            const next = warmState.warming.has(model.id)
+              ? 'loading'
+              : warmState.states.get(model.id) ?? ''
             setResidentState((current) => current === next ? current : next)
           }
         }
@@ -411,13 +414,13 @@ window.__ModuleLoader__.load({
           lastWarm.set(key, modelId)
           lastWarmRevision.set(modelKey, warmRevision)
           lastWarmAt.set(modelKey, Date.now())
-          preheat.begin(modelKey)
+          preheat.begin(modelKey, modelId)
           try {
             await call('warm', { model: modelId })
           } catch {
             lastWarm.delete(key)
           } finally {
-            preheat.end(modelKey)
+            preheat.end(modelKey, modelId)
           }
         })
         warmChain.set(key, job.catch(() => {}))
@@ -1008,14 +1011,36 @@ window.__ModuleLoader__.load({
         const modelId = preheat.selected.get(sessionId)
         return modelId !== undefined && (preheat.active.get(`${sessionId}\u0000${modelId}`) ?? 0) > 0
       },
-      begin(key) {
+      begin(key, modelId) {
         preheat.active.set(key, (preheat.active.get(key) ?? 0) + 1)
+        if (typeof modelId === 'string') {
+          warmState.warming.set(modelId, (warmState.warming.get(modelId) ?? 0) + 1)
+          for (const listener of warmState.listeners) {
+            try {
+              listener()
+            } catch {
+              // A label can unmount between warm start and notification.
+            }
+          }
+        }
         for (const listener of preheat.listeners) listener()
       },
-      end(key) {
+      end(key, modelId) {
         const next = (preheat.active.get(key) ?? 0) - 1
         if (next > 0) preheat.active.set(key, next)
         else preheat.active.delete(key)
+        if (typeof modelId === 'string') {
+          const count = (warmState.warming.get(modelId) ?? 0) - 1
+          if (count > 0) warmState.warming.set(modelId, count)
+          else warmState.warming.delete(modelId)
+          for (const listener of warmState.listeners) {
+            try {
+              listener()
+            } catch {
+              // A label can unmount between warm end and notification.
+            }
+          }
+        }
         for (const listener of preheat.listeners) listener()
       },
     }
