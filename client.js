@@ -105,8 +105,6 @@ window.__ModuleLoader__.load({
       'usage.title': 'Token 用量',
       'compaction.dsh': 'DSH 压缩阈值',
       'compaction.gate': '推荐 bigGate',
-      'compaction.hint': '按当前上下文、输出预留与 65536 headroom 估算；修改上下文或最大输出后会即时更新。',
-      'compaction.invalid': '上下文不足以容纳输出预留与压缩 headroom',
     }
 
     const en = {
@@ -186,8 +184,6 @@ window.__ModuleLoader__.load({
       'usage.title': 'Token usage',
       'compaction.dsh': 'DSH compaction threshold',
       'compaction.gate': 'Recommended bigGate',
-      'compaction.hint': 'Estimated from the current context, output reservation, and 65536 headroom; updates as these fields change.',
-      'compaction.invalid': 'The context cannot fit the output reservation and compaction headroom',
     }
 
     function format(template, params) {
@@ -1575,7 +1571,7 @@ window.__ModuleLoader__.load({
                   style: { display: 'flex', flexDirection: 'column', gap: '1px' },
                 }, [
                   h('span', { key: 'main' }, t('autoNctx.label')),
-                  h('span', { key: 'sub' }, t('autoNctx.sublabel')),
+                  h('span', { key: 'sub', style: S.hint }, t('autoNctx.sublabel')),
                 ]),
               ]) : null,
               h('div', {
@@ -1596,8 +1592,6 @@ window.__ModuleLoader__.load({
                 h('span', { key: 'gate' }, `${t('compaction.gate')}: ${formatTokens(recommendedGate)}`),
               ]),
             ]),
-            h('div', { key: 'compaction-hint', style: S.hint },
-              compactionThreshold === null ? t('compaction.invalid') : t('compaction.hint')),
           ]),
           h('div', { key: 'divider-sampling', style: S.divider }),
           h('div', { key: 'sampling', style: S.configSection }, [
