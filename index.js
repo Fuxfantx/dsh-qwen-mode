@@ -15,6 +15,7 @@ import http from 'node:http'
 import https from 'node:https'
 import { join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
+import { isDeepStrictEqual } from 'node:util'
 import { createCapabilityResolver, supportsPreserveThinking } from './lib/capabilities.js'
 import { createThinkState, rewriteMessage, transformSseEvent } from './lib/reasoning.js'
 import {
@@ -28,6 +29,7 @@ import {
   positiveInt,
   positiveIntOrNull,
   readJson,
+  runConfigEdit,
   sendJson,
   shortModelName,
   text,
@@ -431,8 +433,8 @@ function readProviderConfig(ctx) {
 
 /** Merge a change into the provider table through one config edit. */
 async function editProviders(ctx, change) {
-  const { editor, entry } = readProviderConfig(ctx)
-  await editor.edit(entry, (current, inherited) => {
+  const { entry } = readProviderConfig(ctx)
+  await runConfigEdit(ctx, entry, (current, inherited) => {
     const config = { ...(inherited ?? {}), ...(current ?? {}) }
     const providers = providerMap(inherited, current)
     change(providers)
@@ -460,15 +462,20 @@ async function ensureLocalCredential(ctx) {
   }
 }
 
+/** The output cap one provider model exposes to DSH. */
+function modelTokenLimit(settings, capability, contextWindow) {
+  const declared = positiveIntOrNull(capability?.maxOutput)
+  return Math.max(1, Math.min(settings.maxOutputTokens, declared ?? contextWindow, contextWindow))
+}
+
 /** Build one provider model entry from resolved capabilities. */
 function buildModelSpec(settings, id, capability) {
   const runtimeId = typeof capability?.runtime === 'string' ? capability.runtime : ''
   const contextWindow = effectiveContext(settings, positiveIntOrNull(capability?.contextLength), runtimeId)
-  const declaredMaxOutput = positiveIntOrNull(capability?.maxOutput)
   const model = {
     id,
     name: shortModelName(id),
-    maxTokens: Math.max(1, Math.min(settings.maxOutputTokens, declaredMaxOutput ?? contextWindow, contextWindow)),
+    maxTokens: modelTokenLimit(settings, capability, contextWindow),
     contextWindow,
     input: capability?.vision === true ? ['text', 'image'] : ['text'],
   }
@@ -563,23 +570,38 @@ async function upsertProvider(ctx, settings) {
   }
   // Commit only if the settings that asked for this provider are still current.
   // A mode switch to Off runs its delete immediately, and this guard keeps a
-  // slow in-flight discovery from resurrecting the provider afterwards.
-  let committed = false
-  await editProviders(ctx, (providers) => {
-    if (!providerSettingsCurrent(settings)) return
-    const previous = runtime.settings.managedProviderId
-    if (previous !== null && previous !== id) delete providers[previous]
-    providers[id] = desired
-    committed = true
-  })
-  if (!committed || !providerSettingsCurrent(settings)) return null
+  // slow in-flight discovery from resurrecting the provider afterwards. When
+  // the committed entry already equals the discovered one, skip the write:
+  // a redundant edit rewrites the profile patch and wakes HMR for nothing.
+  let changed = true
+  try {
+    const { providers } = readProviderConfig(ctx)
+    changed = runtime.settings.managedProviderId !== id || !isDeepStrictEqual(providers[id], desired)
+  } catch {
+    // The provider table is unreadable; let the edit surface the failure.
+  }
+  if (changed) {
+    let committed = false
+    await editProviders(ctx, (providers) => {
+      if (!providerSettingsCurrent(settings)) return
+      const previous = runtime.settings.managedProviderId
+      if (previous !== null && previous !== id) delete providers[previous]
+      providers[id] = desired
+      committed = true
+    })
+    if (!committed || !providerSettingsCurrent(settings)) return null
+  } else if (!providerSettingsCurrent(settings)) {
+    return null
+  }
   runtime.settings.managedProviderId = id
   runtime.settings.lastError = null
-  try {
-    ctx.emit('llm/models-updated', id)
-    ctx.emit('llm/adapters-updated')
-  } catch {
-    // Catalog refresh is best-effort; the provider config is already committed.
+  if (changed) {
+    try {
+      ctx.emit('llm/models-updated', id)
+      ctx.emit('llm/adapters-updated')
+    } catch {
+      // Catalog refresh is best-effort; the provider config is already committed.
+    }
   }
   return {
     id,
@@ -638,6 +660,7 @@ function createRuntime() {
     capabilities: null,
     managedModels: new Set(),
     visionModels: new Set(),
+    modelMaxTokens: new Map(),
     mtpModels: new Set(),
     mtpDrafts: new Map(),
     modelContexts: new Map(),
@@ -681,18 +704,21 @@ function invalidateState() {
 function applyManagedProvider(provider) {
   runtime.managedModels.clear()
   runtime.visionModels.clear()
+  runtime.modelMaxTokens.clear()
   runtime.modelReasoning.clear()
   for (const id of provider?.models ?? []) runtime.managedModels.add(id)
   for (const id of provider?.visionModels ?? []) runtime.visionModels.add(id)
-  // The provider entry already records each model's context and thinking
-  // capability, so the first request after a restart does not fall back to the
-  // plugin default while the local metadata is being re-read.
+  // The provider entry already records each model's context, output cap, and
+  // thinking capability, so the first request after a restart does not fall
+  // back to the plugin default while the local metadata is being re-read.
   for (const model of provider?.entries ?? []) {
     if (typeof model?.id !== 'string') continue
     if (model.reasoningEfforts === false) runtime.modelReasoning.set(model.id, false)
     else if (model.reasoningEfforts !== undefined) runtime.modelReasoning.set(model.id, true)
     const context = positiveIntOrNull(model.contextWindow)
     if (context !== null) runtime.modelContexts.set(model.id, context)
+    const maxTokens = positiveIntOrNull(model.maxTokens)
+    if (maxTokens !== null) runtime.modelMaxTokens.set(model.id, maxTokens)
   }
 }
 
@@ -1318,7 +1344,7 @@ async function ensureReplyOnlyPreset(ctx, locale) {
   if (entry === null) return { updated: false, ...labels }
   const presets = config.presets !== null && typeof config.presets === 'object' ? config.presets : {}
   if (samePreset(presets[REPLY_ONLY_KEY], replyOnlyPreset(presets, locale))) return { updated: false, ...labels }
-  await ctx.configEditor.edit(entry, (current, inherited) => {
+  await runConfigEdit(ctx, entry, (current, inherited) => {
     const base = { ...(inherited ?? {}), ...(current ?? {}) }
     const merged = { ...((inherited ?? {}).presets ?? {}), ...((current ?? {}).presets ?? {}) }
     return { ...base, presets: { ...merged, [REPLY_ONLY_KEY]: replyOnlyPreset(merged, locale) } }
@@ -1328,21 +1354,27 @@ async function ensureReplyOnlyPreset(ctx, locale) {
 
 async function warmUpModel(ctx, settings, model, options) {
   const url = upstreamURL(settings, 'chat/completions')
-  const body = {
+  // The warm-up path returns before generation, but GenieX still keys the
+  // loaded model on the request's load fields. Produce those fields through
+  // the same normalizer as a live request so `nctx`, compute, `vit_compute`,
+  // and the MTP draft fields cannot drift apart.
+  const body = applyRequestDefaults({
     model,
     // GenieX treats a lone system message as a warm-up: the model loads with
     // these exact load parameters and no prefill or decoding runs.
     messages: [{ role: 'system', content: `You are ${shortModelName(model)}. Load the model; do not answer.` }],
     stream: false,
-    enable_think: false,
-    reasoning_format: 'auto',
-    // GenieX raises NCtx to max_completion_tokens for llama.cpp. Without an
-    // explicit value the server default (2048) can beat a small nctx and make
-    // the warm-up cache key differ from the following request's.
-    max_completion_tokens: 1,
-    ...inferenceFields(settings, options.vision),
-    ...loadFields(settings, options),
-  }
+    // Keep the completion reservation at the provider's normal cap. GenieX
+    // raises NCtx to max_completion_tokens for llama.cpp, and a live request
+    // sends the same provider limit.
+    max_completion_tokens: runtime.modelMaxTokens.get(model)
+      ?? modelTokenLimit(settings, runtime.modelCapabilities.get(model), options.context),
+  }, settings, {
+    ...options,
+    thinking: false,
+    reasoning: false,
+    preserveThinking: false,
+  })
   const startedAt = Date.now()
   let response
   try {

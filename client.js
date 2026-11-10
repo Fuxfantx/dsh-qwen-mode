@@ -900,7 +900,7 @@ window.__ModuleLoader__.load({
         const span = document.createElement('span')
         span.setAttribute('data-qwen-reply-icon', '')
         span.setAttribute('aria-hidden', 'true')
-        span.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;flex:0 0 14px;width:14px;height:14px;min-width:14px;min-height:14px;color:var(--dsw-alias-menu-icon);'
+        span.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;flex:0 0 14px;width:14px;height:14px;min-width:14px;min-height:14px;color:currentColor;'
         const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
         svg.setAttribute('viewBox', '0 0 16 16')
         svg.setAttribute('width', '14')
@@ -961,25 +961,39 @@ window.__ModuleLoader__.load({
         }
       }
       let scheduled = false
-      let timer = null
+      let frame = null
       const schedule = () => {
         if (scheduled) return
         scheduled = true
-        // Streaming messages mutate the DOM continuously; a short debounce
-        // keeps the presets decorated without rescanning on every frame.
-        timer = window.setTimeout(() => {
+        // Decorate before the next paint, not after a long debounce; the
+        // permission trigger and menu appear and disappear with the picker.
+        frame = window.requestAnimationFrame(() => {
           scheduled = false
-          timer = null
+          frame = null
           scan()
-        }, 150)
+        })
       }
-      const observer = new MutationObserver(schedule)
+      const observer = new MutationObserver((mutations) => {
+        // Newly mounted buttons can be decorated immediately, before paint.
+        for (const mutation of mutations) {
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType !== Node.ELEMENT_NODE) continue
+            if (node.tagName !== 'BUTTON' && node.querySelector?.('button') === null) continue
+            const label = node.textContent ?? ''
+            if (label.includes('仅回复') || label.includes('Reply Only')) {
+              scan()
+              return
+            }
+          }
+        }
+        schedule()
+      })
       if (document.body === null) return () => observer.disconnect()
       observer.observe(document.body, { childList: true, subtree: true })
       scan()
       return () => {
         observer.disconnect()
-        if (timer !== null) window.clearTimeout(timer)
+        if (frame !== null) window.cancelAnimationFrame(frame)
         for (const icon of document.querySelectorAll('[data-qwen-reply-icon]')) icon.remove()
         alignStyle?.remove()
       }

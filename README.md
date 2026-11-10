@@ -6,7 +6,7 @@
 
 ## 中文
 
-把 Qwen 接入 DSH：既可以连接本机 GenieX 上运行的模型，也可以连接阿里云百炼 QwenCloud。Qwen 模式会自动创建并维护 Provider，把模型、思考模式、采样、预热和用量统计统一到 DSH 的设置页与对话界面。
+把 Qwen 接入 DSH：既可以连接本机 GenieX 上运行的模型，也可以连接阿里云百炼 QwenCloud。Qwen 模式会自动创建并维护 Provider，把模型、思考模式、采样、预热和每轮统计统一到 DSH 的设置页与对话界面。
 
 ### 功能
 
@@ -19,7 +19,6 @@
 - 可选 MTP 投机解码，并在生效时显示接受率。
 - 破限 / 无审查模型名称高亮。
 - 可选「仅回复」权限：隐藏并拒绝工具调用，只进行纯文本对话。
-- 含 From GenieX 回复的会话显示累计 token 用量，可展开查看输入与输出。
 
 ### 系统要求
 
@@ -54,9 +53,6 @@
 - **预热**：启用后，选择 From GenieX 模型会提前加载权重。圆点状态：黄色预热中、绿色已驻留、红色未驻留、蓝色其它来源。
 - **MTP**：适用于自带 MTP 张量并放置了配套草稿文件的本地 GGUF 模型。启用后发送图片时，会要求选择「直接发送」或「本次关闭 MTP」。
 - **推理后端**：Compute 与 Vision Encoder 留空时使用 GenieX 默认值；Vision Encoder 仅对图片模型生效。
-- **模型高亮**：破限 / 无审查模型使用橙色名称。
-- **仅回复**：工具调用被隐藏并拒绝，回复保持纯文本。
-- **模式切换**：保存后立即返回；Provider 的创建或删除在后台完成，卡片显示「同步中…」。
 
 ### 限制
 
@@ -64,16 +60,14 @@
 - GenieX 同一时间只驻留一个模型；不同会话使用不同模型时会互相卸载。
 - MTP 与图片不能同时生效，发送前需要选择。
 - 模型目录来自上游；上游不可达时不会创建模型，插件会在后台重试。
-- 预热、MTP、GGUF 元数据与推理后端仅适用于 GenieX；QwenCloud 保留 Provider 管理、思考、采样、统计与仅回复。
-- 上游拥塞或不可达时插件仍会启动，设置页可用，Provider 会在后台重试。
-- QwenCloud 的可用模型、上下文、思考等级与参数支持由阿里云百炼决定。
+- 预热、MTP、GGUF 元数据与推理后端仅适用于 GenieX；QwenCloud 保留 Provider 管理、思考、采样、每轮统计与仅回复。
 
 
 ---
 
 ## English
 
-Connect DSH to Qwen: use models running on a local GenieX server, or QwenCloud on Alibaba Cloud Model Studio. Qwen Mode maintains the provider automatically and brings models, thinking mode, sampling, warmup, and usage statistics into the DSH settings page and chat UI.
+Connect DSH to Qwen: use models running on a local GenieX server, or QwenCloud on Alibaba Cloud Model Studio. Qwen Mode maintains the provider automatically and brings models, thinking mode, sampling, warmup, and per-turn statistics into the DSH settings page and chat UI.
 
 ### Features
 
@@ -86,7 +80,6 @@ Connect DSH to Qwen: use models running on a local GenieX server, or QwenCloud o
 - Optional MTP speculative decoding, with the acceptance rate shown while active.
 - Highlights abliterated / uncensored model names.
 - Optional **Reply Only** permission: hides and denies tool calls, keeping replies plain text.
-- Shows cumulative token usage for sessions containing From GenieX replies; expand to see input and output.
 
 ### System requirements
 
@@ -121,9 +114,6 @@ Connect DSH to Qwen: use models running on a local GenieX server, or QwenCloud o
 - **Warmup**: when enabled, selecting a From GenieX model loads its weights ahead of time. Dots: yellow warming, green resident, red not resident, blue another source.
 - **MTP**: for local GGUF models that ship MTP tensors and a matching draft file. While enabled, sending an image asks whether to send directly or disable MTP for that send.
 - **Inference backend**: empty Compute and Vision Encoder values use GenieX defaults; Vision Encoder applies to image models only.
-- **Model highlight**: abliterated / uncensored models use an orange name.
-- **Reply Only**: tool calls are hidden and denied, and replies stay plain text.
-- **Mode switch**: saves and answers immediately; provider creation or removal runs in the background, and the card shows **Syncing…**.
 
 ### Limitations
 
@@ -131,9 +121,7 @@ Connect DSH to Qwen: use models running on a local GenieX server, or QwenCloud o
 - GenieX keeps one model resident at a time; using different models in different sessions unloads the previous one.
 - MTP and images cannot be active together; the send flow asks first.
 - The model catalog comes from the upstream. When the upstream is unreachable no models are created, and the plugin retries in the background.
-- Warmup, MTP, GGUF metadata, and inference backends are GenieX-only; QwenCloud keeps provider management, thinking, sampling, statistics, and Reply Only.
-- The plugin still starts when the upstream is congested or unreachable: the settings page stays available and the provider is retried in the background.
-- QwenCloud model availability, context, thinking levels, and parameter support are determined by Alibaba Cloud Model Studio.
+- Warmup, MTP, GGUF metadata, and inference backends are GenieX-only; QwenCloud keeps provider management, thinking, sampling, per-turn statistics, and Reply Only.
 
 ---
 
