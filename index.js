@@ -1332,23 +1332,38 @@ export async function apply(ctx) {
       if (typeof metadata?.contextLength === 'number') modelContexts.set(id, metadata.contextLength)
     }
   }
-  const refreshManagedModels = async () => {
-    capabilityRetryAt = 0
-    managedModels.clear()
-    visionModels.clear()
-    mtpModels.clear()
-    mtpFiles.clear()
-    modelContexts.clear()
-    modelCapabilities.clear()
-    const provider = readManagedProvider(ctx, settings).provider
-    for (const id of provider?.models ?? []) managedModels.add(id)
-    for (const id of provider?.visionModels ?? []) visionModels.add(id)
-    const entries = settings.protocol === 'geniex'
-      ? await mapLimit([...managedModels], 4, async (id) => {
-          return [id, await readModelMetadata(settings, id)]
-        })
-      : []
-    applyCapabilities(new Map(entries))
+  let managedRefresh = null
+  let managedRefreshKey = ''
+  const refreshManagedModels = () => {
+    const snapshot = { ...settings }
+    const sourceKey = `${snapshot.mode}|${snapshot.protocol}|${snapshot.upstream}|${snapshot.managedProviderId}`
+    if (managedRefresh !== null && managedRefreshKey === sourceKey) return managedRefresh
+    const promise = (async () => {
+      capabilityRetryAt = 0
+      const provider = readManagedProvider(ctx, snapshot).provider
+      const nextManaged = new Set(provider?.models ?? [])
+      const nextVision = new Set(provider?.visionModels ?? [])
+      const entries = snapshot.protocol === 'geniex'
+        ? await mapLimit([...nextManaged], 4, async (id) => {
+            return [id, await readModelMetadata(snapshot, id)]
+          })
+        : []
+      const currentKey = `${settings.mode}|${settings.protocol}|${settings.upstream}|${settings.managedProviderId}`
+      if (currentKey !== sourceKey) return
+      managedModels.clear()
+      for (const id of nextManaged) managedModels.add(id)
+      visionModels.clear()
+      for (const id of nextVision) visionModels.add(id)
+      applyCapabilities(new Map(entries))
+    })().finally(() => {
+      if (managedRefresh === promise) {
+        managedRefresh = null
+        managedRefreshKey = ''
+      }
+    })
+    managedRefresh = promise
+    managedRefreshKey = sourceKey
+    return promise
   }
   await refreshManagedModels()
   const modelLoadContext = (model) => {
@@ -1501,6 +1516,7 @@ export async function apply(ctx) {
     invalidateState()
     if (settings.mode === 'off') {
       await deleteProvider(ctx, settings)
+      settings.managedProviderId = null
       managedModels.clear()
       visionModels.clear()
       applyCapabilities()
@@ -1522,6 +1538,7 @@ export async function apply(ctx) {
   } catch (error) {
     logger.warn(`[${SCOPE}] cannot refresh managed provider: ${String(error)}`)
   }
+  await persist().catch((error) => logger.warn(`[${SCOPE}] cannot save settings: ${String(error)}`))
 
   const statusCache = { key: '', at: 0, value: null }
   const readGeniexStatus = async () => {
@@ -1564,6 +1581,7 @@ export async function apply(ctx) {
   }
 
   let warmQueue = Promise.resolve()
+  let warmGeneration = 0
   const warmingModels = new Set()
   const api = {
     state: () => state(),
@@ -1707,7 +1725,9 @@ export async function apply(ctx) {
       return { updated: true, name }
     },
     warm: (payload) => {
+      const generation = ++warmGeneration
       const operation = async () => {
+        if (generation !== warmGeneration) return { warmed: false, skipped: true }
         if (settings.protocol !== 'geniex') throw httpError(409, 'model warmup is GenieX-only')
         if (settings.mode !== 'auto' || !settings.warm) throw httpError(409, 'model warmup is disabled')
         const model = text(payload?.model)
@@ -1802,6 +1822,7 @@ export async function apply(ctx) {
       invalidateState()
       try {
         await deleteProvider(ctx, settings)
+        settings.managedProviderId = null
         managedModels.clear()
         visionModels.clear()
         applyCapabilities()

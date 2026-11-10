@@ -213,13 +213,15 @@ window.__ModuleLoader__.load({
     const stateStore = {
       value: null,
       pending: null,
+      generation: 0,
     }
     async function readState() {
       if (stateStore.pending !== null) return stateStore.pending
+      const generation = stateStore.generation
       const pending = call('state', undefined, { signal: AbortSignal.timeout(15000) })
         .then((next) => {
-          stateStore.value = next
-          return next
+          if (generation === stateStore.generation) stateStore.value = next
+          return stateStore.value ?? next
         })
         .finally(() => {
           if (stateStore.pending === pending) stateStore.pending = null
@@ -654,9 +656,8 @@ window.__ModuleLoader__.load({
       if (value >= 1000) return `${Math.round(value / 1000)}K`
       return String(value)
     }
-    const QwenUsagePill = React.memo(function QwenUsagePill({ sessionId, useProjection, useChat, getLocale }) {
+    const QwenUsagePill = React.memo(function QwenUsagePill({ sessionId, useProjection, getLocale }) {
       const usage = useProjection('tokenUsage')
-      const nodeCount = useChat((state) => state.legacy.nodes.length)
       const [providerState, setProviderState] = React.useState(() => ({
         sessionId,
         geniex: sessionProviderCache.get(sessionId) === true,
@@ -709,7 +710,7 @@ window.__ModuleLoader__.load({
           cancelled = true
           if (timer !== null) clearTimeout(timer)
         }
-      }, [sessionId, signature, nodeCount])
+      }, [sessionId, signature])
 
       React.useEffect(() => {
         if (!open) return undefined
@@ -1368,6 +1369,7 @@ window.__ModuleLoader__.load({
         try {
           const next = await operation()
           if (next !== undefined) {
+            stateStore.generation += 1
             stateStore.value = next
             setSettings(next)
             void refreshModelInfo(next.protocol)
