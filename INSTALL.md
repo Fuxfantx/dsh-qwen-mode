@@ -24,6 +24,12 @@ Version / 版本: **1.8.1**
 
 本包没有 npm 依赖，离线安装不需要联网。
 
+也可以直接从 GitHub 安装：
+
+```sh
+dsh plugin --profile <profile> add github:Fuxfantx/dsh-qwen-mode
+```
+
 ## English
 
 Archive contents:
@@ -45,3 +51,9 @@ Install:
 7. Select a model under that provider in the model picker.
 
 The package has no npm dependencies, so offline installation needs no network access.
+
+It can also be installed straight from GitHub:
+
+```sh
+dsh plugin --profile <profile> add github:Fuxfantx/dsh-qwen-mode
+```

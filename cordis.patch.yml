@@ -2,6 +2,10 @@
     - id: qwen-mode
       name: 'dsh-qwen-mode'
       config: {}
+# Reply Only lives in the permission plugin's preset map; the plugin only adds
+# the `reply-only` preset and otherwise leaves the user's permission state
+# alone. A patch config replaces this entry's config wholesale, so the stock
+# presets are repeated below unchanged next to the added one.
 - id: permission
   config:
     presets:

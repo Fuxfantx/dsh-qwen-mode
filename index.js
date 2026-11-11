@@ -2094,6 +2094,14 @@ function registerWebApi(ctx, api) {
         sendJson(res, 405, { ok: false, error: { message: 'POST only' } })
         return
       }
+      // Same-origin admission is checked above; also refuse a body that a
+      // cross-site form or `fetch(..., { mode: 'no-cors' })` could send without
+      // a preflight. Every method reads JSON, so nothing else is legitimate.
+      const mediaType = String(req.headers?.['content-type'] ?? '').split(';', 1)[0].trim().toLowerCase()
+      if (mediaType !== 'application/json') {
+        sendJson(res, 415, { ok: false, error: { message: 'content-type must be application/json' } })
+        return
+      }
       const pathname = new URL(req.url ?? '/', 'http://qwen.invalid').pathname
       const method = pathname.startsWith(`${API_PREFIX}/`) ? pathname.slice(API_PREFIX.length + 1) : ''
       try {

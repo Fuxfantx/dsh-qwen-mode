@@ -28,7 +28,7 @@
 
 ### 安装
 
-1. 通过 DSH 的插件管理安装离线 zip 或插件目录。
+1. 在 DSH 中执行 `dsh plugin --profile <profile> add github:Fuxfantx/dsh-qwen-mode`，或通过 DSH 的插件管理安装离线 zip 或插件目录。
 2. 刷新 DSH 页面。
 3. 打开 **设置 → Qwen 模式**。
 
@@ -88,7 +88,7 @@ Use Qwen in DSH: connect to models running on a local GenieX server, or to QwenC
 
 ### Install
 
-1. Install the offline zip or plugin directory through DSH plugin management.
+1. Run `dsh plugin --profile <profile> add github:Fuxfantx/dsh-qwen-mode` in DSH, or install the offline zip or plugin directory through DSH plugin management.
 2. Refresh the DSH page.
 3. Open **Settings → Qwen Mode**.
 
