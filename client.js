@@ -1126,7 +1126,7 @@ window.__ModuleLoader__.load({
       }
       return null
     }
-    function composerHasText(editor) {
+    function editorHasText(editor) {
       const value = editor.isContentEditable === true ? editor.textContent : editor.value
       return typeof value === 'string' && value.replace(/[\u200b-\u200d\ufeff]/gu, '').trim() !== ''
     }
@@ -1406,7 +1406,7 @@ window.__ModuleLoader__.load({
           return
         }
         preheat.observeComposer(editor)
-        preheat.setHasText(composerHasText(editor))
+        preheat.setHasText(editorHasText(editor))
       },
       scheduleComposerProbe() {
         if (preheat.textFrame !== null) return

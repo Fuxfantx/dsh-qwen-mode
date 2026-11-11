@@ -734,7 +734,6 @@ function createRuntime() {
     stateCache: null,
     statusCache: { key: '', at: 0, value: null },
     turnMetrics: new Map(),
-    turnReady: new Map(),
     requestStarts: new Map(),
     currentSteps: new Map(),
     sessionProviders: new Set(),
@@ -1054,10 +1053,10 @@ function loadedAtFor(models, model) {
 }
 
 /** Attribute part of one call's TTFT to a weight-load/queue wait. */
-async function applyLoadTiming(ctx, call, requestStart) {
-  if (ctx === null || requestStart === null || requestStart.model !== call.model) return
+function applyLoadTiming(call, models) {
+  const requestStart = call.requestStart
+  if (requestStart === undefined || requestStart.model !== call.model) return
   if (requestStart.upstream !== runtime.settings.upstream) return
-  const models = await fetchGeniexStatus(ctx)
   const loadedAt = loadedAtFor(models, call.model)
   if (loadedAt <= 0 || loadedAt < requestStart.at || loadedAt > call.firstTokenAt) return
   const loadMs = Math.min(call.ttftMs, Math.max(0, Math.round(loadedAt - requestStart.at)))
@@ -1109,7 +1108,7 @@ function aggregateTurnMetric(metric) {
 }
 
 /** Store one call's timing and token counts on its turn. */
-function recordTurn(ctx, sessionId, turn, call, requestStart = null) {
+function recordTurn(sessionId, turn, call) {
   const key = `${sessionId}:${turn}`
   let metric = runtime.turnMetrics.get(key)
   if (metric === undefined) {
@@ -1123,12 +1122,6 @@ function recordTurn(ctx, sessionId, turn, call, requestStart = null) {
     metric.provider = call.provider
     metric.model = call.model
     metric.hasToolCalls = metric.hasToolCalls === true || call.toolCall === true
-  }
-  if (requestStart !== null && ctx !== null && call.toolCall !== true) {
-    const ready = applyLoadTiming(ctx, call, requestStart).catch(() => {})
-    const previous = runtime.turnReady.get(key) ?? Promise.resolve()
-    runtime.turnReady.set(key, Promise.all([previous, ready]).then(() => undefined, () => undefined))
-    trimMap(runtime.turnReady, 2000)
   }
   if (call.provider !== PROVIDERS.geniex.id) return
   runtime.sessionProviders.add(sessionId)
@@ -1163,7 +1156,7 @@ function deriveSessionMetrics(session) {
         } else if (event.type === 'assistant/message') {
           const first = firsts.get(key) ?? streamFirstTokenTime(event.data.stream) ?? event.time
           const metric = buildTurnMetric(event, first, starts.get(key) ?? first, step)
-          if (metric !== null) recordTurn(null, session.id, turn, metric)
+          if (metric !== null) recordTurn(session.id, turn, metric)
         }
       }
       if (index % 400 === 399) await new Promise((resolve) => setImmediate(resolve))
@@ -1597,8 +1590,8 @@ async function warmUpModel(ctx, settings, model, options) {
   return { elapsedMs: Date.now() - startedAt, usage }
 }
 
-/** Read GenieX's model status independently of the warmup setting. */
-async function fetchGeniexStatus(ctx) {
+/** Read GenieX's `/status` body independently of the warmup setting. */
+async function readGeniexStatus(ctx, timeout = 1500) {
   const settings = runtime.settings
   if (settings.protocol !== 'geniex') return null
   try {
@@ -1607,11 +1600,10 @@ async function fetchGeniexStatus(ctx) {
     url.search = ''
     const response = await fetch(url, {
       headers: { accept: 'application/json', ...await credentialHeader(ctx, settings) },
-      signal: AbortSignal.timeout(1500),
+      signal: AbortSignal.timeout(timeout),
     })
     if (!response.ok) return null
-    const body = await response.json()
-    return Array.isArray(body?.models) ? body.models : null
+    return await response.json()
   } catch {
     return null
   }
@@ -1633,25 +1625,14 @@ async function readModelStatus(ctx) {
     }
   }
   let value = { active: true, models: [], warming: [] }
-  try {
-    const url = new URL(settings.upstream)
-    url.pathname = '/status'
-    url.search = ''
-    const response = await fetch(url, {
-      headers: { accept: 'application/json', ...await credentialHeader(ctx, settings) },
-      signal: AbortSignal.timeout(2500),
-    })
-    if (response.ok) {
-      const body = await response.json()
-      const models = Array.isArray(body?.models) ? body.models.filter((model) => typeof model?.id === 'string') : []
-      value = {
-        active: true,
-        models: models.map((model) => model.id),
-        states: Object.fromEntries(models.map((model) => [model.id, model.state])),
-      }
+  const body = await readGeniexStatus(ctx, 2500)
+  if (body !== null) {
+    const models = Array.isArray(body?.models) ? body.models.filter((model) => typeof model?.id === 'string') : []
+    value = {
+      active: true,
+      models: models.map((model) => model.id),
+      states: Object.fromEntries(models.map((model) => [model.id, model.state])),
     }
-  } catch {
-    // A missing status endpoint means the client cannot classify warm models.
   }
   value.warming = [...runtime.warmingModels]
   value.revision = runtime.loadRevision
@@ -1783,10 +1764,19 @@ function createApi(ctx) {
         if (session === undefined) return null
         await deriveSessionMetrics(session)
       }
-      const ready = runtime.turnReady.get(key)
-      if (ready !== undefined) await ready
       const metric = runtime.turnMetrics.get(key)
-      return metric === undefined ? null : aggregateTurnMetric(metric)
+      if (metric === undefined) return null
+      if (metric.loadPromise === undefined) {
+        const pending = metric.calls.filter((call) => call.requestStart !== undefined && call.toolCall !== true)
+        metric.loadPromise = pending.length === 0
+          ? Promise.resolve()
+          : readGeniexStatus(ctx, 1500).then((body) => {
+              const models = Array.isArray(body?.models) ? body.models : null
+              for (const call of pending) applyLoadTiming(call, models)
+            }).catch(() => {})
+      }
+      await metric.loadPromise
+      return aggregateTurnMetric(metric)
     },
     sessionProvider: (payload) => {
       const sessionId = text(payload?.sessionId)
@@ -2209,7 +2199,8 @@ export async function apply(ctx) {
     runtime.requestStarts.delete(key)
     const metric = buildTurnMetric(event, first, start, step)
     if (metric === null) return
-    recordTurn(ctx, session.id, turn, metric, requestStart)
+    metric.requestStart = requestStart ?? undefined
+    recordTurn(session.id, turn, metric)
   }), `${SCOPE}: turn metrics`)
 
   ctx.effect(() => ctx.tools.guard((execution) => {
