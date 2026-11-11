@@ -73,7 +73,7 @@ Use Qwen in DSH: connect to models running on a local GenieX server, or to QwenC
 - Maintains the **From GenieX** / **From QwenCloud** model lists automatically and refreshes them when a source changes.
 - Recognizes each model's context, output limit, image input, thinking, and MTP support.
 - Thinking mode: choose a level the model supports. QwenCloud receives only supported levels, and GenieX enables thinking only on models that support it.
-- Shows the model name, first-token delay, decode speed, and elapsed time per turn; turns that use tools show a turn average.
+- Shows the model name, first-response delay, decode speed, and elapsed time per turn; turns that use tools show a turn average.
 - Optional warmup: once you start typing, preload the selected From GenieX model ahead of time, with loading-status dots in the model list.
 - Sampling parameters can be entered manually or read from the model's recommended values, including a random seed.
 - Optional MTP acceleration for supported local From GenieX models.
