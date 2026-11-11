@@ -513,7 +513,7 @@ function buildModelSpec(settings, id, capability) {
  * timeout is expected even on a healthy local server.
  */
 async function fetchJson(url, { headers, timeout, attempts = 1 }) {
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
+  for (let attempt = 0; ; attempt += 1) {
     try {
       const response = await fetch(url, { headers, signal: AbortSignal.timeout(timeout) })
       if (!response.ok) {
@@ -527,7 +527,6 @@ async function fetchJson(url, { headers, timeout, attempts = 1 }) {
       await delay(500 * (attempt + 1))
     }
   }
-  throw httpError(502, 'model discovery failed')
 }
 
 /**

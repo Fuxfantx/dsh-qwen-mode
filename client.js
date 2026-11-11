@@ -1402,6 +1402,8 @@ window.__ModuleLoader__.load({
       probeComposerNow() {
         const editor = findComposerEditor()
         if (editor === null) {
+          preheat.textObserver?.disconnect()
+          preheat.textObserverTarget = null
           preheat.setHasText(false)
           return
         }
