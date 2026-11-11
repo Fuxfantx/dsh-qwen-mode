@@ -413,13 +413,11 @@ function buildTurnMetric(event, firstTokenAt, startedAt, step) {
   const toolCall = Array.isArray(content) && content.some((block) => block?.type === 'tool-call')
   return {
     id: `${step ?? ''}:${event.time}`,
-    step: Number.isInteger(step) ? step : null,
     time: event.time,
     firstTokenAt,
     provider: source.provider,
     model: source.model,
     ttftMs,
-    loadMs: 0,
     netTtftMs: ttftMs,
     decodeMs,
     tps: outputTokens === null ? null : Math.round(outputTokens / (decodeMs / 1000) * 10) / 10,
@@ -1060,7 +1058,6 @@ function applyLoadTiming(call, models) {
   const loadedAt = loadedAtFor(models, call.model)
   if (loadedAt <= 0 || loadedAt < requestStart.at || loadedAt > call.firstTokenAt) return
   const loadMs = Math.min(call.ttftMs, Math.max(0, Math.round(loadedAt - requestStart.at)))
-  call.loadMs = loadMs
   call.netTtftMs = Math.max(0, call.ttftMs - loadMs)
 }
 
