@@ -19,7 +19,11 @@ window.__ModuleLoader__.load({
     const DEFAULT_MAX_OUTPUT = 16384
     const CREDENTIAL_REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/u
     const COMPACTION_HEADROOM = 65536
+    const MODEL_SUMMARY_LIMIT = 12
     const WARMUP_CALL_TIMEOUT_MS = 11 * 60 * 1000
+    // Replaced on every apply; aborting it cancels every in-flight request
+    // from the previous plugin instance.
+    let lifecycleAbort = new AbortController()
 
     const zh = {
       'section.title': 'Qwen 模式',
@@ -200,11 +204,14 @@ window.__ModuleLoader__.load({
     }
 
     async function call(method, payload, options) {
+      const signal = options?.signal === undefined
+        ? lifecycleAbort.signal
+        : AbortSignal.any([lifecycleAbort.signal, options.signal])
       const response = await fetch(`${apiBase()}${API}/${method}`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(payload ?? {}),
-        signal: options?.signal,
+        signal,
       })
       const body = await response.json().catch(() => undefined)
       if (!response.ok || body?.ok !== true) throw new Error(body?.error?.message ?? `HTTP ${response.status}`)
@@ -304,6 +311,7 @@ window.__ModuleLoader__.load({
 
     const modelMetaState = {
       models: new Map(),
+      revision: -1,
       listeners: new Set(),
       timer: null,
       subscribers: 0,
@@ -312,13 +320,22 @@ window.__ModuleLoader__.load({
         if (modelMetaState.refreshing) return
         if (typeof document !== 'undefined' && document.hidden) return
         modelMetaState.refreshing = true
+        let changed = false
         try {
           const info = await call('modelInfo', undefined, { signal: AbortSignal.timeout(5000) })
-          modelMetaState.models = new Map(Object.entries(info?.models ?? {}))
+          const revision = Number.isSafeInteger(info?.revision) ? info.revision : null
+          // The host bumps its revision only when a model capability changed;
+          // otherwise every poll would re-render every mounted model label.
+          changed = revision === null || revision !== modelMetaState.revision || modelMetaState.models.size === 0
+          if (changed) {
+            modelMetaState.revision = revision ?? -1
+            modelMetaState.models = new Map(Object.entries(info?.models ?? {}))
+          }
         } catch {
           // Model metadata is optional; keep the last successful snapshot.
         }
         modelMetaState.refreshing = false
+        if (!changed) return
         for (const listener of modelMetaState.listeners) {
           try {
             listener()
@@ -338,11 +355,13 @@ window.__ModuleLoader__.load({
         return () => {
           modelMetaState.listeners.delete(listener)
           modelMetaState.subscribers -= 1
-          if (modelMetaState.subscribers === 0 && modelMetaState.timer !== null) {
-            window.clearInterval(modelMetaState.timer)
-            modelMetaState.timer = null
-          }
+          if (modelMetaState.subscribers === 0) modelMetaState.stopPolling()
         }
+      },
+      stopPolling() {
+        if (modelMetaState.timer === null) return
+        window.clearInterval(modelMetaState.timer)
+        modelMetaState.timer = null
       },
     }
 
@@ -442,7 +461,7 @@ window.__ModuleLoader__.load({
         })
       }, [provider?.id, model?.id])
       React.useEffect(() => {
-        if (placement !== 'trigger' || !selected) return
+        if (placement !== 'trigger' || !selected) return undefined
         preheat.scheduleComposerProbe()
         const key = sessionId ?? 'global'
         const selectedModel = provider?.id === 'from-geniex' && typeof model?.id === 'string' ? model.id : null
@@ -456,19 +475,30 @@ window.__ModuleLoader__.load({
             if (cooldownKey.startsWith(`${key}\u0000`)) lastWarmAt.delete(cooldownKey)
           }
         }
-        if (selectedModel === null) {
-          return
+        return () => {
+          // Do not leave a stale selection behind when the composer moves to
+          // another session or unmounts while a warm job is still queued.
+          if (preheat.selected.get(key) === selectedModel) preheat.setSelected(key, null)
+          if (selectedMtp.model === (selectedModel ?? '')) selectedMtp.model = ''
         }
-        if (!composerHasText) return
-        if (!preheatEnabled) return
+      }, [placement, selected, provider?.id, model?.id, sessionId])
+      React.useEffect(() => {
+        if (placement !== 'trigger' || !selected || !composerHasText || !preheatEnabled) return undefined
+        const key = sessionId ?? 'global'
+        const selectedModel = provider?.id === 'from-geniex' && typeof model?.id === 'string' ? model.id : null
+        if (selectedModel === null) return undefined
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), WARMUP_CALL_TIMEOUT_MS + 5000)
         const modelId = selectedModel
         const previous = warmChain.get(key) ?? Promise.resolve()
         const job = previous.then(async () => {
+          if (controller.signal.aborted) return
           if (preheat.bootDelay === null) {
             preheat.bootDelay = new Promise((resolve) => setTimeout(resolve, 500))
           }
           await preheat.bootDelay
           if (preheat.ready !== null) await preheat.ready
+          if (controller.signal.aborted) return
           if (preheat.selected.get(key) !== modelId) return
           if (!preheat.enabled || !preheat.hasText) return
           const loaded = warmState.states.has(modelId)
@@ -497,10 +527,11 @@ window.__ModuleLoader__.load({
           try {
             for (let attempt = 0; attempt < 2; attempt += 1) {
               try {
-                await call('warm', { model: modelId }, { signal: AbortSignal.timeout(WARMUP_CALL_TIMEOUT_MS) })
+                await call('warm', { model: modelId }, { signal: controller.signal })
                 failure = null
                 break
               } catch (error) {
+                if (controller.signal.aborted) return
                 failure = String(error?.message ?? error)
                 if (attempt === 0
                   && preheat.enabled
@@ -509,12 +540,14 @@ window.__ModuleLoader__.load({
                   // Provider discovery and the first model load can still be
                   // settling; retry once before reporting a warm failure.
                   await new Promise((resolve) => setTimeout(resolve, 800))
+                  if (controller.signal.aborted) return
                   if (!preheat.enabled || !preheat.hasText || preheat.selected.get(key) !== modelId) break
                   continue
                 }
                 break
               }
             }
+            if (controller.signal.aborted) return
             if (failure !== null) {
               lastWarmRevision.delete(modelKey)
               lastWarmAt.delete(modelKey)
@@ -533,6 +566,10 @@ window.__ModuleLoader__.load({
         warmChain.set(key, job.catch(() => {}))
         trimWarmTracking()
         void job
+        return () => {
+          clearTimeout(timer)
+          controller.abort()
+        }
       }, [placement, selected, provider?.id, model?.id, sessionId, warmRevision, preheatEnabled, composerHasText])
 
       const name = model?.name ?? model?.id ?? ''
@@ -658,6 +695,9 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         if (stats === null || stats === undefined || typeof document === 'undefined') return
+        // The host also sees other providers in the same session; this row is
+        // only this plugin's statistic.
+        if (stats.provider !== 'from-geniex' && stats.provider !== 'from-qwencloud') return
         const model = String(stats.model ?? '').split('/').pop().replace(/:[^:]+$/u, '')
         const ttftMs = Number(stats.netTtftMs ?? stats.ttftMs)
         if (!Number.isFinite(ttftMs)) return
@@ -687,45 +727,72 @@ window.__ModuleLoader__.load({
           appendSeparator()
           appendPart(t(average ? 'stats.avgTps' : 'stats.tps', { value: stats.tps }))
         }
-        let hiddenClock = null
+        let observer = null
+        let timer = null
+        let attempts = 0
         let timePart = null
         let timeSeparator = null
+        const hiddenClocks = new Set()
+        const restoreClocks = () => {
+          for (const clock of hiddenClocks) clock.style.display = ''
+          hiddenClocks.clear()
+        }
         const findEndInfo = () => {
           const row = [...document.querySelectorAll('[data-turn-tail]')]
             .find((element) => element.getAttribute('data-turn-tail') === String(turnNumber))
           return row?.querySelector('[class*="endInfo"]') ?? null
         }
-        const endInfo = findEndInfo()
-        if (endInfo === null) return
-        const place = () => {
-          const clock = endInfo.querySelector('[class*="timeEnd"]') ?? endInfo.lastElementChild
-          const timeText = clock?.textContent?.trim() ?? ''
-          if (timeText !== '') {
-            if (timePart === null) {
-              timeSeparator = appendSeparator()
-              timePart = document.createElement('span')
-              span.appendChild(timePart)
+        const connect = () => {
+          const endInfo = findEndInfo()
+          if (endInfo === null) {
+            // The row can mount a tick after the turn settles.
+            if (attempts < 5) {
+              attempts += 1
+              timer = setTimeout(connect, 400)
             }
-            timePart.textContent = timeText
-          } else if (timePart !== null) {
-            timePart.remove()
-            timePart = null
-            timeSeparator?.remove()
-            timeSeparator = null
+            return
           }
-          if (clock !== null && clock !== timePart) {
-            hiddenClock = clock
-            clock.style.display = 'none'
+          const place = () => {
+            // Only the shipped clock node is safe to hide; the last child can
+            // be an action control, and hiding/copying it corrupts the row.
+            const clock = endInfo.querySelector('[class*="timeEnd"]')
+            const timeText = clock?.textContent?.trim() ?? ''
+            if (timeText !== '') {
+              if (timePart === null) {
+                timeSeparator = appendSeparator()
+                timePart = document.createElement('span')
+                span.appendChild(timePart)
+              }
+              if (timePart.textContent !== timeText) timePart.textContent = timeText
+            } else if (timePart !== null) {
+              timePart.remove()
+              timePart = null
+              timeSeparator?.remove()
+              timeSeparator = null
+            }
+            for (const element of hiddenClocks) {
+              if (element === clock) continue
+              element.style.display = ''
+              hiddenClocks.delete(element)
+            }
+            if (clock !== null) {
+              hiddenClocks.add(clock)
+              clock.style.display = 'none'
+              if (!span.isConnected) endInfo.insertBefore(span, clock)
+            } else if (!span.isConnected) {
+              endInfo.appendChild(span)
+            }
           }
-          if (!span.isConnected) endInfo.insertBefore(span, clock)
+          place()
+          observer = new MutationObserver(place)
+          observer.observe(endInfo, { childList: true, characterData: true, subtree: true })
         }
-        place()
-        const observer = new MutationObserver(place)
-        observer.observe(endInfo, { childList: true })
+        connect()
         return () => {
-          observer.disconnect()
+          if (timer !== null) clearTimeout(timer)
+          observer?.disconnect()
           span.remove()
-          if (hiddenClock !== null) hiddenClock.style.display = ''
+          restoreClocks()
         }
       }, [stats, turnNumber, t])
       return null
@@ -749,8 +816,9 @@ window.__ModuleLoader__.load({
       if (value >= 1000) return `${(value / 1000).toFixed(1).replace(/\.0$/u, '')}K`
       return String(value)
     }
-    const MEASURE_STYLE = { visibility: 'hidden', left: 0, top: 0 }
-    const useAnchoredPosition = primitives.useAnchoredPosition
+    // One CSS anchor name per mounted pill; the portaled panel resolves it
+    // through `position-anchor` without any JavaScript layout work.
+    let usageAnchorSeq = 0
     const QwenUsagePill = React.memo(function QwenUsagePill({ sessionId, useProjection, getLocale }) {
       const usage = useProjection('tokenUsage')
       const [providerState, setProviderState] = React.useState(() => ({
@@ -760,15 +828,11 @@ window.__ModuleLoader__.load({
       const [open, setOpen] = React.useState(false)
       const buttonRef = React.useRef(null)
       const panelRef = React.useRef(null)
-      const anchored = useAnchoredPosition({
-        open,
-        anchorRef: buttonRef,
-        panelRef,
-        side: 'top',
-        align: 'start',
-        gap: 8,
-        margin: 12,
-      })
+      const anchorName = React.useRef(null)
+      if (anchorName.current === null) {
+        usageAnchorSeq += 1
+        anchorName.current = `--dsh-qwen-usage-${usageAnchorSeq}`
+      }
       const input = usage === undefined
         ? 0
         : (usage.uncachedInputTokens ?? 0) + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
@@ -810,6 +874,11 @@ window.__ModuleLoader__.load({
                 : { sessionId, geniex: true })
               if (timer !== null) clearInterval(timer)
               timer = null
+            } else if (value?.pending === false) {
+              // The host has finished replaying this session and knows it is
+              // not a GenieX session; more probes would only add load.
+              if (timer !== null) clearInterval(timer)
+              timer = null
             }
           } catch {
             // Transient status failures are retried by the next tick.
@@ -826,6 +895,14 @@ window.__ModuleLoader__.load({
           if (timer !== null) clearInterval(timer)
         }
       }, [hasUsage, sessionId])
+
+      React.useEffect(() => {
+        setOpen(false)
+      }, [sessionId])
+
+      React.useEffect(() => {
+        if (total <= 0) setOpen(false)
+      }, [total])
 
       React.useEffect(() => {
         if (!open) return undefined
@@ -846,34 +923,35 @@ window.__ModuleLoader__.load({
 
       if (providerState.sessionId !== sessionId || !providerState.geniex || total <= 0) return null
       const locale = String(getLocale?.() ?? 'zh')
-      const exact = exactFormatter(locale)
       const titleText = locale.startsWith('zh') ? 'Token 用量' : 'Token usage'
       const toggle = () => setOpen((current) => !current)
       const icon = h(primitives.IconDatabaseOutlineRegular, { key: 'icon' })
-      const details = h('dl', {
-        key: 'details',
-        className: 'qwen-usage-details',
-      }, [
-        h('dt', { key: 'input-label' }, locale.startsWith('zh') ? '输入' : 'Input'),
-        h('dd', { key: 'input-value' }, exact.format(input)),
-        h('dt', { key: 'output-label' }, locale.startsWith('zh') ? '输出' : 'Output'),
-        h('dd', { key: 'output-value' }, exact.format(output)),
-      ])
-      const panel = open ? h('div', {
-        ref: panelRef,
-        role: 'dialog',
-        'aria-label': titleText,
-        'data-qwen-usage-panel': '',
-        className: 'qwen-usage-panel',
-        style: anchored ?? MEASURE_STYLE,
-      }, [
-        h('div', { key: 'title', className: 'qwen-usage-title' }, [
-          h('span', { key: 'label', className: 'qwen-usage-title-label' }, [icon, titleText]),
-          h('span', { key: 'value', className: 'qwen-usage-title-value' }, exact.format(total)),
-        ]),
-        h('div', { key: 'rule', className: 'qwen-usage-title-rule', 'aria-hidden': true }),
-        details,
-      ]) : null
+      let panel = null
+      if (open) {
+        const exact = exactFormatter(locale)
+        panel = h('div', {
+          ref: panelRef,
+          role: 'dialog',
+          'aria-label': titleText,
+          'data-qwen-usage-panel': '',
+          className: 'qwen-usage-panel',
+          // The panel is portaled to <body>, so it must carry the anchor name
+          // itself; a custom property on the button does not cross the portal.
+          style: { '--dsh-qwen-usage-anchor': anchorName.current },
+        }, [
+          h('div', { key: 'title', className: 'qwen-usage-title' }, [
+            h('span', { key: 'label', className: 'qwen-usage-title-label' }, [icon, titleText]),
+            h('span', { key: 'value', className: 'qwen-usage-title-value' }, exact.format(total)),
+          ]),
+          h('div', { key: 'rule', className: 'qwen-usage-title-rule', 'aria-hidden': true }),
+          h('dl', { key: 'details', className: 'qwen-usage-details' }, [
+            h('dt', { key: 'input-label' }, locale.startsWith('zh') ? '输入' : 'Input'),
+            h('dd', { key: 'input-value' }, exact.format(input)),
+            h('dt', { key: 'output-label' }, locale.startsWith('zh') ? '输出' : 'Output'),
+            h('dd', { key: 'output-value' }, exact.format(output)),
+          ]),
+        ])
+      }
       return h('span', {
         'data-composer-stat': 'qwen-usage',
         className: 'qwen-usage-anchor',
@@ -888,6 +966,7 @@ window.__ModuleLoader__.load({
           'aria-label': `${formatCompactTokens(total)} tok`,
           onClick: toggle,
           className: 'qwen-usage-pill',
+          style: { '--dsh-qwen-usage-anchor': anchorName.current },
         }, [
           icon,
           h('span', { key: 'label', className: 'qwen-usage-label' }, `${formatCompactTokens(total)} tok`),
@@ -926,10 +1005,10 @@ window.__ModuleLoader__.load({
       // Scope the option-layout overrides to the one menu row this plugin
       // decorates; unscoped `button[role="option"]` rules reached every menu.
       alignStyle.textContent = [
-        'button[role="option"]:has([data-qwen-reply-icon]){align-items:center!important}',
-        'button[role="option"]:has([data-qwen-reply-icon])>span[aria-hidden="true"]{display:inline-flex!important;align-items:center!important;justify-content:center!important;width:14px!important;height:20px!important;flex:0 0 14px!important}',
-        'button[role="option"]:has([data-qwen-reply-icon])>span[aria-hidden="true"] svg{display:block;width:14px;height:14px}',
-        'button[role="option"]:has([data-qwen-reply-icon])>span[class*="itemName"]{display:flex!important;align-items:center!important;line-height:20px}',
+        'button[role="option"]:has([data-qwen-reply-icon]),button[role="menuitem"]:has([data-qwen-reply-icon]){align-items:center!important}',
+        'button[role="option"]:has([data-qwen-reply-icon])>span[aria-hidden="true"],button[role="menuitem"]:has([data-qwen-reply-icon])>span[aria-hidden="true"]{display:inline-flex!important;align-items:center!important;justify-content:center!important;width:14px!important;height:20px!important;flex:0 0 14px!important}',
+        'button[role="option"]:has([data-qwen-reply-icon])>span[aria-hidden="true"] svg,button[role="menuitem"]:has([data-qwen-reply-icon])>span[aria-hidden="true"] svg{display:block;width:14px;height:14px}',
+        'button[role="option"]:has([data-qwen-reply-icon])>span[class*="itemName"],button[role="option"]:has([data-qwen-reply-icon])>span[class*="itemLabel"],button[role="menuitem"]:has([data-qwen-reply-icon])>span[class*="itemName"],button[role="menuitem"]:has([data-qwen-reply-icon])>span[class*="itemLabel"]{display:flex!important;align-items:center!important;line-height:20px}',
         '[data-qwen-reply-icon]{height:20px!important;min-height:20px!important;align-self:center!important;transform:none!important}',
         'button:has([data-qwen-reply-icon])>[class*="triggerLabel"]{display:inline-flex;align-items:center}',
         'button:has([data-qwen-reply-icon])>[class*="triggerIcon"]{display:inline-flex;align-items:center;justify-content:center}',
@@ -962,8 +1041,15 @@ window.__ModuleLoader__.load({
         span.appendChild(svg)
         return span
       }
-      const hasReplyLabel = (host) => [...host.childNodes].some((node) =>
-        node.nodeType === Node.TEXT_NODE && REPLY_LABELS.has(node.nodeValue?.trim() ?? ''))
+      // The shipped picker wraps its text in a label span, so the reply-only
+      // text is not a direct child of the button: walk the subtree instead.
+      const hasReplyLabel = (host) => {
+        const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT)
+        for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+          if (REPLY_LABELS.has(node.nodeValue?.trim() ?? '')) return true
+        }
+        return false
+      }
       const guards = new Set()
       const guardIcon = (host, icon) => {
         const guard = new MutationObserver(() => {
@@ -1018,21 +1104,33 @@ window.__ModuleLoader__.load({
         })
       }
       const observer = new MutationObserver((mutations) => {
-        // Newly mounted buttons can be decorated immediately, before paint.
+        // The permission picker mounts and localizes its rows as ordinary
+        // DOM; unrelated chat streaming must never trigger a full-document
+        // button scan. Only an added label or a changed label text matters.
         for (const mutation of mutations) {
+          if (mutation.type === 'characterData') {
+            const raw = mutation.target.nodeValue
+            if (typeof raw !== 'string' || raw.length > 20) continue
+            if (REPLY_LABELS.has(raw.trim())) {
+              schedule()
+              return
+            }
+            continue
+          }
           for (const node of mutation.addedNodes) {
             if (node.nodeType !== Node.ELEMENT_NODE) continue
-            if (node.tagName !== 'BUTTON' && node.querySelector?.('button') === null) continue
+            const interactive = node.matches?.('button,[role="option"],[role="menuitem"]') === true
+              || node.querySelector?.('button,[role="option"],[role="menuitem"]') !== null
+            if (!interactive) continue
             const label = node.textContent ?? ''
             if (label.includes('仅回复') || label.includes('Reply Only')) {
-              scan()
+              schedule()
               return
             }
           }
         }
-        schedule()
       })
-      observer.observe(document.body, { childList: true, subtree: true })
+      observer.observe(document.body, { childList: true, subtree: true, characterData: true })
       scan()
       return () => {
         observer.disconnect()
@@ -1108,8 +1206,25 @@ window.__ModuleLoader__.load({
       timer: null,
       interval: null,
       style: null,
+      attempts: 0,
     }
-    const SEND_LABELS = new Set(['发送消息', 'Send message', '发送', 'Send'])
+    // Current builds label the primary action by delivery mode, and ship more
+    // locales than this plugin's own dictionaries: match the send family first,
+    // then any remaining composer primary action that is not stop/continue.
+    const SEND_LABELS = new Set([
+      '发送消息', 'Send message', '发送', 'Send',
+      '排队发送', 'Queue message', '插话发送', 'Steer message',
+      '正在发送消息', 'Sending message',
+    ])
+    const NON_SEND_LABELS = new Set([
+      '停止生成', 'Stop generating', '继续生成', 'Continue generating',
+      '生成を停止', '生成を続ける',
+      'Detener generación', 'Continuar generando',
+      'Arrêter la génération', 'Continuer la génération',
+      'Generierung stoppen', 'Generierung fortsetzen',
+      'Остановить генерацию', 'Продолжить генерацию',
+      'Parar geração', 'Continuar gerando',
+    ])
     const REPLY_LABELS = new Set(['仅回复', 'Reply Only'])
     function findComposerEditor() {
       if (preheat.editor?.isConnected === true) return preheat.editor
@@ -1148,21 +1263,28 @@ window.__ModuleLoader__.load({
         sendWarm.button.removeAttribute('data-qwen-warm-hidden')
         sendWarm.button = null
       }
+      sendWarm.attempts = 0
     }
     function findSendButton() {
-      for (const button of document.querySelectorAll('button[aria-label]')) {
-        const label = button.getAttribute('aria-label')
-        if (label === null || !SEND_LABELS.has(label.trim())) continue
-        if (!String(button.className).includes('_primary')) continue
-        return button
+      let fallback = null
+      // The primary-action class is a cheap pre-filter; without it every
+      // aria-labelled button in the page (toolbars, menus) would be scanned.
+      for (const button of document.querySelectorAll('button[class*="_primary"][aria-label]')) {
+        const name = (button.getAttribute('aria-label') ?? '').trim()
+        if (name === '') continue
+        if (SEND_LABELS.has(name)) return button
+        if (fallback === null && !NON_SEND_LABELS.has(name)
+          && button.closest('[data-composer-card]') !== null) {
+          fallback = button
+        }
       }
-      return null
+      return fallback
     }
 
     /** Force a choice before a VLM image send that would otherwise ignore the images under MTP. */
     function installMtpSendGuard(t) {
       if (typeof document === 'undefined') return () => {}
-      const panel = { node: null, busy: false, openedAt: 0 }
+      const panel = { node: null, busy: false, openedAt: 0, controller: null }
       const composerHasImages = (button) => {
         let node = button.parentElement
         let root = null
@@ -1178,12 +1300,18 @@ window.__ModuleLoader__.load({
         return root.querySelector('img, [class*="imagePreview"], [class*="rail"] img') !== null
       }
       const close = () => {
+        panel.controller?.abort()
+        panel.controller = null
+        window.removeEventListener('resize', close)
+        document.removeEventListener('scroll', close, true)
         if (panel.node !== null) panel.node.remove()
         panel.node = null
         panel.busy = false
       }
       const open = (button, model) => {
         if (panel.node !== null) return
+        const controller = new AbortController()
+        panel.controller = controller
         const rect = button.getBoundingClientRect()
         const node = document.createElement('div')
         node.setAttribute('data-qwen-mtp-choice', '')
@@ -1222,17 +1350,23 @@ window.__ModuleLoader__.load({
           note.style.cssText = 'color:var(--dsw-alias-label-secondary);font-size:11px;margin-top:2px;'
           buttonNode.append(strong, note)
           buttonNode.onclick = async () => {
-            if (panel.busy) return
+            if (panel.busy || panel.node === null) return
             panel.busy = true
             buttonNode.disabled = true
             try {
-              await call('mtpChoice', { model, allow }, { signal: AbortSignal.timeout(5000) })
+              await call('mtpChoice', { model, allow }, {
+                signal: AbortSignal.any([controller.signal, AbortSignal.timeout(5000)]),
+              })
             } catch (error) {
+              if (controller.signal.aborted) return
               body.textContent = String(error?.message ?? error)
               buttonNode.disabled = false
               panel.busy = false
               return
             }
+            // The panel may have been cancelled while the choice was saving;
+            // never send after the user closed it.
+            if (controller.signal.aborted || panel.node !== node) return
             close()
             mtpGuardBypass = true
             button.click()
@@ -1249,10 +1383,21 @@ window.__ModuleLoader__.load({
         document.body.appendChild(node)
         panel.node = node
         panel.openedAt = Date.now()
+        window.addEventListener('resize', close)
+        // The panel is positioned from the button's rect; any scroll invalidates it.
+        document.addEventListener('scroll', close, true)
       }
 
       let mtpGuardBypass = false
       const onClick = (event) => {
+        const model = selectedMtp.model
+        if (panel.node === null) {
+          // Cheap path for the overwhelming majority of clicks: no open
+          // choice, or the selected model cannot use MTP with images.
+          if (model === '') return
+          const current = modelMetaState.models.get(model)
+          if (current?.vision !== true || current.mtpReady !== true || current.mtpEnabled !== true) return
+        }
         const button = findSendButton()
         const isSend = button !== null && event.target instanceof Node && button.contains(event.target)
         if (panel.node !== null && event.target instanceof Node && !panel.node.contains(event.target)) {
@@ -1273,7 +1418,6 @@ window.__ModuleLoader__.load({
           mtpGuardBypass = false
           return
         }
-        const model = selectedMtp.model
         if (model === '') return
         const meta = modelMetaState.models.get(model)
         if (meta?.vision !== true || meta.mtpReady !== true || meta.mtpEnabled !== true) return
@@ -1283,7 +1427,17 @@ window.__ModuleLoader__.load({
         open(button, model)
       }
       const onKeyDown = (event) => {
-        if (event.key === 'Escape') close()
+        if (event.key === 'Escape') {
+          close()
+          return
+        }
+        // Enter can send without a click; keep the unresolved image/MTP
+        // choice in front of it instead of letting the send bypass the panel.
+        if (panel.node !== null && event.key === 'Enter' && !event.shiftKey && !event.isComposing
+          && !panel.node.contains(event.target)) {
+          event.preventDefault()
+          event.stopImmediatePropagation()
+        }
       }
       document.addEventListener('click', onClick, true)
       document.addEventListener('keydown', onKeyDown)
@@ -1306,7 +1460,10 @@ window.__ModuleLoader__.load({
       }
       const button = findSendButton()
       if (button === null) {
-        if (sendWarm.timer === null) {
+        // The composer may still be mounting; retry briefly, but never leave a
+        // timer running for the whole warmup when no send button exists.
+        if (sendWarm.timer === null && sendWarm.attempts < 20) {
+          sendWarm.attempts += 1
           sendWarm.timer = setTimeout(() => {
             sendWarm.timer = null
             showSendWarm()
@@ -1314,6 +1471,7 @@ window.__ModuleLoader__.load({
         }
         return
       }
+      sendWarm.attempts = 0
       const spinner = document.createElement('span')
       spinner.setAttribute('data-qwen-send-spinner', '')
       spinner.setAttribute('role', 'status')
@@ -1368,6 +1526,7 @@ window.__ModuleLoader__.load({
     }
     const preheat = {
       enabled: false,
+      disposed: false,
       ready: null,
       bootDelay: null,
       hasText: false,
@@ -1380,6 +1539,11 @@ window.__ModuleLoader__.load({
       listeners: new Set(),
       subscribe(listener) {
         preheat.listeners.add(listener)
+        try {
+          listener()
+        } catch {
+          // A label can unmount between subscription and notification.
+        }
         return () => {
           preheat.listeners.delete(listener)
         }
@@ -1400,6 +1564,7 @@ window.__ModuleLoader__.load({
         preheat.textObserverTarget = editor
       },
       probeComposerNow() {
+        if (preheat.disposed) return
         const editor = findComposerEditor()
         if (editor === null) {
           preheat.textObserver?.disconnect()
@@ -1411,7 +1576,7 @@ window.__ModuleLoader__.load({
         preheat.setHasText(editorHasText(editor))
       },
       scheduleComposerProbe() {
-        if (preheat.textFrame !== null) return
+        if (preheat.disposed || preheat.textFrame !== null) return
         preheat.textFrame = window.requestAnimationFrame(() => {
           preheat.textFrame = null
           preheat.probeComposerNow()
@@ -1492,18 +1657,23 @@ window.__ModuleLoader__.load({
         for (const listener of preheat.listeners) listener()
       },
     }
-    preheat.ready = (async () => {
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        try {
-          const next = await readState()
-          preheat.setEnabled(next?.mode === 'auto' && next?.warm === true)
-          preheat.scheduleComposerProbe()
-          return
-        } catch {
-          if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 500))
+    /** Read the initial settings once, after the page has a live API. */
+    function startPreheat() {
+      return (async () => {
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          if (preheat.disposed) return
+          try {
+            const next = await readState()
+            if (preheat.disposed) return
+            preheat.setEnabled(next?.mode === 'auto' && next?.warm === true)
+            preheat.scheduleComposerProbe()
+            return
+          } catch {
+            if (attempt < 2) await new Promise((resolve) => setTimeout(resolve, 500))
+          }
         }
-      }
-    })()
+      })()
+    }
 
     /**
      * Detect whether the composer holds text without polling it. Input,
@@ -1595,15 +1765,25 @@ window.__ModuleLoader__.load({
       const [error, setError] = React.useState('')
       const [busy, setBusy] = React.useState('')
 
+      const modelInfoBusy = React.useRef(false)
+      const protocolRef = React.useRef(settings?.protocol)
+      protocolRef.current = settings?.protocol
       const refreshModelInfo = React.useCallback(async (protocol) => {
         if (protocol !== 'geniex') {
           setModelInfo({ revision: 0, models: {} })
           return
         }
+        if (modelInfoBusy.current) return
+        modelInfoBusy.current = true
         try {
-          setModelInfo(await call('modelInfo', undefined, { signal: AbortSignal.timeout(10000) }))
+          const next = await call('modelInfo', undefined, { signal: AbortSignal.timeout(10000) })
+          // A protocol change while this request was in flight owns the page;
+          // the late GenieX catalog must not replace it.
+          if (protocolRef.current === 'geniex') setModelInfo(next)
         } catch {
           // Model metadata is optional.
+        } finally {
+          modelInfoBusy.current = false
         }
       }, [])
 
@@ -1612,6 +1792,7 @@ window.__ModuleLoader__.load({
         for (let attempt = 0; attempt < 2; attempt += 1) {
           try {
             const next = await readState()
+            protocolRef.current = next?.protocol
             setSettings(next)
             setError('')
             if (next.protocol === 'geniex') void refreshModelInfo('geniex')
@@ -1633,18 +1814,31 @@ window.__ModuleLoader__.load({
       const syncFollow = React.useRef(0)
       const followPendingSync = React.useCallback(async () => {
         const token = ++syncFollow.current
-        for (let attempt = 0; attempt < 360; attempt += 1) {
-          await new Promise((resolve) => setTimeout(resolve, 500))
+        // A provider sync can take a while on a congested local link; poll
+        // with backoff so a slow sync does not add a request every 500 ms.
+        let wait = 500
+        let failures = 0
+        for (let attempt = 0; attempt < 90; attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, wait))
           if (syncFollow.current !== token) return
+          const generation = stateStore.generation
           let next
           try {
             next = await call('state', undefined, { signal: AbortSignal.timeout(5000) })
+            failures = 0
           } catch {
-            return
+            failures += 1
+            if (failures >= 3) return
+            wait = Math.min(4000, Math.round(wait * 2))
+            continue
           }
           if (syncFollow.current !== token) return
+          // A save/apply/remove that completed while this poll was in flight
+          // owns the fresher state; do not overwrite it with the older answer.
+          if (stateStore.generation !== generation) return
           stateStore.generation += 1
           stateStore.value = next
+          protocolRef.current = next?.protocol
           setSettings(next)
           if (next?.pendingSync !== true) {
             void refreshModelInfo(next?.protocol)
@@ -1652,6 +1846,7 @@ window.__ModuleLoader__.load({
             void warmState.refresh()
             return
           }
+          wait = Math.min(2000, Math.round(wait * 1.5))
         }
       }, [refreshModelInfo])
       React.useEffect(() => () => {
@@ -1667,6 +1862,9 @@ window.__ModuleLoader__.load({
 
       const modelPollCount = React.useRef(0)
       React.useEffect(() => {
+        modelPollCount.current = 0
+      }, [settings?.protocol])
+      React.useEffect(() => {
         if (settings?.protocol !== 'geniex') return undefined
         const hasModels = modelInfo !== null && Object.keys(modelInfo.models ?? {}).length > 0
         if (hasModels) {
@@ -1675,6 +1873,7 @@ window.__ModuleLoader__.load({
         }
         if (modelPollCount.current >= 12) return undefined
         const timer = window.setInterval(() => {
+          if (typeof document !== 'undefined' && document.hidden) return
           modelPollCount.current += 1
           if (modelPollCount.current > 12) {
             window.clearInterval(timer)
@@ -1701,6 +1900,7 @@ window.__ModuleLoader__.load({
           if (next !== undefined) {
             stateStore.generation += 1
             stateStore.value = next
+            protocolRef.current = next.protocol
             setSettings(next)
             void refreshModelInfo(next.protocol)
             void modelMetaState.refresh()
@@ -1900,7 +2100,12 @@ window.__ModuleLoader__.load({
           ]),
           h('div', { key: 'models', style: S.modelList }, models.length === 0
             ? t('noModels')
-            : format(t('provider.modelsFound'), { count: models.length, models: models.join(', ') })),
+            : format(t('provider.modelsFound'), {
+                count: models.length,
+                models: models.length <= MODEL_SUMMARY_LIMIT
+                  ? models.join(', ')
+                  : `${models.slice(0, MODEL_SUMMARY_LIMIT).join(', ')} … +${models.length - MODEL_SUMMARY_LIMIT}`,
+              })),
           h('div', { key: 'actions', style: S.row }, [
             h('button', {
               key: 'rebuild',
@@ -2148,6 +2353,38 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale'],
       apply(ctx) {
+        const controller = new AbortController()
+        lifecycleAbort = controller
+        // Client module state survives a hot reload; start every generation
+        // from a clean slate so stale warm/meta snapshots cannot leak in.
+        warmState.states.clear()
+        warmState.revisions.clear()
+        warmState.warming.clear()
+        warmState.remoteWarming.clear()
+        warmState.errors.clear()
+        warmState.failures = 0
+        warmState.revision = 0
+        modelMetaState.models.clear()
+        modelMetaState.revision = -1
+        preheat.disposed = false
+        preheat.active.clear()
+        preheat.selected.clear()
+        lastProvider.clear()
+        lastWarmAt.clear()
+        lastWarmRevision.clear()
+        warmChain.clear()
+        selectedMtp.model = ''
+        clearSendWarm()
+        preheat.ready = startPreheat()
+        ctx.effect(() => () => {
+          controller.abort()
+          if (controller !== lifecycleAbort) return
+          preheat.disposed = true
+          preheat.ready = null
+          warmState.stopPolling()
+          modelMetaState.stopPolling()
+          clearSendWarm()
+        }, 'qwen-mode: client lifecycle')
         ctx.effect(() => {
           const report = (message, stack) => {
             const text = `${message}\n${stack}`
@@ -2166,19 +2403,22 @@ window.__ModuleLoader__.load({
         if (typeof document !== 'undefined') {
           const style = document.createElement('style')
           style.id = 'qwen-model-labels'
-          style.textContent = 'button[role="option"] [data-provider-id]{display:flex!important;align-items:center!important;width:100%!important;min-width:0!important}@keyframes qwen-model-name-marquee{from{transform:translateX(0)}to{transform:translateX(calc(-1 * var(--qwen-model-name-distance,0px)))}}body:has([data-qwen-usage]) [data-composer-stat="usage"]{display:none!important}'
+          style.textContent = 'button[role="option"] [data-provider-id],button[role="menuitem"] [data-provider-id]{display:flex!important;align-items:center!important;width:100%!important;min-width:0!important}@keyframes qwen-model-name-marquee{from{transform:translateX(0)}to{transform:translateX(calc(-1 * var(--qwen-model-name-distance,0px)))}}body:has([data-qwen-usage]) [data-composer-stat="usage"]{display:none!important}'
           document.head.appendChild(style)
           ctx.effect(() => () => style.remove(), 'qwen-mode: model label styles')
           const usageStyle = document.createElement('style')
           usageStyle.id = 'qwen-usage-style'
           usageStyle.textContent = [
             '.qwen-usage-anchor{min-width:0;font-size:calc(var(--dsh-content-font-size-secondary,13px) - 1px);line-height:calc(20px + var(--dsh-content-font-delta-secondary,0px));display:inline-flex}',
-            '.qwen-usage-pill{box-sizing:border-box;border-radius:var(--dsw-radius-sm);max-width:100%;color:var(--dsw-alias-label-tertiary);font:inherit;font-variant-numeric:tabular-nums;line-height:inherit;white-space:nowrap;background:0 0;border:none;align-items:center;gap:6px;padding:1px 8px;display:inline-flex;cursor:pointer}',
+            '.qwen-usage-pill{box-sizing:border-box;anchor-name:var(--dsh-qwen-usage-anchor);border-radius:var(--dsw-radius-sm);max-width:100%;color:var(--dsw-alias-label-tertiary);font:inherit;font-variant-numeric:tabular-nums;line-height:inherit;white-space:nowrap;background:0 0;border:none;align-items:center;gap:6px;padding:1px 8px;display:inline-flex;cursor:pointer}',
             '.qwen-usage-pill svg{flex:none;width:14px;height:14px}',
             '.qwen-usage-pill[aria-expanded=true]{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}',
             '@media (hover:hover){.qwen-usage-pill:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-secondary)}}',
             '.qwen-usage-label{text-overflow:ellipsis;min-width:0;overflow:hidden}',
-            '.qwen-usage-panel{z-index:1100;box-sizing:border-box;width:max-content;min-width:min(300px,calc(100vw - 24px),var(--dsh-anchored-max-width,100vw));max-width:min(440px,calc(100vw - 24px),var(--dsh-anchored-max-width,100vw));border-radius:var(--dsw-radius-lg);background:var(--dsw-specific-menu);backdrop-filter:var(--dsw-menu-backdrop-filter);--dsw-elevation-stroke-color:var(--dsw-alias-border-l1);box-shadow:var(--dsw-elevation-prominent);color:var(--dsw-alias-label-secondary);cursor:default;max-height:var(--dsh-anchored-max-height,none);--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2);border:0;padding:16px;font-size:12px;line-height:18px;position:fixed;overflow:hidden auto}',
+            '.qwen-usage-panel{z-index:1100;box-sizing:border-box;position:fixed;position-anchor:var(--dsh-qwen-usage-anchor);bottom:max(12px,calc(anchor(top) + 8px));left:max(12px,anchor(left));width:max-content;min-width:min(300px,calc(100vw - 24px));max-width:min(440px,calc(100vw - 24px));max-height:min(60dvh,calc(100dvh - 96px));position-try-fallbacks:--qwen-usage-below,--qwen-usage-flip,--qwen-usage-window;border-radius:var(--dsw-radius-lg);background:var(--dsw-specific-menu);backdrop-filter:var(--dsw-menu-backdrop-filter);--dsw-elevation-stroke-color:var(--dsw-alias-border-l1);box-shadow:var(--dsw-elevation-prominent);color:var(--dsw-alias-label-secondary);cursor:default;--dsh-scrollbar-thumb:var(--dsw-alias-scrollbar-bg-l2);--dsh-scrollbar-thumb-hover:var(--dsw-alias-scrollbar-hover-l2);border:0;padding:16px;font-size:12px;line-height:18px;overflow:hidden auto}',
+            '@position-try --qwen-usage-below{top:max(12px,calc(anchor(bottom) + 8px));bottom:auto}',
+            '@position-try --qwen-usage-flip{left:auto;right:max(12px,anchor(right))}',
+            '@position-try --qwen-usage-window{top:12px;left:12px;right:12px;bottom:12px;width:auto;min-width:0;max-width:none}',
             '.qwen-usage-title{color:var(--dsw-alias-label-primary);justify-content:space-between;gap:16px;margin-bottom:8px;font-weight:500;display:flex}',
             '.qwen-usage-title-rule{border-top:.5px solid var(--dsw-alias-border-l2);margin-bottom:10px}',
             '.qwen-usage-title-value{font-variant-numeric:tabular-nums}',

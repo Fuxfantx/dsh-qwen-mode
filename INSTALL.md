@@ -1,13 +1,13 @@
-# DSH Qwen mode — offline install / 离线安装
+# DSH Qwen Mode — offline install / 离线安装
 
-Version / 版本: **1.8.1**
+Version / 版本: **1.8.2**
 
 ## 中文
 
 压缩包内容：
 
-- `dsh-qwen-mode/` — 解压后的插件目录。
-- `dsh-qwen-mode-1.8.1.tgz` — npm tarball。
+- `dsh-qwen-mode/` — 插件目录。
+- `dsh-qwen-mode-1.8.2.tgz` — npm tarball。
 - `INSTALL.md` — 本说明。
 
 安装：
@@ -16,7 +16,7 @@ Version / 版本: **1.8.1**
 2. 在目标 DSH 的 Plugins / Plugin Manager 中选择本地目录安装；如果当前版本没有本地安装入口，让 Agent 使用 `plugin_manager` 的 `install_bundle`，`target` 填 `dsh-qwen-mode` 目录的绝对路径。
 3. 刷新 DSH 页面，打开 **Settings → Qwen mode**。
 4. 选择 GenieX 或 QwenCloud，填写上游地址：
-   - GenieX 可填 `http://127.0.0.1:18181`；
+   - GenieX 可填 `http://127.0.0.1:18181`。
    - QwenCloud 填写完整兼容端点（例如 `https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1`）。
 5. 使用 QwenCloud 时，在「API Key 变量名」填写保存 Key 的环境变量名（例如 `DASHSCOPE_API_KEY`），并在启动 DSH 的环境中导出该变量；该字段接收变量名，不是 Key 本身。
 6. 点击「保存并应用」，插件会自动创建 **From GenieX** / **From QwenCloud** Provider。
@@ -30,12 +30,14 @@ Version / 版本: **1.8.1**
 dsh plugin --profile <profile> add github:Fuxfantx/dsh-qwen-mode
 ```
 
+卸载：在 DSH 运行时从 **Plugins** 页停用或卸载；「仅回复」权限预设会随插件移除，DSH 自带的其它权限预设不受影响。
+
 ## English
 
 Archive contents:
 
-- `dsh-qwen-mode/` — unpacked plugin directory.
-- `dsh-qwen-mode-1.8.1.tgz` — npm tarball.
+- `dsh-qwen-mode/` — the plugin directory.
+- `dsh-qwen-mode-1.8.2.tgz` — npm tarball.
 - `INSTALL.md` — this file.
 
 Install:
@@ -57,3 +59,5 @@ It can also be installed straight from GitHub:
 ```sh
 dsh plugin --profile <profile> add github:Fuxfantx/dsh-qwen-mode
 ```
+
+Uninstall: disable or uninstall from the **Plugins** page while DSH is running. The Reply Only permission preset is removed with the plugin; DSH's own permission presets are unaffected.

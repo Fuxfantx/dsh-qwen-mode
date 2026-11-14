@@ -52,12 +52,17 @@ const DEFAULT_GENIEX_CONTEXT = 131072
 // A QAIRT context window is compiled into the bundle and cannot be changed by
 // `nctx`; assuming the much larger llama.cpp default would over-claim it.
 const DEFAULT_QAIRT_CONTEXT = 32768
+// A discovery response is untrusted input; cap the catalog before resolving
+// capabilities one file per model.
+const MAX_DISCOVERED_MODELS = 2000
 // The output cap is a per-request reservation shared with the prompt, so a
 // local model needs a prompt budget far larger than its answer budget.
 const DEFAULT_MAX_OUTPUT = 16384
 const DISCOVERY_TIMEOUT_MS = 15000
 const DISCOVERY_ATTEMPTS = 2
 const WARMUP_TIMEOUT_MS = 10 * 60 * 1000
+const UPSTREAM_IDLE_TIMEOUT_MS = 10 * 60 * 1000
+const STATUS_CACHE_MS = 2000
 const SYNC_RETRY_DELAYS = [1000, 3000, 8000, 15000]
 const MTP_SPEC_TYPE = 'draft-mtp'
 const MTP_DRAFT_TOKENS = 3
@@ -70,7 +75,9 @@ const MEDIA_PART_TYPES = new Set(['image_url', 'input_image', 'image', 'input_au
 const HOP_BY_HOP = ['connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization', 'te', 'trailer', 'transfer-encoding', 'upgrade']
 const SUPPORTED_MODES = ['off', 'auto']
 const VIT_COMPUTE_VALUES = new Set(['', 'cpu', 'gpu', 'npu'])
-const REPLY_ONLY_KEY = 'reply-only'
+const REPLY_ONLY_KEY = 'qmode-reply-only'
+/** The key earlier releases wrote; migrated on load and when localizing. */
+const LEGACY_REPLY_ONLY_KEY = 'reply-only'
 /** Settings the settings page may write; everything else is host-owned. */
 const SAVE_FIELDS = [
   'mode',
@@ -105,6 +112,22 @@ const DEFAULTS = {
 
 /** Services required by the proxy, provider maintenance, and settings API. */
 export const inject = ['webServer', 'connection', 'configEditor', 'credentials', 'permissionPresets', 'sessions', 'agents', 'tools']
+
+/**
+ * The active profile directory. `profileContext` owns it; the environment and
+ * the host cwd are fallbacks for hosts that do not expose that service.
+ */
+function profileDirectory(ctx) {
+  try {
+    if (typeof ctx.get === 'function') {
+      const dir = text(ctx.get('profileContext')?.dir)
+      if (dir !== '') return dir
+    }
+  } catch {
+    // Fall through to the launch environment.
+  }
+  return text(process.env.DSH_PROFILE_DIR) || process.cwd()
+}
 
 function normalizeUpstream(value) {
   const candidate = text(value).replace(/\/+$/u, '')
@@ -148,7 +171,6 @@ function integerOrNull(value, min, max) {
 function normalizeSettings(raw) {
   const source = raw !== null && typeof raw === 'object' ? raw : {}
   const protocol = source.protocol === 'qwen' ? 'qwen' : 'geniex'
-  const proxyPort = positiveIntOrNull(source.proxyPort)
   const contextWindow = positiveIntOrNull(source.contextWindow)
   const maxOutput = positiveInt(source.maxOutputTokens, DEFAULTS.maxOutputTokens)
   const ceiling = contextWindow ?? (protocol === 'qwen' ? DEFAULT_QWEN_CONTEXT : null)
@@ -160,8 +182,10 @@ function normalizeSettings(raw) {
     protocol,
     upstream: normalizeUpstream(source.upstream),
     apiKeyEnv: normalizeApiKeyRef(source.apiKeyEnv),
-    proxyPort: proxyPort !== null && proxyPort < 65536 ? proxyPort : DEFAULT_PROXY_PORT,
-    managedProviderId: text(source.managedProviderId) || null,
+    proxyPort: integerOrNull(source.proxyPort, 1, 65535) ?? DEFAULT_PROXY_PORT,
+    managedProviderId: Object.values(PROVIDERS).some((provider) => provider.id === source.managedProviderId)
+      ? source.managedProviderId
+      : null,
     contextWindow,
     maxOutputTokens: ceiling === null ? maxOutput : Math.min(maxOutput, ceiling),
     autoNctx: source.autoNctx === true,
@@ -181,7 +205,9 @@ function normalizeSettings(raw) {
     frequencyPenalty: clampedNumber(source.frequencyPenalty, -2, 2),
     // GenieX casts the seed to int32; keep one range valid for both sources.
     seed: integerOrNull(source.seed, 0, 2147483647),
-    lastError: text(source.lastError) || null,
+    // The preset exists only while this plugin is loaded; the label locale is
+    // kept here so a reload can restore it before the page reports the locale.
+    replyOnlyLocale: text(source.replyOnlyLocale).toLowerCase().slice(0, 35),
   }
 }
 
@@ -196,7 +222,8 @@ function providerNameFor(protocol) {
 function apiKeyRef(settings) {
   // Only QwenCloud authenticates. A key reference remembered from a previous
   // QwenCloud selection must not follow the user back to GenieX.
-  return settings.protocol === 'qwen' ? text(settings.apiKeyEnv) || 'local' : 'local'
+  if (settings.protocol !== 'qwen') return 'local'
+  return text(settings.apiKeyEnv)
 }
 
 function proxyBaseURL(port) {
@@ -263,8 +290,8 @@ function requestedThinking(body) {
 function inferenceFields(settings, vision) {
   const fields = {}
   if (settings.compute !== '') fields.compute = settings.compute
-  // Only image requests select the vision encoder; text requests keep the
-  // GenieX default for that backend.
+  // Vision models always carry the encoder choice, including warmup and text
+  // requests, so every request hits the same GenieX load cache key.
   if (vision && settings.vitCompute !== '') fields.vit_compute = settings.vitCompute
   return fields
 }
@@ -455,10 +482,13 @@ function readProviderConfig(ctx) {
 }
 
 /** Merge a change into the provider table through one config edit. */
-async function editProviders(ctx, change) {
-  if (runtime.disposed) return
+async function editProviders(ctx, change, instance = runtime) {
+  if (!isLive(instance)) return
   const { entry } = readProviderConfig(ctx)
   await runConfigEdit(ctx, entry, (current, inherited) => {
+    // The plugin may have been replaced while this edit waited in the HMR
+    // queue; refuse the write instead of resurrecting the old provider.
+    if (!isLive(instance)) throw new Error('plugin instance was replaced')
     const config = { ...(inherited ?? {}), ...(current ?? {}) }
     const providers = providerMap(inherited, current)
     change(providers)
@@ -467,8 +497,10 @@ async function editProviders(ctx, change) {
 }
 
 async function credentialHeader(ctx, settings) {
+  const ref = apiKeyRef(settings)
+  if (ref === '') return {}
   try {
-    const value = (await ctx.credentials.resolve(apiKeyRef(settings)))?.value ?? ''
+    const value = (await ctx.credentials.resolve(ref))?.value ?? ''
     return value === '' ? {} : { authorization: `Bearer ${value}` }
   } catch {
     return {}
@@ -551,6 +583,7 @@ async function discoverModels(ctx, settings, capabilities) {
   const body = await fetchJson(url, { headers, timeout: DISCOVERY_TIMEOUT_MS, attempts: DISCOVERY_ATTEMPTS })
   const rows = Array.isArray(body?.data) ? body.data : []
   const ids = [...new Set(rows.map((row) => (typeof row?.id === 'string' ? row.id.trim() : '')).filter((id) => id !== ''))]
+    .slice(0, MAX_DISCOVERED_MODELS)
   if (ids.length === 0) throw httpError(502, 'model discovery returned no models')
   const resolved = new Map()
   await mapLimit(ids, 4, async (id) => {
@@ -569,19 +602,22 @@ function providerSettingsKey(settings = runtime.settings) {
 
 /** Whether the settings that produced one provider snapshot are still current. */
 function providerSettingsCurrent(snapshot) {
-  return !runtime.disposed && providerSettingsKey(runtime.settings) === providerSettingsKey(snapshot)
+  return isLive(runtime) && providerSettingsKey(runtime.settings) === providerSettingsKey(snapshot)
 }
 
-async function upsertProvider(ctx, settings) {
+async function upsertProvider(ctx, settings, instance = runtime) {
   const keyRef = apiKeyRef(settings)
   if (keyRef === 'local') await ensureLocalCredential(ctx)
   const { models, capabilities } = await discoverModels(ctx, settings, runtimeCapabilities(ctx))
+  if (!isLive(instance)) return null
   const id = providerIdFor(settings.protocol)
   const desired = {
     displayName: providerNameFor(settings.protocol),
     api: 'openai-completions',
     baseURL: proxyBaseURL(settings.proxyPort),
-    apiKeyEnv: keyRef,
+    // GenieX needs the local placeholder credential; a QwenCloud deployment
+    // without a key reference legitimately sends no Authorization header.
+    ...(keyRef === '' ? {} : { apiKeyEnv: keyRef }),
     compat: {
       thinkingFormat: 'qwen',
       supportsReasoningEffort: true,
@@ -619,14 +655,15 @@ async function upsertProvider(ctx, settings) {
       for (const otherId of otherIds) delete providers[otherId]
       providers[id] = desired
       committed = true
-    })
+    }, instance)
     if (!committed || !providerSettingsCurrent(settings)) {
-      await deleteProviders(ctx, [id, ...otherIds, settings.managedProviderId])
+      await deleteProviders(ctx, [id, ...otherIds, settings.managedProviderId], instance)
       return null
     }
   } else if (!providerSettingsCurrent(settings)) {
     return null
   }
+  if (!isLive(instance)) return null
   runtime.settings.managedProviderId = id
   runtime.settings.lastError = null
   if (changed) {
@@ -654,8 +691,8 @@ function managedProviderIds(settings) {
 }
 
 /** Delete the managed providers that are actually present in the config. */
-async function deleteProviders(ctx, ids) {
-  if (runtime.disposed) return
+async function deleteProviders(ctx, ids, instance = runtime) {
+  if (!isLive(instance)) return
   let present
   try {
     const { providers } = readProviderConfig(ctx)
@@ -666,7 +703,8 @@ async function deleteProviders(ctx, ids) {
   if (present.length === 0) return
   await editProviders(ctx, (providers) => {
     for (const id of present) delete providers[id]
-  })
+  }, instance)
+  if (!isLive(instance)) return
   try {
     for (const id of present) ctx.emit('llm/models-updated', id)
     ctx.emit('llm/adapters-updated')
@@ -730,6 +768,8 @@ function createRuntime() {
     syncGeneration: 0,
     stateCache: null,
     statusCache: { key: '', at: 0, value: null },
+    statusPending: null,
+    revisionsCache: { revision: -1, value: {} },
     turnMetrics: new Map(),
     requestStarts: new Map(),
     currentSteps: new Map(),
@@ -744,6 +784,7 @@ function createRuntime() {
     warmingModels: new Set(),
     warmQueue: Promise.resolve(),
     warmGeneration: 0,
+    abort: new AbortController(),
     providerChain: Promise.resolve(),
     persistChain: Promise.resolve(),
     bindError: null,
@@ -752,6 +793,11 @@ function createRuntime() {
 }
 
 let runtime = createRuntime()
+
+/** Whether `instance` is still the mounted runtime. */
+function isLive(instance) {
+  return runtime === instance && !instance.disposed
+}
 
 function invalidateState() {
   runtime.stateCache = null
@@ -824,6 +870,7 @@ function applyCapabilities(capabilities) {
   runtime.mtpDrafts.clear()
   runtime.modelContexts.clear()
   runtime.modelCapabilities.clear()
+  let dropped = false
   for (const [id, capability] of capabilities) {
     runtime.modelCapabilities.set(id, capability)
     if (capability?.mtpReady === true && typeof capability?.mtpDraft === 'string' && capability.mtpDraft !== '') {
@@ -833,6 +880,7 @@ function applyCapabilities(capabilities) {
     if (capability === null || capability === undefined) {
       runtime.loadSignatures.delete(id)
       runtime.loadRevisions.delete(id)
+      dropped = true
       continue
     }
     const rowSignature = warmSignature(capability)
@@ -845,8 +893,10 @@ function applyCapabilities(capabilities) {
     if (!capabilities.has(id)) {
       runtime.loadSignatures.delete(id)
       runtime.loadRevisions.delete(id)
+      dropped = true
     }
   }
+  if (dropped) runtime.loadRevision += 1
   const changed = signature !== runtime.capabilitySignature
   runtime.capabilitySignature = signature
   return changed
@@ -863,13 +913,12 @@ function runtimeCapabilities(ctx) {
 }
 
 /** Resolve capabilities for every managed model and refresh both catalogs. */
-async function refreshManagedModels(ctx) {
-  const instance = runtime
+async function refreshManagedModelsNow(ctx, instance) {
   const snapshot = { ...instance.settings }
-  const key = [snapshot.mode, snapshot.protocol, snapshot.upstream, snapshot.managedProviderId].join('|')
-  const currentKey = () => [instance.settings.mode, instance.settings.protocol, instance.settings.upstream, instance.settings.managedProviderId].join('|')
+  const key = `${providerSettingsKey(snapshot)}|${snapshot.managedProviderId}`
+  const currentKey = () => `${providerSettingsKey(instance.settings)}|${instance.settings.managedProviderId}`
   if (snapshot.mode !== 'auto') {
-    if (runtime !== instance || instance.disposed || currentKey() !== key) return
+    if (!isLive(instance) || currentKey() !== key) return
     clearManagedState()
     return
   }
@@ -881,7 +930,7 @@ async function refreshManagedModels(ctx) {
       capabilities.set(id, await runtimeCapabilities(ctx).resolve(snapshot, id))
     })
   }
-  if (runtime !== instance || instance.disposed || currentKey() !== key) return
+  if (!isLive(instance) || currentKey() !== key) return
   applyManagedProvider(provider)
   if (snapshot.protocol === 'geniex') {
     if (applyCapabilities(capabilities)) runtime.modelRevision += 1
@@ -889,6 +938,12 @@ async function refreshManagedModels(ctx) {
     runtime.modelRevision += 1
   }
   invalidateState()
+}
+
+/** Serialize a manual catalog refresh with provider builds on the same chain. */
+function refreshManagedModels(ctx) {
+  const instance = runtime
+  return providerTask(instance, () => refreshManagedModelsNow(ctx, instance))
 }
 
 /** Serialize provider-config work on the instance that owns it. */
@@ -901,13 +956,13 @@ function providerTask(instance, operation) {
 /** One provider-build attempt for the current settings. */
 async function syncProviderOnce(ctx) {
   const instance = runtime
-  if (instance.disposed) return
+  if (!isLive(instance)) return
   // Snapshot, not a live reference: a mode/source change during discovery must
   // make this attempt stale instead of mutating its own comparison key.
   const settings = { ...instance.settings }
   if (settings.mode === 'off') {
-    await deleteProviders(ctx, managedProviderIds(settings))
-    if (runtime !== instance || instance.disposed) return
+    await deleteProviders(ctx, managedProviderIds(settings), instance)
+    if (!isLive(instance)) return
     instance.settings.managedProviderId = null
     clearManagedState()
     return
@@ -917,10 +972,10 @@ async function syncProviderOnce(ctx) {
     error.retryable = false
     throw error
   }
-  const provider = await upsertProvider(ctx, settings)
+  const provider = await upsertProvider(ctx, settings, instance)
   if (provider === null) return
   // The mode, source, or key may have changed while discovery was in flight.
-  if (runtime !== instance || instance.disposed || !providerSettingsCurrent(settings)) return
+  if (!isLive(instance) || !providerSettingsCurrent(settings)) return
   applyManagedProvider(provider)
   if (applyCapabilities(provider.capabilities)) runtime.modelRevision += 1
   runtime.capabilityRetryAt = 0
@@ -937,19 +992,25 @@ async function syncProviderOnce(ctx) {
  */
 function syncProvider(ctx, attempts = 1) {
   const instance = runtime
-  if (instance.disposed) return Promise.resolve()
+  if (!isLive(instance)) return Promise.resolve()
   const generation = ++runtime.syncGeneration
   const key = providerSettingsKey()
   runtime.pendingSync += 1
   invalidateState()
   const run = (async () => {
     for (let attempt = 0; ; attempt += 1) {
-      if (runtime !== instance || instance.disposed || generation !== runtime.syncGeneration) return
+      if (!isLive(instance) || generation !== runtime.syncGeneration) return
       try {
-        await providerTask(instance, () => syncProviderOnce(ctx))
+        // A sync queued behind a slow discovery may already be superseded by
+        // the time it runs; check the generation inside the queue too, so a
+        // burst of settings writes cannot cause a burst of stale discoveries.
+        await providerTask(instance, () => {
+          if (!isLive(instance) || generation !== runtime.syncGeneration) return undefined
+          return syncProviderOnce(ctx)
+        })
         return
       } catch (error) {
-        if (runtime !== instance || instance.disposed || generation !== runtime.syncGeneration) return
+        if (!isLive(instance) || generation !== runtime.syncGeneration) return
         const superseded = providerSettingsKey() !== key || runtime.settings.mode === 'off'
         if (superseded || error?.retryable === false || attempt >= attempts - 1) throw error
         await delay(SYNC_RETRY_DELAYS[Math.min(attempt, SYNC_RETRY_DELAYS.length - 1)])
@@ -957,7 +1018,7 @@ function syncProvider(ctx, attempts = 1) {
     }
   })()
   return run.finally(() => {
-    if (runtime !== instance || instance.disposed) return
+    if (!isLive(instance)) return
     runtime.pendingSync = Math.max(0, runtime.pendingSync - 1)
     invalidateState()
   })
@@ -966,10 +1027,10 @@ function syncProvider(ctx, attempts = 1) {
 /** Start a provider sync without making the settings page wait for it. */
 function startBackgroundSync(ctx, attempts) {
   const instance = runtime
-  if (instance.disposed) return
+  if (!isLive(instance)) return
   const key = providerSettingsKey()
   void syncProvider(ctx, attempts).catch((error) => {
-    if (runtime !== instance || instance.disposed || providerSettingsKey() !== key) return
+    if (!isLive(instance) || providerSettingsKey() !== key) return
     runtime.settings.lastError = userError(error)
     invalidateState()
     runtime.logger?.warn?.(`[${SCOPE}] cannot refresh managed provider: ${userError(error)}`)
@@ -1105,18 +1166,17 @@ function aggregateTurnMetric(metric) {
 
 /** Store one call's timing and token counts on its turn. */
 function recordTurn(sessionId, turn, call) {
+  if (call.provider !== PROVIDERS.geniex.id && call.provider !== PROVIDERS.qwen.id) return
   const key = `${sessionId}:${turn}`
   let metric = runtime.turnMetrics.get(key)
   if (metric === undefined) {
-    metric = { provider: call.provider, model: call.model, calls: [], hasToolCalls: false }
+    metric = { calls: [], hasToolCalls: false }
     runtime.turnMetrics.set(key, metric)
     trimMap(runtime.turnMetrics, 2000)
   }
   if (!metric.calls.some((existing) => existing.id === call.id)) {
     metric.calls.push(call)
     metric.calls.sort((left, right) => left.time - right.time)
-    metric.provider = call.provider
-    metric.model = call.model
     metric.hasToolCalls = metric.hasToolCalls === true || call.toolCall === true
   }
   if (call.provider !== PROVIDERS.geniex.id) return
@@ -1182,7 +1242,7 @@ function deriveSessionMetrics(session) {
 function writeProxyResponse(upstream, res, { managed, onUsage }) {
   const logger = runtime.logger
   const headers = { ...upstream.headers }
-  for (const name of [...HOP_BY_HOP, 'content-length', 'transfer-encoding']) delete headers[name]
+  for (const name of [...HOP_BY_HOP, 'content-length']) delete headers[name]
   headers['cache-control'] = 'no-store'
   const status = upstream.statusCode ?? 502
   const contentType = String(upstream.headers['content-type'] ?? '')
@@ -1191,36 +1251,42 @@ function writeProxyResponse(upstream, res, { managed, onUsage }) {
   // of corrupting it, even though the request asked for `identity`.
   const encoded = headers['content-encoding'] !== undefined
   const rewriting = managed && !encoded && (streaming || contentType.includes('application/json'))
+  let started = false
 
-  const finish = (value) => {
-    if (res.writableEnded) return
-    try {
-      res.end(value)
-    } catch {
-      res.destroy()
-    }
-  }
-
-  res.on('close', () => {
-    if (!res.writableEnded) upstream.destroy()
-  })
-  upstream.on('error', () => res.destroy())
-  upstream.on('aborted', () => res.destroy())
-
-  const startResponse = () => {
+  const start = () => {
+    if (started) return true
     try {
       res.writeHead(status, headers)
       res.flushHeaders?.()
+      started = true
+      res.socket?.setNoDelay(true)
       return true
     } catch {
       upstream.destroy()
       return false
     }
   }
+  const finish = (value) => {
+    if (res.writableEnded || res.destroyed) return
+    try {
+      res.end(value)
+      started = true
+    } catch {
+      res.destroy()
+    }
+  }
+  const fail = () => {
+    if (!res.writableEnded) res.destroy()
+  }
+
+  res.on('close', () => {
+    if (!res.writableEnded) upstream.destroy()
+  })
+  upstream.on('error', fail)
+  upstream.on('aborted', fail)
 
   if (!rewriting) {
-    if (!startResponse()) return
-    res.socket?.setNoDelay(true)
+    if (!start()) return
     upstream.pipe(res)
     return
   }
@@ -1230,16 +1296,13 @@ function writeProxyResponse(upstream, res, { managed, onUsage }) {
     let size = 0
     upstream.on('data', (chunk) => {
       size += chunk.length
-      if (size > MAX_JSON_RESPONSE) {
-        upstream.destroy()
-        if (!res.headersSent) sendJson(res, 502, { ok: false, error: { message: 'upstream response is too large' } })
-        else res.destroy()
+      if (size <= MAX_JSON_RESPONSE) {
+        chunks.push(chunk)
         return
       }
-      chunks.push(chunk)
-    })
-    upstream.on('close', () => {
-      if (!upstream.complete && !res.writableEnded) res.destroy()
+      upstream.destroy()
+      if (!res.headersSent) sendJson(res, 502, { ok: false, error: { message: 'upstream response is too large' } })
+      else res.destroy()
     })
     upstream.on('end', () => {
       if (res.writableEnded || res.destroyed) return
@@ -1248,8 +1311,7 @@ function writeProxyResponse(upstream, res, { managed, onUsage }) {
       try {
         payload = JSON.parse(raw.toString('utf8'))
       } catch {
-        if (!startResponse()) return
-        finish(raw)
+        if (start()) finish(raw)
         return
       }
       onUsage?.(payload?.usage)
@@ -1262,14 +1324,12 @@ function writeProxyResponse(upstream, res, { managed, onUsage }) {
       }
       const body = Buffer.from(JSON.stringify(payload), 'utf8')
       headers['content-length'] = String(body.length)
-      if (!startResponse()) return
-      finish(body)
+      if (start()) finish(body)
     })
     return
   }
 
-  if (!startResponse()) return
-  res.socket?.setNoDelay(true)
+  if (!start()) return
   const decoder = new StringDecoder('utf8')
   const state = createThinkState()
   const meta = { onUsage }
@@ -1293,25 +1353,14 @@ function writeProxyResponse(upstream, res, { managed, onUsage }) {
       })
     }
   }
-  const emit = (raw) => {
-    let value
-    try {
-      value = transformSseEvent(raw, state, meta)
-    } catch (error) {
-      logger?.warn?.(`[${SCOPE}] cannot rewrite stream event: ${userError(error)}`)
-      upstream.destroy()
-      res.destroy()
-      return false
-    }
-    write(value)
-    return true
-  }
-  upstream.on('data', (chunk) => {
-    buffer += decoder.write(chunk)
+  // One write per upstream chunk: a high-token-rate stream otherwise pays a
+  // syscall per SSE event even when hundreds arrive in one TCP read.
+  const drainEvents = (input) => {
+    let output = ''
     let start = 0
     for (;;) {
-      const lf = buffer.indexOf('\n\n', start)
-      const crlf = buffer.indexOf('\r\n\r\n', start)
+      const lf = input.indexOf('\n\n', start)
+      const crlf = input.indexOf('\r\n\r\n', start)
       let index = -1
       let width = 2
       if (crlf !== -1 && (lf === -1 || crlf < lf)) {
@@ -1322,10 +1371,24 @@ function writeProxyResponse(upstream, res, { managed, onUsage }) {
       } else {
         break
       }
-      if (!emit(buffer.slice(start, index))) return
+      output += transformSseEvent(input.slice(start, index), state, meta)
       start = index + width
     }
-    if (start > 0) buffer = buffer.slice(start)
+    if (output !== '') write(output)
+    return start
+  }
+  upstream.on('data', (chunk) => {
+    buffer += decoder.write(chunk)
+    let consumed
+    try {
+      consumed = drainEvents(buffer)
+    } catch (error) {
+      logger?.warn?.(`[${SCOPE}] cannot rewrite stream event: ${userError(error)}`)
+      upstream.destroy()
+      res.destroy()
+      return
+    }
+    if (consumed > 0) buffer = buffer.slice(consumed)
     if (buffer.length > MAX_EVENT_BUFFER) {
       logger?.warn?.(`[${SCOPE}] upstream event exceeded ${MAX_EVENT_BUFFER} bytes`)
       upstream.destroy()
@@ -1334,11 +1397,17 @@ function writeProxyResponse(upstream, res, { managed, onUsage }) {
   })
   upstream.on('end', () => {
     buffer += decoder.end()
-    if (buffer.trim() !== '' && !emit(buffer)) return
+    if (buffer.trim() !== '') {
+      try {
+        write(transformSseEvent(buffer, state, meta))
+      } catch (error) {
+        logger?.warn?.(`[${SCOPE}] cannot rewrite stream event: ${userError(error)}`)
+      }
+    }
     finish()
   })
   upstream.on('close', () => {
-    if (!upstream.complete && !res.writableEnded) res.destroy()
+    if (!upstream.complete) fail()
   })
 }
 
@@ -1351,6 +1420,12 @@ function handleProxyRequest(req, res) {
     upstreamUrl = upstreamRequestURL(settings, new URL(req.url ?? '/', 'http://qwen.invalid'))
   } catch (error) {
     sendJson(res, 500, { ok: false, error: { message: `Invalid upstream URL: ${userError(error)}` } })
+    return
+  }
+  const declared = Number(req.headers?.['content-length'])
+  if (Number.isFinite(declared) && declared > MAX_PROXY_BODY) {
+    sendJson(res, 413, { ok: false, error: { message: 'request body is too large' } })
+    req.resume()
     return
   }
   const transport = upstreamUrl.protocol === 'https:' ? https : http
@@ -1367,6 +1442,7 @@ function handleProxyRequest(req, res) {
     upstreamReq?.destroy()
   }
   const clientWentAway = () => {
+    if (clientGone) return
     clientGone = true
     destroyUpstream()
   }
@@ -1383,14 +1459,9 @@ function handleProxyRequest(req, res) {
     chunks.push(chunk)
   })
   req.on('error', (error) => {
-    clientGone = true
-    destroyUpstream()
+    clientWentAway()
     logger.warn(`[${SCOPE}] proxy request failed: ${userError(error)}`)
     if (!res.headersSent) sendJson(res, 400, { ok: false, error: { message: userError(error) } })
-  })
-  req.on('aborted', () => {
-    rejected = true
-    clientWentAway()
   })
   res.on('close', () => {
     if (!res.writableEnded) clientWentAway()
@@ -1449,10 +1520,18 @@ function handleProxyRequest(req, res) {
       return
     }
     upstreamReq.setNoDelay(true)
+    // Bound a stalled upstream socket; activity resets this inactivity timer.
+    upstreamReq.setTimeout(UPSTREAM_IDLE_TIMEOUT_MS, () => {
+      upstreamReq?.destroy(new Error('upstream request timed out'))
+    })
     upstreamReq.on('error', (error) => {
+      if (clientGone) return
       logger.warn(`[${SCOPE}] upstream request failed: ${userError(error)}`)
-      if (!res.headersSent) sendJson(res, 502, { ok: false, error: { message: userError(error) } })
-      else res.destroy()
+      if (!res.headersSent) {
+        sendJson(res, 502, { ok: false, error: { message: userError(error) } })
+      } else {
+        res.destroy()
+      }
     })
     upstreamReq.end(body)
   })
@@ -1460,72 +1539,173 @@ function handleProxyRequest(req, res) {
 
 /** The reply-only preset labels for one locale. */
 function replyOnlyLabels(locale) {
-  return locale.startsWith('en')
-    ? { name: 'Reply Only', description: 'Tool calls are hidden and denied; replies stay plain text.' }
-    : { name: '仅回复', description: '禁止工具调用，仅进行纯文本对话。' }
+  // The plugin ships two dictionaries; every non-Chinese UI gets English so a
+  // third built-in locale never shows Chinese copy for this preset.
+  return locale.startsWith('zh')
+    ? { name: '仅回复', description: '禁止工具调用，仅进行纯文本对话。' }
+    : { name: 'Reply Only', description: 'Tool calls are hidden and denied; replies stay plain text.' }
 }
 
-function replyOnlyPreset(presets, locale) {
-  const current = presets[REPLY_ONLY_KEY]
+const OWNED_PRESET_KEYS = [REPLY_ONLY_KEY, LEGACY_REPLY_ONLY_KEY]
+
+/** Whether a value is a preset entry the permission plugin can resolve. */
+function isPresetSpec(value) {
+  return value !== null && typeof value === 'object'
+    && typeof value.sandbox === 'string' && typeof value.approval === 'string'
+}
+
+/** @returns the preset table of a config layer, or an empty table. */
+function presetsOf(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value) ? value : {}
+}
+
+/**
+ * The preset table without this plugin's keys: stock presets come from the
+ * bundle layer so a DSH upgrade flows through, profile-only presets are kept.
+ */
+function basePresets(inherited, override) {
+  const table = {}
+  for (const [key, value] of Object.entries(presetsOf(inherited.presets))) {
+    if (!OWNED_PRESET_KEYS.includes(key)) table[key] = value
+  }
+  for (const [key, value] of Object.entries(presetsOf(override.presets))) {
+    if (!OWNED_PRESET_KEYS.includes(key)) table[key] = value
+  }
+  return table
+}
+
+/** The reply-only entry, keeping an existing knob choice but refreshing labels. */
+function replyOnlySpec(table, locale) {
   const labels = replyOnlyLabels(locale)
+  const current = table[REPLY_ONLY_KEY] ?? table[LEGACY_REPLY_ONLY_KEY]
   return {
-    sandbox: current?.sandbox ?? 'read-only',
-    approval: current?.approval ?? 'never',
+    sandbox: isPresetSpec(current) ? current.sandbox : 'read-only',
+    approval: isPresetSpec(current) ? current.approval : 'never',
     name: labels.name,
     description: labels.description,
   }
 }
 
-function samePreset(left, right) {
-  return left?.sandbox === right.sandbox
-    && left?.approval === right.approval
-    && left?.name === right.name
-    && left?.description === right.description
+/** A stable view of the permission services, usable after the plugin context closes. */
+function permissionHandle(ctx) {
+  const configEditor = ctx.configEditor
+  let hmr
+  try {
+    hmr = typeof ctx.get === 'function' ? ctx.get('hmr') : undefined
+  } catch {
+    hmr = undefined
+  }
+  return {
+    configEditor,
+    hmr,
+    runConfigEdit: (entry, change) => runConfigEdit({
+      configEditor,
+      get: (name) => name === 'hmr' ? hmr : undefined,
+    }, entry, change),
+    emit: (name) => ctx.emit(name),
+  }
 }
 
-/** Read the merged permission config without editing it. */
-function readPermissionConfig(ctx) {
-  const entry = ctx.configEditor.entries().find((candidate) => {
+/** Read the permission config and both of its layers without editing them. */
+function readPermissionConfig(handle) {
+  const entry = handle.configEditor.entries().find((candidate) => {
     return candidate.options?.id === 'permission' || candidate.id?.endsWith(':permission')
   })
-  if (entry === undefined) return { entry: null, config: {} }
-  const row = ctx.configEditor.configuration().find((candidate) => candidate.entry === entry)
-  return { entry, config: { ...(row?.inherited ?? {}), ...(row?.override ?? {}) } }
+  if (entry === undefined) return { entry: null, inherited: {}, override: {} }
+  const row = handle.configEditor.configuration().find((candidate) => candidate.entry === entry)
+  // A row can be momentarily absent while the permission plugin reloads;
+  // treating that as an empty inherited table would wipe every stock preset.
+  if (row === undefined) return { entry: null, inherited: {}, override: {} }
+  return { entry, inherited: row.inherited ?? {}, override: row.override ?? {} }
+}
+
+/** Tell the permission picker its process catalog changed. */
+function emitPermissionCatalogChanged(handle) {
+  try {
+    handle.emit('permission-presets/catalog-changed')
+  } catch {
+    // Catalog refresh is best-effort; the durable preset is already written.
+  }
+}
+
+/**
+ * Reconcile this plugin's preset in the profile layer.
+ *
+ * A patch config replaces the whole permission entry, so the table must be
+ * restated. `basePresets` rebuilds the stock table from the inherited layer
+ * on every write, which lets a future DSH stock change flow through instead
+ * of freezing it at this package's version. When the result equals the
+ * inherited config, ConfigEditor removes the override row entirely.
+ * @param handle - captured permission services.
+ * @param locale - active UI locale.
+ * @param remove - drop this plugin's presets instead of maintaining them.
+ * @returns whether the profile patch was rewritten.
+ */
+async function writeReplyOnlyPreset(handle, locale, remove = false) {
+  const { entry, inherited, override } = readPermissionConfig(handle)
+  const labels = replyOnlyLabels(locale)
+  if (entry === null) return { updated: false, ...labels }
+  const overridePresets = presetsOf(override.presets)
+  if (remove && !OWNED_PRESET_KEYS.some((key) => Object.hasOwn(overridePresets, key))) {
+    return { updated: false }
+  }
+  const desired = basePresets(inherited, override)
+  if (!remove) desired[REPLY_ONLY_KEY] = replyOnlySpec(overridePresets, locale)
+  if (isDeepStrictEqual(desired, overridePresets)) return { updated: false, ...labels }
+  await handle.runConfigEdit(entry, (current) => ({ ...(current ?? {}), presets: desired }))
+  emitPermissionCatalogChanged(handle)
+  return { updated: true, ...labels }
 }
 
 /**
  * Keep the reply-only preset present and localized, without rewriting the
  * profile patch when nothing changed.
+ * @param ctx - plugin context.
+ * @param locale - active UI locale.
+ * @returns whether the profile patch was rewritten.
  */
 async function ensureReplyOnlyPreset(ctx, locale) {
-  const { entry, config } = readPermissionConfig(ctx)
-  const labels = replyOnlyLabels(locale)
-  if (entry === null) return { updated: false, ...labels }
-  const presets = config.presets !== null && typeof config.presets === 'object' ? config.presets : {}
-  if (samePreset(presets[REPLY_ONLY_KEY], replyOnlyPreset(presets, locale))) return { updated: false, ...labels }
-  await runConfigEdit(ctx, entry, (current, inherited) => {
-    const base = { ...(inherited ?? {}), ...(current ?? {}) }
-    const merged = { ...((inherited ?? {}).presets ?? {}), ...((current ?? {}).presets ?? {}) }
-    return { ...base, presets: { ...merged, [REPLY_ONLY_KEY]: replyOnlyPreset(merged, locale) } }
-  })
-  return { updated: true, ...labels }
+  if (locale !== '' && runtime.settings.replyOnlyLocale !== locale) {
+    runtime.settings.replyOnlyLocale = locale
+    await persistSettings().catch(() => {})
+  }
+  return writeReplyOnlyPreset(permissionHandle(ctx), locale === '' ? runtime.settings.replyOnlyLocale : locale)
+}
+
+/**
+ * Serialize every permission-config read-modify-write. The chain lives at
+ * module scope so a reloading instance's removal cannot interleave with the
+ * next instance's add: Cordis awaits the old disposer before the new apply.
+ */
+let permissionChain = Promise.resolve()
+
+/**
+ * @param operation - permission-config work to run after earlier work settles.
+ * @returns the operation's result.
+ */
+function queuePermission(operation) {
+  const result = permissionChain.then(operation, operation)
+  permissionChain = result.then(() => undefined, () => undefined)
+  return result
 }
 
 /** Wait for the background provider sync to publish the requested model. */
 async function waitForManagedModel(ctx, model, timeoutMs = 15000) {
+  const instance = runtime
   const deadline = Date.now() + timeoutMs
-  while (!runtime.disposed && Date.now() < deadline) {
-    if (runtime.managedModels.has(model)) return true
-    if (runtime.pendingSync === 0) break
+  while (isLive(instance) && Date.now() < deadline) {
+    if (instance.managedModels.has(model)) return true
+    if (instance.pendingSync === 0) break
     await delay(200)
   }
-  if (runtime.managedModels.has(model)) return true
+  if (!isLive(instance)) return false
+  if (instance.managedModels.has(model)) return true
   try {
     await refreshManagedModels(ctx)
   } catch {
     // The caller reports the model as unavailable.
   }
-  return runtime.managedModels.has(model)
+  return instance.managedModels.has(model)
 }
 
 async function warmUpModel(ctx, settings, model, options) {
@@ -1558,7 +1738,7 @@ async function warmUpModel(ctx, settings, model, options) {
       method: 'POST',
       headers: { 'content-type': 'application/json', accept: 'application/json', ...await credentialHeader(ctx, settings) },
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(WARMUP_TIMEOUT_MS),
+      signal: AbortSignal.any([AbortSignal.timeout(WARMUP_TIMEOUT_MS), runtime.abort.signal]),
     })
   } catch (error) {
     if (error?.name === 'AbortError' || error?.name === 'TimeoutError') {
@@ -1605,65 +1785,112 @@ async function readGeniexStatus(ctx, timeout = 1500) {
   }
 }
 
+/** The warm-revision map, rebuilt only when a load input changed. */
+function revisionsSnapshot() {
+  const cached = runtime.revisionsCache
+  if (cached.revision === runtime.loadRevision) return cached.value
+  const value = Object.fromEntries(runtime.loadRevisions)
+  runtime.revisionsCache = { revision: runtime.loadRevision, value }
+  return value
+}
+
+/** Attach the live warm state to one cached GenieX status snapshot. */
+function statusPayload(value) {
+  return {
+    active: true,
+    models: value?.models ?? [],
+    states: value?.states ?? {},
+    warming: [...runtime.warmingModels],
+    revision: runtime.loadRevision,
+    revisions: revisionsSnapshot(),
+  }
+}
+
 /** Read the loaded-model state from GenieX's `/status`. */
 async function readModelStatus(ctx) {
   const settings = runtime.settings
   if (!(settings.mode === 'auto' && settings.protocol === 'geniex' && settings.warm === true)) {
-    return { active: false, models: [], warming: [], revision: runtime.loadRevision, revisions: Object.fromEntries(runtime.loadRevisions) }
+    return { active: false, models: [], warming: [], revision: runtime.loadRevision, revisions: revisionsSnapshot() }
   }
   const cached = runtime.statusCache
-  if (cached.key === settings.upstream && Date.now() - cached.at < 1500) {
-    return {
-      ...cached.value,
-      warming: [...runtime.warmingModels],
-      revision: runtime.loadRevision,
-      revisions: Object.fromEntries(runtime.loadRevisions),
-    }
+  if (cached.key === settings.upstream && cached.value !== null && Date.now() - cached.at < STATUS_CACHE_MS) {
+    return statusPayload(cached.value)
   }
-  let value = { active: true, models: [], warming: [] }
-  const body = await readGeniexStatus(ctx, 2500)
-  if (body !== null) {
-    const models = Array.isArray(body?.models) ? body.models.filter((model) => typeof model?.id === 'string') : []
-    value = {
-      active: true,
-      models: models.map((model) => model.id),
-      states: Object.fromEntries(models.map((model) => [model.id, model.state])),
-    }
+  // Every open label polls this endpoint; one in-flight read serves them all.
+  let pending = runtime.statusPending
+  if (pending === null || pending.key !== settings.upstream) {
+    const promise = readGeniexStatus(ctx, 2000).then((body) => {
+      if (body !== null) {
+        const models = Array.isArray(body?.models) ? body.models.filter((model) => typeof model?.id === 'string') : []
+        runtime.statusCache = {
+          key: settings.upstream,
+          at: Date.now(),
+          value: {
+            models: models.map((model) => model.id),
+            states: Object.fromEntries(models.map((model) => [model.id, model.state])),
+          },
+        }
+      }
+      // A failed probe keeps the last known state instead of painting every
+      // model cold; the label already reports a persistent failure separately.
+      return runtime.statusCache
+    }).catch(() => runtime.statusCache)
+    pending = { key: settings.upstream, promise }
+    runtime.statusPending = { key: settings.upstream, promise }
+    void promise.finally(() => {
+      if (runtime.statusPending?.promise === promise) runtime.statusPending = null
+    })
   }
-  value.warming = [...runtime.warmingModels]
-  value.revision = runtime.loadRevision
-  value.revisions = Object.fromEntries(runtime.loadRevisions)
-  runtime.statusCache = { key: settings.upstream, at: Date.now(), value }
-  return value
+  await pending.promise
+  const snapshot = runtime.statusCache
+  if (snapshot.key !== settings.upstream || snapshot.value === null) {
+    return { active: true, models: [], states: {}, warming: [...runtime.warmingModels], revision: runtime.loadRevision, revisions: revisionsSnapshot() }
+  }
+  return statusPayload(snapshot.value)
 }
 
 /** The settings page state, cached until the next mutation. */
 function readState(ctx) {
   if (runtime.stateCache !== null) return runtime.stateCache
   const settings = runtime.settings
+  const managed = readManagedProvider(ctx, settings)
+  // Model entries only feed the runtime; the page needs ids and display fields.
+  const provider = managed.provider === null
+    ? null
+    : {
+        id: managed.provider.id,
+        displayName: managed.provider.displayName,
+        baseURL: managed.provider.baseURL,
+        exists: managed.provider.exists,
+        models: managed.provider.models,
+        visionModels: managed.provider.visionModels,
+      }
   runtime.stateCache = {
     ...settings,
-    lastError: runtime.bindError ?? settings.lastError,
+    lastError: runtime.bindError ?? settings.lastError ?? null,
     pendingSync: runtime.pendingSync > 0,
     proxyBaseURL: proxyBaseURL(settings.proxyPort),
-    ...readManagedProvider(ctx, settings),
+    provider,
   }
   return runtime.stateCache
 }
 
 /** Resolve capabilities for models the client is waiting on. */
 async function ensureCapabilities(ctx) {
-  if (runtime.managedModels.size === 0) return
-  const missing = [...runtime.managedModels].filter((id) => {
-    const capability = runtime.modelCapabilities.get(id)
+  const instance = runtime
+  if (!isLive(instance) || instance.managedModels.size === 0) return
+  const missing = [...instance.managedModels].filter((id) => {
+    const capability = instance.modelCapabilities.get(id)
     return capability === undefined || capability === null
   })
-  if (missing.length === 0 || Date.now() < runtime.capabilityRetryAt) return
-  runtime.capabilityRetryAt = Date.now() + 30000
-  const entries = await mapLimit(missing, 4, async (id) => [id, await runtimeCapabilities(ctx).resolve(runtime.settings, id, true)])
+  if (missing.length === 0 || Date.now() < instance.capabilityRetryAt) return
+  instance.capabilityRetryAt = Date.now() + 30000
+  const settings = { ...instance.settings }
+  const entries = await mapLimit(missing, 4, async (id) => [id, await runtimeCapabilities(ctx).resolve(settings, id, true)])
+  if (!isLive(instance)) return
   const merged = new Map()
-  for (const id of runtime.managedModels) {
-    const capability = runtime.modelCapabilities.get(id)
+  for (const id of instance.managedModels) {
+    const capability = instance.modelCapabilities.get(id)
     if (capability !== undefined) merged.set(id, capability)
   }
   for (const [id, capability] of entries) merged.set(id, capability)
@@ -1805,7 +2032,9 @@ function createApi(ctx) {
       }
       return { recorded: true }
     },
-    permissionLabel: async (payload) => ensureReplyOnlyPreset(ctx, text(payload?.locale).toLowerCase()),
+    permissionLabel: async (payload) => queuePermission(
+      () => ensureReplyOnlyPreset(ctx, text(payload?.locale).toLowerCase()),
+    ),
     warm: (payload) => {
       const generation = ++runtime.warmGeneration
       const operation = async () => {
@@ -1828,12 +2057,13 @@ function createApi(ctx) {
         if (generation !== runtime.warmGeneration) return { warmed: false, skipped: true }
         // The user may have disabled warmup or changed the source while this
         // request waited for the catalog.
-        const settings = currentSettings()
         if (runtime.warmingModels.has(model)) return { warmed: false, model, skipped: true }
         if (!runtime.modelCapabilities.has(model)) {
           await refreshManagedModels(ctx)
+          if (generation !== runtime.warmGeneration) return { warmed: false, skipped: true }
           if (!runtime.managedModels.has(model)) throw httpError(409, 'model is not available yet')
         }
+        const settings = currentSettings()
         runtime.warmingModels.add(model)
         invalidateStatus()
         try {
@@ -1858,6 +2088,9 @@ function createApi(ctx) {
         if (payload !== null && typeof payload === 'object' && Object.hasOwn(payload, key)) patch[key] = payload[key]
       }
       if (patch.mode !== undefined && !SUPPORTED_MODES.includes(patch.mode)) throw httpError(400, 'invalid mode')
+      if (patch.protocol !== undefined && patch.protocol !== 'geniex' && patch.protocol !== 'qwen') {
+        throw httpError(400, 'invalid protocol')
+      }
       if (typeof patch.upstream !== 'string') delete patch.upstream
       else assertUpstream(patch.upstream)
       if (typeof patch.apiKeyEnv !== 'string') delete patch.apiKeyEnv
@@ -1921,22 +2154,26 @@ function createApi(ctx) {
       return readState(ctx)
     },
     remove: async () => {
+      const instance = runtime
       runtime.syncGeneration += 1
       invalidateState()
       try {
-        await providerTask(runtime, async () => {
-          await deleteProviders(ctx, managedProviderIds(runtime.settings))
-          runtime.settings.managedProviderId = null
+        await providerTask(instance, async () => {
+          await deleteProviders(ctx, managedProviderIds(instance.settings), instance)
+          if (isLive(instance)) instance.settings.managedProviderId = null
         })
-        clearManagedState()
-        runtime.settings.lastError = null
+        if (isLive(instance)) {
+          clearManagedState()
+          instance.settings.lastError = null
+        }
       } catch (error) {
-        runtime.settings.lastError = userError(error)
+        if (isLive(instance)) instance.settings.lastError = userError(error)
       }
+      if (!isLive(instance)) return readState(ctx)
       try {
         await persistSettings()
       } catch (error) {
-        runtime.settings.lastError = userError(error)
+        instance.settings.lastError = userError(error)
         invalidateState()
       }
       return readState(ctx)
@@ -1959,12 +2196,12 @@ function settingsFingerprint(settings = runtime.settings) {
 function persistSettings() {
   const instance = runtime
   const run = async () => {
-    if (instance.disposed) return
+    if (!isLive(instance)) return
     await mkdir(instance.profileDir, { recursive: true })
     const body = `${JSON.stringify(settingsForStore(instance.settings), null, 2)}\n`
     const temporary = `${instance.storePath}.${process.pid}.${Date.now()}.tmp`
     await writeFile(temporary, body, 'utf8')
-    if (instance.disposed) {
+    if (!isLive(instance)) {
       try {
         await unlink(temporary)
       } catch {
@@ -1991,33 +2228,41 @@ function persistSettings() {
 /** Bind the loopback proxy, sliding to the next port when one is taken. */
 async function startProxy() {
   const instance = runtime
-  if (instance.disposed) return null
+  if (!isLive(instance)) return null
   const server = http.createServer((req, res) => handleProxyRequest(req, res))
   const preferred = instance.settings.proxyPort
+  const listen = (port) => new Promise((resolve, reject) => {
+    const onError = (error) => {
+      server.off('listening', onListening)
+      reject(error)
+    }
+    const onListening = () => {
+      server.off('error', onError)
+      resolve()
+    }
+    server.once('error', onError)
+    server.once('listening', onListening)
+    server.listen(port, '127.0.0.1')
+  })
   let bound = null
-  for (let offset = 0; offset < PROXY_PORT_TRIES; offset += 1) {
+  outer: for (let offset = 0; offset < PROXY_PORT_TRIES; offset += 1) {
     const port = preferred + offset
     if (port > 65535) break
-    try {
-      await new Promise((resolve, reject) => {
-        const onError = (error) => {
-          server.off('listening', onListening)
-          reject(error)
+    // A hot reload can overlap the previous instance's close by a few ticks;
+    // retry the preferred port before permanently moving the profile to the
+    // next one (which would otherwise drift on every reload).
+    const waits = offset === 0 ? 3 : 1
+    for (let attempt = 0; attempt < waits; attempt += 1) {
+      try {
+        await listen(port)
+        bound = port
+        break outer
+      } catch (error) {
+        if (error?.code !== 'EADDRINUSE') {
+          instance.logger?.warn?.(`[${SCOPE}] cannot bind proxy on ${port}: ${userError(error)}`)
+          break outer
         }
-        const onListening = () => {
-          server.off('error', onError)
-          resolve()
-        }
-        server.once('error', onError)
-        server.once('listening', onListening)
-        server.listen(port, '127.0.0.1')
-      })
-      bound = port
-      break
-    } catch (error) {
-      if (error?.code !== 'EADDRINUSE') {
-        instance.logger.warn(`[${SCOPE}] cannot bind proxy on ${port}: ${userError(error)}`)
-        break
+        if (attempt < waits - 1) await delay(150)
       }
     }
   }
@@ -2026,7 +2271,7 @@ async function startProxy() {
     invalidateState()
     return null
   }
-  if (runtime !== instance || instance.disposed) {
+  if (!isLive(instance)) {
     await new Promise((resolve) => {
       server.close(() => resolve())
       server.closeAllConnections?.()
@@ -2045,16 +2290,21 @@ async function startProxy() {
   return server
 }
 
+/** Whether a session's effective preset is this plugin's reply-only preset. */
+function isReplyOnly(ctx, session) {
+  try {
+    const preset = ctx.permissionPresets.current(session)
+    return preset === REPLY_ONLY_KEY || preset === LEGACY_REPLY_ONLY_KEY
+  } catch {
+    return false
+  }
+}
+
 /** Keep the per-agent tool restriction in sync with the reply-only preset. */
 function applyReplyOnly(ctx, agent) {
   const session = ctx.sessions.get(agent.id)
   if (session === undefined) return
-  let reply = false
-  try {
-    reply = ctx.permissionPresets.current(session) === REPLY_ONLY_KEY
-  } catch {
-    return
-  }
+  const reply = isReplyOnly(ctx, session)
   const active = runtime.replyRestrictions.get(agent.id)
   if (!reply) {
     if (active !== undefined) {
@@ -2118,7 +2368,7 @@ function registerWebApi(ctx, api) {
 /** Serialize mutating API calls so settings writes cannot interleave. */
 function serializeMutations(api) {
   let queue = Promise.resolve()
-  for (const method of ['setMode', 'save', 'apply', 'remove', 'permissionLabel']) {
+  for (const method of ['setMode', 'save', 'apply', 'remove']) {
     const operation = api[method]
     api[method] = (payload) => {
       const run = queue.then(() => operation(payload), () => operation(payload))
@@ -2128,15 +2378,56 @@ function serializeMutations(api) {
   }
 }
 
+/** Retry the initial preset reconcile while the permission plugin reloads. */
+function maintainReplyOnlyPreset(ctx, instance, attempts = 3) {
+  const handle = permissionHandle(ctx)
+  return queuePermission(async () => {
+    for (let attempt = 0; ; attempt += 1) {
+      if (!isLive(instance)) return { updated: false }
+      try {
+        return await writeReplyOnlyPreset(handle, instance.settings.replyOnlyLocale)
+      } catch (error) {
+        if (attempt >= attempts - 1) throw error
+        await delay(500 * (attempt + 1))
+      }
+    }
+  })
+}
+
 export async function apply(ctx) {
   runtime = createRuntime()
   const instance = runtime
   // A reinstall can start before every async task of the previous instance has
   // settled. The flag lets those tasks stop instead of writing settings or
   // config after their plugin has been disposed.
-  ctx.effect(() => () => { instance.disposed = true }, `${SCOPE}: lifecycle`)
+  ctx.effect(() => () => {
+    instance.disposed = true
+    instance.abort.abort()
+  }, `${SCOPE}: lifecycle`)
+  // The preset is plugin-owned and transient: every close — disable, uninstall,
+  // or hot reload — removes it, and the next load adds it again. The removal is
+  // deliberately not returned to Cordis: this disposer runs inside the HMR
+  // transaction, and awaiting a config edit there would queue behind the very
+  // operation that is waiting for this disposal.
+  ctx.effect(() => () => {
+    const target = runtime
+    const handle = permissionHandle(ctx)
+    const locale = target.settings.replyOnlyLocale
+    const removal = queuePermission(async () => {
+      // A reload already installed a new instance; its own sync owns the table.
+      if (runtime !== target) return
+      await writeReplyOnlyPreset(handle, locale, true)
+    }).catch((error) => {
+      target.logger?.warn?.(`[${SCOPE}] cannot remove the reply-only preset: ${userError(error)}`)
+    })
+    // Awaiting inside an HMR transaction would queue behind that transaction,
+    // which is waiting for this disposal. Outside HMR (a plain shutdown) the
+    // cleanup can be awaited so the profile is left clean.
+    if (handle.hmr?.executing?.getStore?.() === true) return
+    return removal
+  }, `${SCOPE}: reply-only cleanup`)
   runtime.logger = loggerFor(ctx, SCOPE)
-  runtime.profileDir = text(process.env.DSH_PROFILE_DIR) || process.cwd()
+  runtime.profileDir = profileDirectory(ctx)
   runtime.storePath = join(runtime.profileDir, STORE_FILE)
 
   let stored = null
@@ -2152,7 +2443,7 @@ export async function apply(ctx) {
   if (stored === null || settingsFingerprint(loaded) !== settingsFingerprint(stored)) {
     await persistSettings().catch((error) => runtime.logger.warn(`[${SCOPE}] cannot save settings: ${userError(error)}`))
   }
-  if (instance.disposed) return
+  if (!isLive(instance)) return
 
   applyManagedProvider(readManagedProvider(ctx, runtime.settings).provider)
   const api = createApi(ctx)
@@ -2212,16 +2503,21 @@ export async function apply(ctx) {
     if (agent === undefined) return undefined
     const session = ctx.sessions.get(agent.id)
     if (session === undefined) return undefined
-    try {
-      return ctx.permissionPresets.current(session) === REPLY_ONLY_KEY
-        ? 'Reply-only mode: tool calls are disabled'
-        : undefined
-    } catch {
-      return undefined
-    }
+    return isReplyOnly(ctx, session) ? 'Reply-only mode: tool calls are disabled' : undefined
   }), `${SCOPE}: reply-only tool guard`)
 
   ctx.effect(() => ctx.on('agent/created', ({ agent }) => applyReplyOnly(ctx, agent)), `${SCOPE}: reply-only agent setup`)
+  ctx.effect(() => ctx.on('agent/disposed', ({ agent }) => {
+    const dispose = instance.replyRestrictions.get(agent.id)
+    if (dispose === undefined) return
+    dispose()
+    instance.replyRestrictions.delete(agent.id)
+  }), `${SCOPE}: reply-only agent teardown`)
+  // The permission service reloads when its config changes; re-resolve the
+  // preset then so a restriction follows the live catalog, not a stale one.
+  ctx.effect(() => ctx.on('permission-presets/catalog-changed', () => {
+    for (const agent of ctx.agents.list()) applyReplyOnly(ctx, agent)
+  }), `${SCOPE}: reply-only catalog follow`)
   ctx.effect(() => ctx.on('session/event', (session, event) => {
     if (event.type !== 'permission/preset' && event.type !== 'sandbox/mode' && event.type !== 'approval/policy') return
     queueMicrotask(() => {
@@ -2236,7 +2532,7 @@ export async function apply(ctx) {
   for (const agent of ctx.agents.list()) applyReplyOnly(ctx, agent)
 
   const server = await startProxy()
-  if (instance.disposed) {
+  if (!isLive(instance)) {
     if (server !== null) {
       await new Promise((resolve) => {
         server.close(() => resolve())
@@ -2246,30 +2542,34 @@ export async function apply(ctx) {
     return
   }
   if (server !== null) {
-    ctx.effect(() => () => {
-      instance.disposed = true
-      return new Promise((resolve) => {
-        server.close(() => resolve())
-        server.closeAllConnections?.()
-      })
-    }, `${SCOPE}: proxy server`)
+    ctx.effect(() => () => new Promise((resolve) => {
+      server.close(() => resolve())
+      server.closeAllConnections?.()
+    }), `${SCOPE}: proxy server`)
   }
+
+  // The reply-only preset is this plugin's only permission contribution. It is
+  // reconciled after activation so the bundle patch never has to replace the
+  // `permission` row and freeze every stock preset at this package's version.
+  void maintainReplyOnlyPreset(ctx, instance).catch((error) => {
+    runtime.logger?.warn?.(`[${SCOPE}] cannot maintain the reply-only preset: ${userError(error)}`)
+  })
 
   // Provider discovery talks to the upstream, so it must never delay
   // activation: a stopped GenieX would otherwise stall the plugin (and its
   // settings page) for the full discovery timeout. The sync below retries on
   // its own, so a congested link only delays the provider, not the plugin.
   const startupSync = async () => {
-    if (runtime !== instance || instance.disposed) return
+    if (!isLive(instance)) return
     const before = settingsFingerprint()
     try {
       await syncProvider(ctx, 4)
-      if (runtime !== instance || instance.disposed) return
+      if (!isLive(instance)) return
       runtime.settings.lastError = null
       invalidateState()
       if (settingsFingerprint() !== before) await persistSettings()
     } catch (error) {
-      if (runtime !== instance || instance.disposed) return
+      if (!isLive(instance)) return
       runtime.settings.lastError = userError(error)
       invalidateState()
       runtime.logger.warn(`[${SCOPE}] cannot refresh managed provider: ${userError(error)}`)

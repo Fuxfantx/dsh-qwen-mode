@@ -1,25 +1,9 @@
+# The reply-only permission preset is maintained at runtime, after this plugin
+# loads: `index.js` merges `qmode-reply-only` into the `permission` row without
+# replacing the row's other presets. A patch config replaces the entry's config
+# wholesale, so overriding `permission` here would freeze every stock preset at
+# this package's version.
 - insert:
     - id: qwen-mode
       name: 'dsh-qwen-mode'
       config: {}
-# Reply Only lives in the permission plugin's preset map; the plugin only adds
-# the `reply-only` preset and otherwise leaves the user's permission state
-# alone. A patch config replaces this entry's config wholesale, so the stock
-# presets are repeated below unchanged next to the added one.
-- id: permission
-  config:
-    presets:
-      reply-only:
-        sandbox: read-only
-        approval: never
-        name: 仅回复
-        description: 禁止工具调用，仅进行纯文本对话。
-      read-only:
-        sandbox: read-only
-        approval: ask
-      workspace-write:
-        sandbox: workspace-write
-        approval: ask
-      danger-full-access:
-        sandbox: danger-full-access
-        approval: never

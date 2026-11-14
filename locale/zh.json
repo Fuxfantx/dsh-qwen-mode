@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Qwen 模式",
-    "description": "在 DSH 中接入 Qwen、GenieX 与 QwenCloud，自动维护 Provider，并提供思考模式、采样、预热、MTP 与用量统计。"
+    "description": "在 DSH 中接入 Qwen、GenieX 与 QwenCloud，自动维护 Provider，并提供思考模式、采样、预热、MTP 与每轮统计。"
   }
 }

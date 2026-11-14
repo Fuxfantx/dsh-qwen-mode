@@ -1,7 +1,7 @@
 {
   "name": "dsh-qwen-mode",
-  "version": "1.8.1",
-  "description": "Qwen mode for DSH: managed Qwen/GenieX/QwenCloud providers, thinking normalization, local model capabilities, warmup, MTP and per-turn stats.",
+  "version": "1.8.2",
+  "description": "Qwen, GenieX, and QwenCloud providers for DSH with thinking, sampling, warmup, MTP, and per-turn statistics.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -22,7 +22,8 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=20.3",
+    "dsh": ">=0.2.2-rc.1 <0.3.0-0"
   },
   "author": "Fuxfantx",
   "license": "MIT-0",

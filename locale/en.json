@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Qwen mode",
-    "description": "Connect DSH to Qwen, GenieX, and QwenCloud with automatic provider management plus thinking, sampling, warmup, MTP, and usage views."
+    "description": "Connect DSH to Qwen via GenieX or QwenCloud with automatic provider management, thinking, sampling, warmup, MTP, and per-turn statistics."
   }
 }
